@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_ext" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.26.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.5.0">
+  <!-- hand-made fixture exercising vendor extensions and unmodeled elements -->
+  <bpmn:message id="Message_Order" name="orderMessage" />
+  <bpmn:process id="Process_Ext" isExecutable="true">
+    <bpmn:startEvent id="Start_Ext" name="Begin">
+      <bpmn:extensionElements>
+        <zeebe:versionTag value="v1" />
+      </bpmn:extensionElements>
+      <bpmn:outgoing>Flow_A</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:subProcess id="Sub_1" name="Prepare">
+      <bpmn:incoming>Flow_A</bpmn:incoming>
+      <bpmn:outgoing>Flow_B</bpmn:outgoing>
+      <bpmn:startEvent id="Sub_Start" />
+      <bpmn:endEvent id="Sub_End" />
+      <bpmn:sequenceFlow id="Sub_Flow" sourceRef="Sub_Start" targetRef="Sub_End" />
+    </bpmn:subProcess>
+    <bpmn:serviceTask id="Task_Charge" name="Charge card">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="charge-card" retries="3" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=amount" target="chargeAmount" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_B</bpmn:incoming>
+      <bpmn:outgoing>Flow_C</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Boundary_Timeout" name="Too slow" attachedToRef="Task_Charge" cancelActivity="false">
+      <bpmn:outgoing>Flow_Timeout</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="Timer_1">
+        <bpmn:timeDuration xsi:type="bpmn:tFormalExpression" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">PT5M</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:intermediateCatchEvent id="Catch_Order" name="Wait for order">
+      <bpmn:incoming>Flow_Timeout</bpmn:incoming>
+      <bpmn:outgoing>Flow_D</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MsgDef_1" messageRef="Message_Order" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="End_Ext" name="Finished">
+      <bpmn:incoming>Flow_C</bpmn:incoming>
+      <bpmn:incoming>Flow_D</bpmn:incoming>
+      <bpmn:terminateEventDefinition id="Term_1" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_A" sourceRef="Start_Ext" targetRef="Sub_1" />
+    <bpmn:sequenceFlow id="Flow_B" sourceRef="Sub_1" targetRef="Task_Charge" />
+    <bpmn:sequenceFlow id="Flow_C" sourceRef="Task_Charge" targetRef="End_Ext" />
+    <bpmn:sequenceFlow id="Flow_Timeout" sourceRef="Boundary_Timeout" targetRef="Catch_Order" />
+    <bpmn:sequenceFlow id="Flow_D" sourceRef="Catch_Order" targetRef="End_Ext" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Ext">
+    <bpmndi:BPMNPlane id="BPMNPlane_Ext" bpmnElement="Process_Ext">
+      <bpmndi:BPMNShape id="Start_Ext_di" bpmnElement="Start_Ext">
+        <dc:Bounds x="152" y="99" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Sub_1_di" bpmnElement="Sub_1" isExpanded="false">
+        <dc:Bounds x="240" y="77" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Charge_di" bpmnElement="Task_Charge">
+        <dc:Bounds x="390" y="77" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Boundary_Timeout_di" bpmnElement="Boundary_Timeout">
+        <dc:Bounds x="442" y="139" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Catch_Order_di" bpmnElement="Catch_Order">
+        <dc:Bounds x="442" y="239" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Ext_di" bpmnElement="End_Ext">
+        <dc:Bounds x="552" y="99" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_A_di" bpmnElement="Flow_A">
+        <di:waypoint x="188" y="117" />
+        <di:waypoint x="240" y="117" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_B_di" bpmnElement="Flow_B">
+        <di:waypoint x="340" y="117" />
+        <di:waypoint x="390" y="117" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_C_di" bpmnElement="Flow_C">
+        <di:waypoint x="490" y="117" />
+        <di:waypoint x="552" y="117" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Timeout_di" bpmnElement="Flow_Timeout">
+        <di:waypoint x="460" y="175" />
+        <di:waypoint x="460" y="239" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_D_di" bpmnElement="Flow_D">
+        <di:waypoint x="478" y="257" />
+        <di:waypoint x="570" y="257" />
+        <di:waypoint x="570" y="135" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

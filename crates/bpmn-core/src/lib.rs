@@ -5,8 +5,14 @@
 //! dependencies, so that the editor, the XML layer, the validator, and a future
 //! execution engine can all share it.
 
+pub mod di;
+pub mod document;
 pub mod geometry;
 pub mod ids;
+pub mod model;
+pub mod raw;
 
+pub use document::Document;
 pub use geometry::{Bounds, Point, Size};
 pub use ids::BpmnId;
+pub use raw::RawXml;

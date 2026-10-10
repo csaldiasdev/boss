@@ -9,7 +9,7 @@ use std::fmt;
 /// `Activity_1x2y3z`) and must round-trip byte-identical, because every
 /// cross-reference in BPMN XML (`sourceRef`, `bpmnElement`, `attachedToRef`,
 /// ...) is one of these strings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct BpmnId(SmolStr);
 
 impl BpmnId {

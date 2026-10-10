@@ -3,6 +3,8 @@
 mod app;
 mod camera;
 mod canvas;
+mod platform;
+mod render;
 mod theme;
 
 use app::App;
@@ -12,7 +14,7 @@ pub fn main() -> iced::Result {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
-    iced::application(App::default, App::update, App::view)
+    iced::application(App::boot, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
         .antialiasing(true)

@@ -1,9 +1,10 @@
-//! The diagram canvas: an `iced` canvas widget with a pannable, zoomable grid.
-//!
-//! M0 scope: camera + grid only. BPMN shape rendering lands in M1.
+//! The diagram canvas: an `iced` canvas widget with a pannable, zoomable grid
+//! and (since M1) read-only rendering of the open BPMN document.
 
 use crate::camera::Camera;
+use crate::render;
 use crate::theme::CanvasTokens;
+use bpmn_core::Document;
 use iced::mouse;
 use iced::widget::canvas::{self, Cache, Canvas, Event, Geometry, Path, Stroke};
 use iced::{Element, Fill, Point, Rectangle, Renderer, Theme, Vector};
@@ -34,6 +35,7 @@ pub enum CanvasMessage {
 #[derive(Default)]
 pub struct DiagramCanvas {
     grid_cache: Cache,
+    content_cache: Cache,
 }
 
 impl DiagramCanvas {
@@ -41,11 +43,14 @@ impl DiagramCanvas {
     pub fn view<'a>(
         &'a self,
         camera: &'a Camera,
+        document: Option<&'a Document>,
         tokens: CanvasTokens,
     ) -> Element<'a, CanvasMessage> {
         Canvas::new(View {
-            cache: &self.grid_cache,
+            grid_cache: &self.grid_cache,
+            content_cache: &self.content_cache,
             camera,
+            document,
             tokens,
         })
         .width(Fill)
@@ -53,15 +58,19 @@ impl DiagramCanvas {
         .into()
     }
 
-    /// Drops cached geometry; call after the camera or theme changes.
+    /// Drops cached geometry; call after the camera, theme, or document
+    /// changes.
     pub fn invalidate(&mut self) {
         self.grid_cache.clear();
+        self.content_cache.clear();
     }
 }
 
 struct View<'a> {
-    cache: &'a Cache,
+    grid_cache: &'a Cache,
+    content_cache: &'a Cache,
     camera: &'a Camera,
+    document: Option<&'a Document>,
     tokens: CanvasTokens,
 }
 
@@ -166,7 +175,7 @@ impl canvas::Program<CanvasMessage> for View<'_> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let grid = self.cache.draw(renderer, bounds.size(), |frame| {
+        let grid = self.grid_cache.draw(renderer, bounds.size(), |frame| {
             frame.fill_rectangle(Point::ORIGIN, frame.size(), self.tokens.bg);
 
             if self.camera.scaling < GRID_MIN_SCALING {
@@ -225,7 +234,25 @@ impl canvas::Program<CanvasMessage> for View<'_> {
             });
         });
 
-        vec![grid]
+        let Some(document) = self.document else {
+            return vec![grid];
+        };
+
+        let content = self.content_cache.draw(renderer, bounds.size(), |frame| {
+            let size = frame.size();
+            let center = Vector::new(size.width / 2.0, size.height / 2.0);
+
+            frame.with_save(|frame| {
+                frame.translate(center);
+                frame.scale(self.camera.scaling);
+                frame.translate(self.camera.translation);
+
+                let region = self.camera.visible_region(size);
+                render::draw(frame, document, self.tokens, self.camera.scaling, region);
+            });
+        });
+
+        vec![grid, content]
     }
 
     fn mouse_interaction(

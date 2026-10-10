@@ -2,9 +2,23 @@
 
 use crate::camera::Camera;
 use crate::canvas::{CanvasMessage, DiagramCanvas};
+use crate::platform::{self, OpenedFile};
 use crate::theme::{self, Mode, Tokens};
+use bpmn_core::Document;
 use iced::widget::{button, column, container, row, space, text};
-use iced::{Center, Element, Fill, Theme};
+use iced::{Center, Element, Fill, Size, Task, Theme, Vector};
+
+/// The document currently open in the editor.
+struct OpenDocument {
+    file_name: String,
+    document: Document,
+}
+
+/// A transient message for the status bar.
+struct StatusLine {
+    text: String,
+    is_error: bool,
+}
 
 /// Top-level application state.
 pub struct App {
@@ -12,6 +26,8 @@ pub struct App {
     canvas: DiagramCanvas,
     mode: Mode,
     theme: Theme,
+    open: Option<OpenDocument>,
+    status: Option<StatusLine>,
 }
 
 impl Default for App {
@@ -21,6 +37,8 @@ impl Default for App {
             canvas: DiagramCanvas::default(),
             mode: Mode::default(),
             theme: theme::iced_theme(Mode::default()),
+            open: None,
+            status: None,
         }
     }
 }
@@ -34,18 +52,46 @@ pub enum Message {
     ZoomIn,
     /// Zoom out from the toolbar.
     ZoomOut,
-    /// Reset the camera to 100% centered on the origin.
-    ZoomReset,
+    /// Zoom to fit the open document (or reset the camera).
+    ZoomFit,
     /// Switch between light and dark.
     ToggleTheme,
+    /// The user asked to open a file.
+    OpenRequested,
+    /// The open dialog finished.
+    FileOpened(Option<OpenedFile>),
+    /// The user asked to save the document (native only; the web gets a
+    /// download fallback in M2, hence the variants are unused on wasm).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    SaveRequested,
+    /// The save dialog finished with this file name.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Saved(Option<String>),
 }
 
 impl App {
+    /// Initial state, plus opening a file passed as a CLI argument on native.
+    pub fn boot() -> (Self, Task<Message>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let task = match std::env::args().nth(1) {
+            Some(path) => Task::perform(
+                async move { platform::read_path(&path) },
+                Message::FileOpened,
+            ),
+            None => Task::none(),
+        };
+        #[cfg(target_arch = "wasm32")]
+        let task = Task::none();
+
+        (Self::default(), task)
+    }
+
     /// Window title.
     pub fn title(&self) -> String {
-        // The open file name (plus a dirty marker) joins this in M1.
-        let _ = self;
-        String::from("boss — untitled.bpmn")
+        match &self.open {
+            Some(open) => format!("boss — {}", open.file_name),
+            None => String::from("boss"),
+        }
     }
 
     /// The current iced theme (built from the Slate tokens).
@@ -57,12 +103,38 @@ impl App {
         theme::tokens(self.mode)
     }
 
+    fn status(&mut self, text: impl Into<String>, is_error: bool) {
+        self.status = Some(StatusLine {
+            text: text.into(),
+            is_error,
+        });
+    }
+
+    /// Centers the camera on the open document and picks a zoom that shows all
+    /// of it. The viewport size is an estimate until M3 tracks the real one.
+    fn zoom_to_fit(&mut self) {
+        const VIEWPORT: Size = Size::new(860.0, 620.0);
+        const MARGIN: f32 = 60.0;
+
+        let Some(bounds) = self.open.as_ref().and_then(|o| o.document.content_bounds()) else {
+            self.camera = Camera::default();
+            return;
+        };
+
+        let (width, height) = (bounds.width as f32 + MARGIN, bounds.height as f32 + MARGIN);
+        let scaling = (VIEWPORT.width / width)
+            .min(VIEWPORT.height / height)
+            .clamp(Camera::MIN_SCALING, 1.5);
+        let center = bounds.center();
+
+        self.camera = Camera {
+            translation: Vector::new(-(center.x as f32), -(center.y as f32)),
+            scaling,
+        };
+    }
+
     /// Handles a message.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "iced's update signature takes messages by value"
-    )]
-    pub fn update(&mut self, message: Message) {
+    pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Canvas(CanvasMessage::Panned(translation)) => {
                 self.camera.translation = translation;
@@ -86,8 +158,8 @@ impl App {
                 self.camera = self.camera.zoomed(1.0 / 1.2);
                 self.canvas.invalidate();
             }
-            Message::ZoomReset => {
-                self.camera = Camera::default();
+            Message::ZoomFit => {
+                self.zoom_to_fit();
                 self.canvas.invalidate();
             }
             Message::ToggleTheme => {
@@ -95,7 +167,41 @@ impl App {
                 self.theme = theme::iced_theme(self.mode);
                 self.canvas.invalidate();
             }
+            Message::OpenRequested => {
+                return Task::perform(platform::open_file(), Message::FileOpened);
+            }
+            Message::FileOpened(Some(file)) => match bpmn_xml::parse(&file.contents) {
+                Ok(document) => {
+                    let elements = document.flow_elements().count();
+                    self.status(
+                        format!("Opened {} — {} flow elements", file.name, elements),
+                        false,
+                    );
+                    self.open = Some(OpenDocument {
+                        file_name: file.name,
+                        document,
+                    });
+                    self.zoom_to_fit();
+                    self.canvas.invalidate();
+                }
+                Err(error) => self.status(format!("Could not open {}: {error}", file.name), true),
+            },
+            Message::FileOpened(None) | Message::Saved(None) => {}
+            Message::SaveRequested =>
+            {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(open) = &self.open {
+                    let xml = bpmn_xml::write(&open.document);
+                    return Task::perform(
+                        platform::save_file(open.file_name.clone(), xml),
+                        Message::Saved,
+                    );
+                }
+            }
+            Message::Saved(Some(name)) => self.status(format!("Saved {name}"), false),
         }
+
+        Task::none()
     }
 
     /// Builds the widget tree for this frame.
@@ -108,7 +214,11 @@ impl App {
                 Self::palette(t),
                 container(
                     self.canvas
-                        .view(&self.camera, t.canvas)
+                        .view(
+                            &self.camera,
+                            self.open.as_ref().map(|o| &o.document),
+                            t.canvas
+                        )
                         .map(Message::Canvas)
                 )
                 .width(Fill)
@@ -130,33 +240,42 @@ impl App {
                 .on_press(message)
         };
 
-        container(
-            row![
-                tool("−", Message::ZoomOut),
+        let mut bar = row![tool("Open…", Message::OpenRequested),]
+            .spacing(8)
+            .align_y(Center);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.open.is_some() {
+            bar = bar.push(tool("Save as…", Message::SaveRequested));
+        }
+
+        bar = bar
+            .push(space::horizontal())
+            .push(tool("−", Message::ZoomOut))
+            .push(
                 container(
                     text(format!("{:>3}%", self.camera.zoom_percent()))
                         .font(theme::MONO)
                         .size(12),
                 )
                 .padding([4, 6]),
-                tool("+", Message::ZoomIn),
-                tool("Reset", Message::ZoomReset),
-                space::horizontal(),
-                tool(
-                    match self.mode {
-                        Mode::Light => "Dark",
-                        Mode::Dark => "Light",
-                    },
-                    Message::ToggleTheme,
-                ),
-            ]
-            .spacing(8)
-            .align_y(Center),
-        )
-        .style(move |_| theme::panel(t))
-        .padding(8)
-        .width(Fill)
-        .into()
+            )
+            .push(tool("+", Message::ZoomIn))
+            .push(tool("Fit", Message::ZoomFit))
+            .push(space::horizontal())
+            .push(tool(
+                match self.mode {
+                    Mode::Light => "Dark",
+                    Mode::Dark => "Light",
+                },
+                Message::ToggleTheme,
+            ));
+
+        container(bar)
+            .style(move |_| theme::panel(t))
+            .padding(8)
+            .width(Fill)
+            .into()
     }
 
     fn palette(t: Tokens) -> Element<'static, Message> {
@@ -200,15 +319,24 @@ impl App {
     }
 
     fn status_bar(&self, t: Tokens) -> Element<'_, Message> {
+        let info: Element<'_, Message> = match &self.status {
+            Some(line) => text(line.text.clone())
+                .size(11)
+                .color(if line.is_error { t.danger } else { t.muted })
+                .into(),
+            None => text("Open a .bpmn file · drag to pan · scroll to zoom")
+                .size(11)
+                .color(t.muted)
+                .into(),
+        };
+
         container(
             row![
                 text(format!("zoom {}%", self.camera.zoom_percent()))
                     .font(theme::MONO)
                     .size(11),
                 space::horizontal(),
-                text("drag to pan · scroll to zoom · M0 skeleton")
-                    .size(11)
-                    .color(t.muted),
+                info,
             ]
             .spacing(12)
             .align_y(Center),

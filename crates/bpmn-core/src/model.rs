@@ -1,0 +1,274 @@
+//! The BPMN 2.0 semantic model (M1 subset).
+//!
+//! Shape of the model: nested structs for data shared along the BPMN class
+//! hierarchy (`BaseElement` → `FlowNode`) plus enums for variation
+//! (`FlowElement`, `EventPosition`, `TaskType`, ...). Enums give exhaustive
+//! `match`es — the compiler points at every renderer/validator/serializer that
+//! must learn about a new element kind — and cheap `Clone` for snapshot undo.
+//!
+//! Elements outside the modeled subset survive as [`RawXml`] in `Unknown`
+//! variants, so every file round-trips even before full coverage lands.
+
+use crate::ids::BpmnId;
+use crate::raw::RawXml;
+
+/// Data every BPMN element carries (`BaseElement` in the spec).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BaseElement {
+    /// The XML `id` attribute.
+    pub id: BpmnId,
+    /// `documentation` child elements (text content).
+    pub documentation: Vec<String>,
+    /// The whole `extensionElements` element, preserved verbatim.
+    pub extension_elements: Option<RawXml>,
+    /// Attributes from foreign namespaces (`camunda:*`, ...), as written.
+    pub unknown_attrs: Vec<(String, String)>,
+    /// Child elements the model does not understand, preserved verbatim.
+    pub unknown_children: Vec<RawXml>,
+}
+
+impl BaseElement {
+    /// Creates a base element with just an id.
+    pub fn new(id: BpmnId) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
+    }
+}
+
+/// Data shared by all flow nodes (events, activities, gateways).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FlowNode {
+    /// Common element data.
+    pub base: BaseElement,
+    /// The `name` attribute (the label on the diagram).
+    pub name: Option<String>,
+    /// `incoming` child elements (sequence flow ids), as written.
+    pub incoming: Vec<BpmnId>,
+    /// `outgoing` child elements (sequence flow ids), as written.
+    pub outgoing: Vec<BpmnId>,
+}
+
+/// One element inside a process's flow-element collection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlowElement {
+    /// An event (start, end, intermediate, boundary).
+    Event(Event),
+    /// An activity (tasks in M1; subprocesses and call activities later).
+    Activity(Activity),
+    /// A gateway.
+    Gateway(Gateway),
+    /// A sequence flow connecting two flow nodes.
+    SequenceFlow(SequenceFlow),
+    /// Anything not modeled yet (subprocesses, data objects, lanes, ...).
+    Unknown(RawXml),
+}
+
+impl FlowElement {
+    /// The element's id, when it is a modeled element.
+    pub fn id(&self) -> Option<&BpmnId> {
+        match self {
+            FlowElement::Event(e) => Some(&e.node.base.id),
+            FlowElement::Activity(a) => Some(&a.node.base.id),
+            FlowElement::Gateway(g) => Some(&g.node.base.id),
+            FlowElement::SequenceFlow(f) => Some(&f.base.id),
+            FlowElement::Unknown(_) => None,
+        }
+    }
+
+    /// The element's display name, when it has one.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            FlowElement::Event(e) => e.node.name.as_deref(),
+            FlowElement::Activity(a) => a.node.name.as_deref(),
+            FlowElement::Gateway(g) => g.node.name.as_deref(),
+            FlowElement::SequenceFlow(f) => f.name.as_deref(),
+            FlowElement::Unknown(_) => None,
+        }
+    }
+}
+
+/// An event. Two orthogonal axes: where it sits ([`EventPosition`]) and what
+/// triggers/results it carries ([`EventDefinition`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    /// Flow node data.
+    pub node: FlowNode,
+    /// Start / end / intermediate / boundary.
+    pub position: EventPosition,
+    /// Zero (plain), one (typed), or several (multiple) definitions.
+    pub definitions: Vec<EventDefinition>,
+}
+
+/// Where an event sits in the process.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventPosition {
+    /// `startEvent`.
+    Start {
+        /// The `isInterrupting` attribute (absent means `true`).
+        is_interrupting: Option<bool>,
+    },
+    /// `endEvent`.
+    End,
+    /// `intermediateCatchEvent`.
+    IntermediateCatch,
+    /// `intermediateThrowEvent`.
+    IntermediateThrow,
+    /// `boundaryEvent`, attached to an activity.
+    Boundary {
+        /// The `attachedToRef` attribute.
+        attached_to: BpmnId,
+        /// The `cancelActivity` attribute (absent means `true`).
+        cancel_activity: Option<bool>,
+    },
+}
+
+/// What an event reacts to or produces (M1 models message and terminate; the
+/// rest round-trips verbatim until M4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventDefinition {
+    /// `messageEventDefinition`.
+    Message {
+        /// Id of the element itself, if present.
+        id: Option<BpmnId>,
+        /// The `messageRef` attribute.
+        message_ref: Option<String>,
+    },
+    /// `terminateEventDefinition`.
+    Terminate {
+        /// Id of the element itself, if present.
+        id: Option<BpmnId>,
+    },
+    /// Any other definition (timer, signal, error, ...), preserved verbatim.
+    Other(RawXml),
+}
+
+/// An activity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Activity {
+    /// Flow node data.
+    pub node: FlowNode,
+    /// What kind of activity this is.
+    pub kind: ActivityKind,
+}
+
+/// The kinds of activity (M1: tasks only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// One of the eight task types.
+    Task(TaskType),
+}
+
+/// BPMN task types, by XML tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskType {
+    /// `task` — the generic, untyped task.
+    Generic,
+    /// `userTask`.
+    User,
+    /// `serviceTask`.
+    Service,
+    /// `scriptTask`.
+    Script,
+    /// `manualTask`.
+    Manual,
+    /// `sendTask`.
+    Send,
+    /// `receiveTask`.
+    Receive,
+    /// `businessRuleTask`.
+    BusinessRule,
+}
+
+/// A gateway.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gateway {
+    /// Flow node data.
+    pub node: FlowNode,
+    /// What kind of gateway this is.
+    pub kind: GatewayKind,
+    /// The `default` attribute (default sequence flow), on exclusive,
+    /// inclusive, and complex gateways.
+    pub default_flow: Option<BpmnId>,
+    /// The `isMarkerVisible` attribute of the DI shape lives in DI; this is
+    /// the semantic `instantiate` attribute of event-based gateways.
+    pub instantiate: Option<bool>,
+}
+
+/// The kinds of gateway, by XML tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayKind {
+    /// `exclusiveGateway`.
+    Exclusive,
+    /// `parallelGateway`.
+    Parallel,
+    /// `inclusiveGateway`.
+    Inclusive,
+    /// `eventBasedGateway`.
+    EventBased,
+    /// `complexGateway`.
+    Complex,
+}
+
+/// A sequence flow connecting two flow nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequenceFlow {
+    /// Common element data.
+    pub base: BaseElement,
+    /// The `name` attribute (the label on the diagram).
+    pub name: Option<String>,
+    /// The `sourceRef` attribute.
+    pub source: BpmnId,
+    /// The `targetRef` attribute.
+    pub target: BpmnId,
+    /// The `conditionExpression` child, preserved verbatim (modeled in M3).
+    pub condition: Option<RawXml>,
+}
+
+/// A `process` root element.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Process {
+    /// Common element data.
+    pub base: BaseElement,
+    /// The `name` attribute.
+    pub name: Option<String>,
+    /// The `isExecutable` attribute, as written (absent stays absent).
+    pub is_executable: Option<bool>,
+    /// Flow elements in document order. Unmodeled children (lane sets,
+    /// artifacts, data objects, ...) are interleaved as
+    /// [`FlowElement::Unknown`] so order survives the round-trip.
+    pub flow_elements: Vec<FlowElement>,
+}
+
+/// A direct child of `definitions`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RootElement {
+    /// A `process`.
+    Process(Process),
+    /// Anything else (collaborations, messages, signals, ...), verbatim.
+    Unknown(RawXml),
+}
+
+/// The `definitions` document root.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Definitions {
+    /// The `id` attribute.
+    pub id: Option<BpmnId>,
+    /// The `targetNamespace` attribute.
+    pub target_namespace: String,
+    /// The `exporter` attribute, preserved from the source file.
+    pub exporter: Option<String>,
+    /// The `exporterVersion` attribute, preserved from the source file.
+    pub exporter_version: Option<String>,
+    /// Every namespace declaration on the root, in source order
+    /// (`None` prefix = default `xmlns`). Preserved so raw fragments keep
+    /// their prefixes working; the writer only appends, never removes.
+    pub ns_decls: Vec<(Option<String>, String)>,
+    /// Other root attributes (`xsi:schemaLocation`, vendor attributes, ...).
+    pub unknown_attrs: Vec<(String, String)>,
+    /// Semantic root elements in document order.
+    pub root_elements: Vec<RootElement>,
+    /// BPMN DI diagrams (siblings of the semantic model, never embedded).
+    pub diagrams: Vec<crate::di::BpmnDiagram>,
+}

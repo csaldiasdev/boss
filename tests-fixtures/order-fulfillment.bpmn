@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" id="Definitions_order" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.26.0">
+  <bpmn:process id="Process_Order" name="Order fulfillment" isExecutable="true">
+    <bpmn:documentation>Ships an order when it is in stock.</bpmn:documentation>
+    <bpmn:startEvent id="StartEvent_Order" name="Order received">
+      <bpmn:outgoing>Flow_ToReview</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:userTask id="Task_Review" name="Review order" camunda:assignee="demo" camunda:candidateGroups="sales">
+      <bpmn:extensionElements>
+        <camunda:formData>
+          <camunda:formField id="approved" label="Approve?" type="boolean" />
+        </camunda:formData>
+        <camunda:properties>
+          <camunda:property name="sla" value="24h" />
+        </camunda:properties>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_ToReview</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToGateway</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Gateway_Stock" name="In stock?" default="Flow_No">
+      <bpmn:incoming>Flow_ToGateway</bpmn:incoming>
+      <bpmn:outgoing>Flow_Yes</bpmn:outgoing>
+      <bpmn:outgoing>Flow_No</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="Task_Ship" name="Ship order" camunda:class="com.acme.shipping.ShipOrder">
+      <bpmn:incoming>Flow_Yes</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToShipped</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End_Shipped" name="Shipped">
+      <bpmn:incoming>Flow_ToShipped</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:task id="Task_Notify" name="Notify customer">
+      <bpmn:incoming>Flow_No</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToNotShipped</bpmn:outgoing>
+    </bpmn:task>
+    <bpmn:endEvent id="End_NotShipped" name="Not shipped">
+      <bpmn:incoming>Flow_ToNotShipped</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_ToReview" sourceRef="StartEvent_Order" targetRef="Task_Review" />
+    <bpmn:sequenceFlow id="Flow_ToGateway" sourceRef="Task_Review" targetRef="Gateway_Stock" />
+    <bpmn:sequenceFlow id="Flow_Yes" name="yes" sourceRef="Gateway_Stock" targetRef="Task_Ship">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${inStock}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_No" name="no" sourceRef="Gateway_Stock" targetRef="Task_Notify" />
+    <bpmn:sequenceFlow id="Flow_ToShipped" sourceRef="Task_Ship" targetRef="End_Shipped" />
+    <bpmn:sequenceFlow id="Flow_ToNotShipped" sourceRef="Task_Notify" targetRef="End_NotShipped" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Process_Order">
+      <bpmndi:BPMNShape id="StartEvent_Order_di" bpmnElement="StartEvent_Order">
+        <dc:Bounds x="179" y="99" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="161" y="142" width="73" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Review_di" bpmnElement="Task_Review">
+        <dc:Bounds x="270" y="77" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_Stock_di" bpmnElement="Gateway_Stock" isMarkerVisible="true">
+        <dc:Bounds x="425" y="92" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="427" y="62" width="46" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Ship_di" bpmnElement="Task_Ship">
+        <dc:Bounds x="530" y="37" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Shipped_di" bpmnElement="End_Shipped">
+        <dc:Bounds x="692" y="59" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="689" y="102" width="42" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Notify_di" bpmnElement="Task_Notify">
+        <dc:Bounds x="530" y="157" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_NotShipped_di" bpmnElement="End_NotShipped">
+        <dc:Bounds x="692" y="179" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="681" y="222" width="59" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_ToReview_di" bpmnElement="Flow_ToReview">
+        <di:waypoint x="215" y="117" />
+        <di:waypoint x="270" y="117" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToGateway_di" bpmnElement="Flow_ToGateway">
+        <di:waypoint x="370" y="117" />
+        <di:waypoint x="425" y="117" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Yes_di" bpmnElement="Flow_Yes">
+        <di:waypoint x="450" y="92" />
+        <di:waypoint x="450" y="77" />
+        <di:waypoint x="530" y="77" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="482" y="59" width="18" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_No_di" bpmnElement="Flow_No">
+        <di:waypoint x="450" y="142" />
+        <di:waypoint x="450" y="197" />
+        <di:waypoint x="530" y="197" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="484" y="179" width="14" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToShipped_di" bpmnElement="Flow_ToShipped">
+        <di:waypoint x="630" y="77" />
+        <di:waypoint x="692" y="77" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToNotShipped_di" bpmnElement="Flow_ToNotShipped">
+        <di:waypoint x="630" y="197" />
+        <di:waypoint x="692" y="197" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
