@@ -9,20 +9,17 @@ use iced::widget::{button, column, container, row, space, text};
 use iced::{Center, Element, Fill, Size, Task, Theme, Vector};
 
 /// Re-brands a document as exported by boss before saving: boss becomes the
-/// exporter, and the bpmn.io placeholder `targetNamespace` (or an empty one)
-/// becomes ours. A real corporate namespace is left alone, and vendor
-/// extension content is never touched — that is user data.
+/// exporter and `targetNamespace` always becomes boss's own — only the
+/// ISO/OMG namespaces carry meaning here, never another tool's. Vendor
+/// extension content inside the document is ignored but preserved verbatim:
+/// that is user data.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // used by wasm saving in M2
 fn branded_for_save(document: &Document) -> Document {
-    use bpmn_core::model::{BOSS_TARGET_NAMESPACE, BPMN_IO_PLACEHOLDER_NAMESPACE};
-
     let mut document = document.clone();
     let def = &mut document.definitions;
     def.exporter = Some(String::from("boss"));
     def.exporter_version = Some(String::from(env!("CARGO_PKG_VERSION")));
-    if def.target_namespace.is_empty() || def.target_namespace == BPMN_IO_PLACEHOLDER_NAMESPACE {
-        def.target_namespace = String::from(BOSS_TARGET_NAMESPACE);
-    }
+    def.target_namespace = String::from(bpmn_core::model::BOSS_TARGET_NAMESPACE);
     document
 }
 
@@ -371,13 +368,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn branding_replaces_exporter_and_placeholder_namespace() {
+    fn branding_replaces_exporter_and_target_namespace() {
         let mut doc = bpmn_xml::parse(include_str!(
             "../../../tests-fixtures/order-fulfillment.bpmn"
         ))
         .unwrap();
-        doc.definitions.target_namespace =
-            String::from(bpmn_core::model::BPMN_IO_PLACEHOLDER_NAMESPACE);
         doc.definitions.exporter = Some(String::from("Some Other Modeler"));
         let branded = branded_for_save(&doc);
 
@@ -394,18 +389,9 @@ mod tests {
 
         let out = bpmn_xml::write(&branded);
         assert!(!out.contains("Some Other Modeler"));
-        assert!(!out.contains("bpmn.io"));
-        // Vendor extension content is user data and stays untouched.
+        // The fixture's foreign targetNamespace is gone...
+        assert!(!out.contains("targetNamespace=\"https://example.com/bpmn\""));
+        // ...but vendor extension content is user data and stays untouched.
         assert!(out.contains("acme:assignee=\"demo\""));
-    }
-
-    #[test]
-    fn branding_keeps_a_real_target_namespace() {
-        let doc = bpmn_xml::parse(include_str!("../../../tests-fixtures/minimal.bpmn")).unwrap();
-        let branded = branded_for_save(&doc);
-        assert_eq!(
-            branded.definitions.target_namespace,
-            "https://example.com/bpmn"
-        );
     }
 }
