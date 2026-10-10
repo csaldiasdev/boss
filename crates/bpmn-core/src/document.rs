@@ -7,7 +7,10 @@ use crate::model::{Definitions, FlowElement, Process, RootElement};
 use std::collections::HashMap;
 
 /// A loaded `.bpmn` document.
-#[derive(Debug, Clone, PartialEq, Default)]
+///
+/// `Default` (in `edit.rs`) is a fresh document with one empty process, not an
+/// all-empty struct.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Document {
     /// The document root.
     pub definitions: Definitions,

@@ -326,7 +326,10 @@ dependencies = [
  "bpmn-xml",
  "console_error_panic_hook",
  "iced",
+ "js-sys",
  "rfd",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

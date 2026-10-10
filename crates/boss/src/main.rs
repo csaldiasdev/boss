@@ -5,6 +5,7 @@ mod camera;
 mod canvas;
 mod platform;
 mod render;
+mod session;
 mod theme;
 
 use app::App;
@@ -17,6 +18,7 @@ pub fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
+        .subscription(App::subscription)
         .antialiasing(true)
         .font(theme::FONT_SANS_REGULAR)
         .font(theme::FONT_SANS_MEDIUM)

@@ -66,6 +66,8 @@ pub struct CanvasTokens {
     pub label: Color,
     /// Flow labels and event captions.
     pub edge_label: Color,
+    /// Selection outlines, marquee, and interaction ghosts (the accent).
+    pub selection: Color,
 }
 
 /// The full Slate token set for one mode.
@@ -114,6 +116,7 @@ const LIGHT: Tokens = Tokens {
         fill: Color::from_rgb8(0xff, 0xff, 0xff),
         label: Color::from_rgb8(0x1b, 0x21, 0x29),
         edge_label: Color::from_rgb8(0x5d, 0x67, 0x73),
+        selection: Color::from_rgb8(0x25, 0x63, 0xeb),
     },
 };
 
@@ -136,6 +139,7 @@ const DARK: Tokens = Tokens {
         fill: Color::from_rgb8(0x22, 0x27, 0x30),
         label: Color::from_rgb8(0xe5, 0xe9, 0xee),
         edge_label: Color::from_rgb8(0x98, 0xa2, 0xae),
+        selection: Color::from_rgb8(0x6a, 0x99, 0xf5),
     },
 };
 
@@ -195,6 +199,27 @@ pub fn tool_button(t: Tokens) -> impl Fn(&Theme, button::Status) -> button::Styl
             text_color: t.text,
             border: Border {
                 color: t.border,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Style for palette entries; the active tool gets an accent outline.
+pub fn palette_button(t: Tokens, active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => t.bg,
+            _ => t.surface,
+        };
+
+        button::Style {
+            background: Some(background.into()),
+            text_color: if active { t.accent } else { t.text },
+            border: Border {
+                color: if active { t.accent } else { t.border },
                 width: 1.0,
                 radius: 6.0.into(),
             },
