@@ -1,0 +1,17 @@
+[package]
+name = "bpmn-xml"
+description = "BPMN 2.0 XML (ISO/IEC 19510) reader and writer with round-trip fidelity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bpmn-core.workspace = true
+quick-xml.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

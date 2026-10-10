@@ -1,0 +1,15 @@
+[package]
+name = "boss-mcp"
+description = "MCP server exposing the boss editor to AI agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bpmn-core.workspace = true
+
+[lints]
+workspace = true

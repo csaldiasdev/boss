@@ -1,0 +1,15 @@
+[package]
+name = "bpmn-validate"
+description = "Validation rule engine for BPMN 2.0 documents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bpmn-core.workspace = true
+
+[lints]
+workspace = true

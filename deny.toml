@@ -1,0 +1,30 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# Guards the dependency tree against licenses we cannot ship under CC0-friendly
+# terms and against suspicious crate sources.
+
+[licenses]
+# Permissive licenses only. Anything outside this list (GPL, MPL, proprietary,
+# unlicensed crates, ...) fails the check and must be discussed explicitly.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Zlib",
+  "ISC",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "Unlicense",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# Our own crates reference each other by path without a version requirement.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

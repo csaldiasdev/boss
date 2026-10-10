@@ -1,0 +1,21 @@
+[package]
+name = "boss"
+description = "A truly open-source BPMN editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+iced = { workspace = true, features = ["tokio"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+iced = { workspace = true, features = ["webgl"] }
+console_error_panic_hook = "0.1"
+
+[lints]
+workspace = true
