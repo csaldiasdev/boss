@@ -10,8 +10,9 @@ use crate::document::Document;
 use crate::geometry::{Bounds, Point, Size};
 use crate::ids::BpmnId;
 use crate::model::{
-    Activity, ActivityKind, BOSS_TARGET_NAMESPACE, BaseElement, Definitions, Event, EventPosition,
-    FlowElement, FlowNode, Gateway, GatewayKind, Process, RootElement, SequenceFlow, TaskType,
+    Activity, ActivityKind, BOSS_TARGET_NAMESPACE, BaseElement, Condition, Definitions, Event,
+    EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, Process, RootElement, SequenceFlow,
+    TaskType,
 };
 use std::collections::HashSet;
 
@@ -371,34 +372,39 @@ impl Document {
         }
 
         for (flow_id, source, target) in touched {
-            let Some((source_outline, source_bounds)) = self.node_outline(&source) else {
-                continue;
-            };
-            let Some((target_outline, target_bounds)) = self.node_outline(&target) else {
-                continue;
-            };
-            let Some(plane) = self.plane_mut() else {
-                return;
-            };
-            for element in &mut plane.elements {
-                if let DiElement::Edge(edge) = element
-                    && edge.bpmn_element == flow_id
-                    && edge.waypoints.len() >= 2
-                {
-                    let n = edge.waypoints.len();
-                    let toward_first = if n == 2 {
-                        target_bounds.center()
-                    } else {
-                        edge.waypoints[1]
-                    };
-                    let toward_last = if n == 2 {
-                        source_bounds.center()
-                    } else {
-                        edge.waypoints[n - 2]
-                    };
-                    edge.waypoints[0] = source_outline.anchor(source_bounds, toward_first);
-                    edge.waypoints[n - 1] = target_outline.anchor(target_bounds, toward_last);
-                }
+            self.reanchor_flow(&flow_id, &source, &target);
+        }
+    }
+
+    /// Recomputes one flow's endpoint waypoints against its nodes' borders.
+    fn reanchor_flow(&mut self, flow_id: &BpmnId, source: &BpmnId, target: &BpmnId) {
+        let Some((source_outline, source_bounds)) = self.node_outline(source) else {
+            return;
+        };
+        let Some((target_outline, target_bounds)) = self.node_outline(target) else {
+            return;
+        };
+        let Some(plane) = self.plane_mut() else {
+            return;
+        };
+        for element in &mut plane.elements {
+            if let DiElement::Edge(edge) = element
+                && edge.bpmn_element == *flow_id
+                && edge.waypoints.len() >= 2
+            {
+                let n = edge.waypoints.len();
+                let toward_first = if n == 2 {
+                    target_bounds.center()
+                } else {
+                    edge.waypoints[1]
+                };
+                let toward_last = if n == 2 {
+                    source_bounds.center()
+                } else {
+                    edge.waypoints[n - 2]
+                };
+                edge.waypoints[0] = source_outline.anchor(source_bounds, toward_first);
+                edge.waypoints[n - 1] = target_outline.anchor(target_bounds, toward_last);
             }
         }
     }
@@ -444,6 +450,316 @@ impl Document {
                 DiElement::Unknown(_) => true,
             });
         }
+    }
+}
+
+impl Document {
+    fn flow_element_mut(&mut self, id: &BpmnId) -> Option<&mut FlowElement> {
+        self.definitions
+            .root_elements
+            .iter_mut()
+            .filter_map(|root| match root {
+                RootElement::Process(process) => Some(process),
+                RootElement::Unknown(_) => None,
+            })
+            .flat_map(|process| process.flow_elements.iter_mut())
+            .find(|element| element.id() == Some(id))
+    }
+
+    /// Renames a flow element (`None` removes the name).
+    pub fn set_name(&mut self, id: &BpmnId, name: Option<String>) -> bool {
+        let name = name.filter(|n| !n.is_empty());
+        match self.flow_element_mut(id) {
+            Some(FlowElement::Event(e)) => e.node.name = name,
+            Some(FlowElement::Activity(a)) => a.node.name = name,
+            Some(FlowElement::Gateway(g)) => g.node.name = name,
+            Some(FlowElement::SequenceFlow(f)) => f.name = name,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Changes a task's type (its XML tag).
+    pub fn set_task_type(&mut self, id: &BpmnId, task_type: TaskType) -> bool {
+        if let Some(FlowElement::Activity(activity)) = self.flow_element_mut(id) {
+            activity.kind = ActivityKind::Task(task_type);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sets a gateway's default flow; `None` clears it. The flow must leave
+    /// that gateway.
+    pub fn set_gateway_default(&mut self, id: &BpmnId, default: Option<BpmnId>) -> bool {
+        if let Some(d) = &default
+            && !self.outgoing_flows(id).contains(d)
+        {
+            return false;
+        }
+        if let Some(FlowElement::Gateway(gateway)) = self.flow_element_mut(id) {
+            gateway.default_flow = default;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The sequence flows leaving a node, in document order.
+    pub fn outgoing_flows(&self, id: &BpmnId) -> Vec<BpmnId> {
+        self.flow_elements()
+            .filter_map(|element| match element {
+                FlowElement::SequenceFlow(flow) if flow.source == *id => Some(flow.base.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sets a sequence flow's condition text. Empty/`None` clears it; an
+    /// existing `xsi:type` is kept when only the text changes.
+    pub fn set_condition(&mut self, id: &BpmnId, text: Option<String>) -> bool {
+        let Some(FlowElement::SequenceFlow(flow)) = self.flow_element_mut(id) else {
+            return false;
+        };
+        let text = text.filter(|t| !t.is_empty());
+        flow.condition = match (text, flow.condition.take()) {
+            (None, _) => None,
+            (Some(text), Some(Condition::Expression { xsi_type, .. })) => {
+                Some(Condition::Expression { xsi_type, text })
+            }
+            (Some(text), _) => Some(Condition::Expression {
+                xsi_type: None,
+                text,
+            }),
+        };
+        true
+    }
+
+    /// Replaces a flow's waypoints (at least two), then re-anchors the ends.
+    pub fn set_edge_waypoints(&mut self, flow_id: &BpmnId, waypoints: &[Point]) -> bool {
+        if waypoints.len() < 2 {
+            return false;
+        }
+        let (source, target) = match self.flow_element_index().get(flow_id) {
+            Some(FlowElement::SequenceFlow(flow)) => (flow.source.clone(), flow.target.clone()),
+            _ => return false,
+        };
+
+        let Some(plane) = self.plane_mut() else {
+            return false;
+        };
+        let mut found = false;
+        for element in &mut plane.elements {
+            if let DiElement::Edge(edge) = element
+                && edge.bpmn_element == *flow_id
+            {
+                edge.waypoints = waypoints.to_vec();
+                found = true;
+            }
+        }
+        if found {
+            self.reanchor_flow(flow_id, &source, &target);
+        }
+        found
+    }
+
+    /// Copies `selection` (plus flows fully inside it) into a standalone
+    /// document — the clipboard payload is plain BPMN XML.
+    #[must_use]
+    pub fn extract(&self, selection: &HashSet<BpmnId>) -> Document {
+        let mut out = Document::new();
+
+        let keep: HashSet<BpmnId> = self
+            .flow_elements()
+            .filter_map(|element| match element {
+                FlowElement::SequenceFlow(flow) => (selection.contains(&flow.source)
+                    && selection.contains(&flow.target))
+                .then(|| flow.base.id.clone()),
+                other => other.id().filter(|id| selection.contains(id)).cloned(),
+            })
+            .collect();
+
+        if let Some(process) = out.first_process_mut() {
+            // (populated below; split for borrow clarity)
+            process.flow_elements.clear();
+        }
+        let mut elements = Vec::new();
+        for element in self.flow_elements() {
+            if element.id().is_some_and(|id| keep.contains(id)) {
+                let mut element = element.clone();
+                if let Some(node) = flow_node_mut(&mut element) {
+                    node.incoming.retain(|id| keep.contains(id));
+                    node.outgoing.retain(|id| keep.contains(id));
+                }
+                if let FlowElement::Gateway(gateway) = &mut element
+                    && gateway
+                        .default_flow
+                        .as_ref()
+                        .is_some_and(|id| !keep.contains(id))
+                {
+                    gateway.default_flow = None;
+                }
+                elements.push(element);
+            }
+        }
+        if let Some(process) = out.first_process_mut() {
+            process.flow_elements = elements;
+        }
+
+        let mut di = Vec::new();
+        if let Some(plane) = self.diagram().and_then(|d| d.plane.as_ref()) {
+            for element in &plane.elements {
+                match element {
+                    DiElement::Shape(shape) if keep.contains(&shape.bpmn_element) => {
+                        di.push(DiElement::Shape(shape.clone()));
+                    }
+                    DiElement::Edge(edge) if keep.contains(&edge.bpmn_element) => {
+                        di.push(DiElement::Edge(edge.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(plane) = out.plane_mut() {
+            plane.elements = di;
+        }
+
+        out
+    }
+
+    /// Pastes every modeled flow element of `source` into this document with
+    /// fresh ids, offset by `(dx, dy)`. Returns the new node ids (not flows).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one coherent remap pass; splitting it obscures the id mapping"
+    )]
+    pub fn paste_from(&mut self, source: &Document, dx: f64, dy: f64) -> Vec<BpmnId> {
+        use std::collections::HashMap;
+
+        let mut used = self.used_ids();
+        let mut fresh = |prefix: &str| -> BpmnId {
+            let mut n = 1u32;
+            loop {
+                let candidate = format!("{prefix}_{n}");
+                if !used.contains(&candidate) {
+                    used.insert(candidate.clone());
+                    return BpmnId::new(candidate.as_str());
+                }
+                n += 1;
+            }
+        };
+
+        // First pass: a new id for every modeled element.
+        let mut mapping: HashMap<BpmnId, BpmnId> = HashMap::new();
+        for element in source.flow_elements() {
+            let Some(old) = element.id() else { continue };
+            let prefix = match element {
+                FlowElement::Event(_) => "Event",
+                FlowElement::Activity(_) => "Activity",
+                FlowElement::Gateway(_) => "Gateway",
+                FlowElement::SequenceFlow(_) => "Flow",
+                FlowElement::Unknown(_) => continue,
+            };
+            mapping.insert(old.clone(), fresh(prefix));
+        }
+        let remap = |id: &BpmnId, mapping: &HashMap<BpmnId, BpmnId>| {
+            mapping.get(id).cloned().unwrap_or_else(|| id.clone())
+        };
+
+        let mut new_nodes = Vec::new();
+        let mut elements = Vec::new();
+        for element in source.flow_elements() {
+            let Some(old) = element.id() else { continue };
+            let Some(new) = mapping.get(old) else {
+                continue;
+            };
+            let mut element = element.clone();
+            match &mut element {
+                FlowElement::SequenceFlow(flow) => {
+                    // A flow whose endpoints were not pasted makes no sense.
+                    if !mapping.contains_key(&flow.source) || !mapping.contains_key(&flow.target) {
+                        continue;
+                    }
+                    flow.base.id = new.clone();
+                    flow.source = remap(&flow.source, &mapping);
+                    flow.target = remap(&flow.target, &mapping);
+                }
+                other => {
+                    if let Some(node) = flow_node_mut(other) {
+                        node.base.id = new.clone();
+                        node.incoming = node
+                            .incoming
+                            .iter()
+                            .filter(|id| mapping.contains_key(*id))
+                            .map(|id| remap(id, &mapping))
+                            .collect();
+                        node.outgoing = node
+                            .outgoing
+                            .iter()
+                            .filter(|id| mapping.contains_key(*id))
+                            .map(|id| remap(id, &mapping))
+                            .collect();
+                    }
+                    if let FlowElement::Gateway(gateway) = other {
+                        gateway.default_flow = gateway
+                            .default_flow
+                            .take()
+                            .filter(|id| mapping.contains_key(id))
+                            .map(|id| remap(&id, &mapping));
+                    }
+                    new_nodes.push(new.clone());
+                }
+            }
+            elements.push(element);
+        }
+        if let Some(process) = self.first_process_mut() {
+            process.flow_elements.extend(elements);
+        }
+
+        let mut di = Vec::new();
+        if let Some(plane) = source.diagram().and_then(|d| d.plane.as_ref()) {
+            for element in &plane.elements {
+                match element {
+                    DiElement::Shape(shape) if mapping.contains_key(&shape.bpmn_element) => {
+                        let mut shape = shape.clone();
+                        shape.bpmn_element = remap(&shape.bpmn_element, &mapping);
+                        shape.id = Some(BpmnId::new(format!("{}_di", shape.bpmn_element).as_str()));
+                        shape.bounds.x += dx;
+                        shape.bounds.y += dy;
+                        if let Some(label) = &mut shape.label {
+                            shape_label_offset(label, dx, dy);
+                        }
+                        di.push(DiElement::Shape(shape));
+                    }
+                    DiElement::Edge(edge) if mapping.contains_key(&edge.bpmn_element) => {
+                        let mut edge = edge.clone();
+                        edge.bpmn_element = remap(&edge.bpmn_element, &mapping);
+                        edge.id = Some(BpmnId::new(format!("{}_di", edge.bpmn_element).as_str()));
+                        for point in &mut edge.waypoints {
+                            point.x += dx;
+                            point.y += dy;
+                        }
+                        if let Some(label) = &mut edge.label {
+                            shape_label_offset(label, dx, dy);
+                        }
+                        di.push(DiElement::Edge(edge));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(plane) = self.plane_mut() {
+            plane.elements.extend(di);
+        }
+
+        new_nodes
+    }
+}
+
+fn shape_label_offset(label: &mut crate::di::BpmnLabel, dx: f64, dy: f64) {
+    if let Some(bounds) = &mut label.bounds {
+        bounds.x += dx;
+        bounds.y += dy;
     }
 }
 
@@ -560,5 +876,142 @@ mod tests {
         let doc = Document::new();
         assert!(doc.processes().next().is_some());
         assert!(doc.diagram().is_some());
+    }
+}
+
+#[cfg(test)]
+mod m3_tests {
+    use super::*;
+
+    #[test]
+    fn property_setters() {
+        let mut doc = Document::new();
+        let gw = doc
+            .create_node(
+                NodeKind::Gateway(GatewayKind::Exclusive),
+                Point::new(0.0, 0.0),
+            )
+            .unwrap();
+        let task = doc
+            .create_node(NodeKind::Task(TaskType::Generic), Point::new(200.0, 0.0))
+            .unwrap();
+        let flow = doc.connect(&gw, &task).unwrap();
+
+        assert!(doc.set_name(&task, Some(String::from("Review"))));
+        assert!(doc.set_task_type(&task, TaskType::User));
+        assert!(doc.set_gateway_default(&gw, Some(flow.clone())));
+        assert!(
+            !doc.set_gateway_default(&gw, Some(task.clone())),
+            "not an outgoing flow"
+        );
+        assert!(doc.set_condition(&flow, Some(String::from("${ok}"))));
+
+        let index = doc.flow_element_index();
+        let FlowElement::Activity(a) = index[&task] else {
+            panic!()
+        };
+        assert_eq!(a.node.name.as_deref(), Some("Review"));
+        assert_eq!(a.kind, ActivityKind::Task(TaskType::User));
+        let FlowElement::SequenceFlow(f) = index[&flow] else {
+            panic!()
+        };
+        assert!(matches!(
+            &f.condition,
+            Some(Condition::Expression { xsi_type: None, text }) if text == "${ok}"
+        ));
+
+        // Clearing works too.
+        assert!(doc.set_condition(&flow, None));
+        assert!(doc.set_name(&task, None));
+    }
+
+    #[test]
+    fn waypoints_replace_and_reanchor() {
+        let mut doc = Document::new();
+        let a = doc
+            .create_node(NodeKind::StartEvent, Point::new(0.0, 0.0))
+            .unwrap();
+        let b = doc
+            .create_node(NodeKind::EndEvent, Point::new(300.0, 0.0))
+            .unwrap();
+        let flow = doc.connect(&a, &b).unwrap();
+
+        assert!(doc.set_edge_waypoints(
+            &flow,
+            &[
+                Point::new(0.0, 0.0),
+                Point::new(150.0, 120.0),
+                Point::new(300.0, 0.0),
+            ],
+        ));
+
+        let plane = doc.diagram().unwrap().plane.as_ref().unwrap();
+        let edge = plane
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                DiElement::Edge(edge) => Some(edge),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(edge.waypoints.len(), 3);
+        assert_eq!(edge.waypoints[1], Point::new(150.0, 120.0));
+        // Endpoints re-anchored toward the interior waypoint, so they left
+        // the shape centers and sit on the circles' borders.
+        assert!((edge.waypoints[0].x.hypot(edge.waypoints[0].y) - 18.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extract_and_paste_remint_ids_and_offset() {
+        let mut doc = Document::new();
+        let a = doc
+            .create_node(NodeKind::StartEvent, Point::new(100.0, 100.0))
+            .unwrap();
+        let b = doc
+            .create_node(NodeKind::Task(TaskType::User), Point::new(300.0, 100.0))
+            .unwrap();
+        let _flow = doc.connect(&a, &b).unwrap();
+
+        let selection: HashSet<BpmnId> = [a.clone(), b.clone()].into_iter().collect();
+        let clipboard = doc.extract(&selection);
+        assert_eq!(clipboard.flow_elements().count(), 3);
+
+        let pasted = doc.paste_from(&clipboard, 20.0, 20.0);
+        assert_eq!(pasted.len(), 2);
+        assert_eq!(doc.flow_elements().count(), 6);
+
+        // Fresh ids, no collisions.
+        let index = doc.flow_element_index();
+        assert_eq!(index.len(), 6);
+        assert!(index.contains_key(&BpmnId::from("Event_2")));
+        assert!(index.contains_key(&BpmnId::from("Activity_2")));
+        assert!(index.contains_key(&BpmnId::from("Flow_2")));
+
+        // The pasted flow connects the pasted nodes, not the originals.
+        let FlowElement::SequenceFlow(f) = index[&BpmnId::from("Flow_2")] else {
+            panic!()
+        };
+        assert_eq!(f.source.as_str(), "Event_2");
+        assert_eq!(f.target.as_str(), "Activity_2");
+
+        // And the pasted shape is offset.
+        let (_, bounds) = doc.node_outline(&BpmnId::from("Event_2")).unwrap();
+        assert_eq!(bounds.center(), Point::new(120.0, 120.0));
+    }
+
+    #[test]
+    fn extract_skips_flows_leaving_the_selection() {
+        let mut doc = Document::new();
+        let a = doc
+            .create_node(NodeKind::StartEvent, Point::new(0.0, 0.0))
+            .unwrap();
+        let b = doc
+            .create_node(NodeKind::EndEvent, Point::new(300.0, 0.0))
+            .unwrap();
+        doc.connect(&a, &b).unwrap();
+
+        let selection: HashSet<BpmnId> = [a].into_iter().collect();
+        let clipboard = doc.extract(&selection);
+        assert_eq!(clipboard.flow_elements().count(), 1, "flow left behind");
     }
 }

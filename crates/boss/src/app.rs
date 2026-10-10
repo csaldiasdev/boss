@@ -6,9 +6,9 @@ use crate::platform::{self, OpenedFile, SavedFile};
 use crate::session::EditSession;
 use crate::theme::{self, Mode, Tokens};
 use bpmn_core::di::DiElement;
-use bpmn_core::model::{GatewayKind, TaskType};
+use bpmn_core::model::{Condition, FlowElement, GatewayKind, TaskType};
 use bpmn_core::{BpmnId, Document, NodeKind};
-use iced::widget::{button, column, container, row, space, text};
+use iced::widget::{button, column, container, pick_list, row, space, text, text_input};
 use iced::{Center, Element, Fill, Size, Subscription, Task, Theme, Vector};
 use std::collections::HashSet;
 
@@ -32,6 +32,39 @@ struct StatusLine {
     is_error: bool,
 }
 
+/// A task type with a human label, for the properties pick list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskTypeChoice(TaskType);
+
+impl std::fmt::Display for TaskTypeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            TaskType::Generic => "Task",
+            TaskType::User => "User task",
+            TaskType::Service => "Service task",
+            TaskType::Script => "Script task",
+            TaskType::Manual => "Manual task",
+            TaskType::Send => "Send task",
+            TaskType::Receive => "Receive task",
+            TaskType::BusinessRule => "Business rule task",
+        })
+    }
+}
+
+const TASK_TYPES: [TaskTypeChoice; 8] = [
+    TaskTypeChoice(TaskType::Generic),
+    TaskTypeChoice(TaskType::User),
+    TaskTypeChoice(TaskType::Service),
+    TaskTypeChoice(TaskType::Script),
+    TaskTypeChoice(TaskType::Manual),
+    TaskTypeChoice(TaskType::Send),
+    TaskTypeChoice(TaskType::Receive),
+    TaskTypeChoice(TaskType::BusinessRule),
+];
+
+/// The "(none)" entry in the default-flow pick list.
+const NO_DEFAULT: &str = "(none)";
+
 /// Top-level application state.
 pub struct App {
     camera: Camera,
@@ -45,6 +78,7 @@ pub struct App {
     selection: HashSet<BpmnId>,
     tool: Tool,
     status: Option<StatusLine>,
+    window_size: Size,
 }
 
 impl Default for App {
@@ -61,6 +95,7 @@ impl Default for App {
             selection: HashSet::new(),
             tool: Tool::Select,
             status: None,
+            window_size: Size::new(1280.0, 800.0),
         }
     }
 }
@@ -90,6 +125,26 @@ pub enum Message {
     Escape,
     /// An unconsumed keyboard event (mapped to shortcuts).
     Keyboard(iced::keyboard::Event),
+    /// The window was resized (drives zoom-to-fit).
+    WindowResized(Size),
+    /// Select every element.
+    SelectAll,
+    /// Copy the selection as BPMN XML to the clipboard.
+    Copy,
+    /// Copy, then delete the selection.
+    Cut,
+    /// Ask the clipboard for BPMN XML to paste.
+    Paste,
+    /// The clipboard answered a paste request.
+    ClipboardPasted(Option<String>),
+    /// The name field of the selected element changed.
+    NameEdited(String),
+    /// The task type of the selected activity changed.
+    TaskTypeChanged(TaskTypeChoice),
+    /// The default flow of the selected gateway changed.
+    DefaultFlowChanged(String),
+    /// The condition of the selected sequence flow changed.
+    ConditionEdited(String),
     /// Start a fresh document.
     NewRequested,
     /// The user asked to open a file.
@@ -134,10 +189,13 @@ impl App {
         self.theme.clone()
     }
 
-    /// Keyboard shortcuts (events no widget consumed).
+    /// Keyboard shortcuts (events no widget consumed) and window resizes.
     pub fn subscription(&self) -> Subscription<Message> {
         let _ = self;
-        iced::keyboard::listen().map(Message::Keyboard)
+        Subscription::batch([
+            iced::keyboard::listen().map(Message::Keyboard),
+            iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
+        ])
     }
 
     fn shortcut(event: &iced::keyboard::Event) -> Option<Message> {
@@ -155,6 +213,10 @@ impl App {
             Key::Character("y") if command => Some(Message::Redo),
             Key::Character("s") if command => Some(Message::SaveRequested),
             Key::Character("o") if command => Some(Message::OpenRequested),
+            Key::Character("a") if command => Some(Message::SelectAll),
+            Key::Character("c") if command => Some(Message::Copy),
+            Key::Character("x") if command => Some(Message::Cut),
+            Key::Character("v") if command => Some(Message::Paste),
             _ => None,
         }
     }
@@ -171,9 +233,8 @@ impl App {
     }
 
     /// Centers the camera on the document and picks a zoom that shows all of
-    /// it. The viewport size is an estimate until M3 tracks the real one.
+    /// it, based on the window size minus the surrounding panels.
     fn zoom_to_fit(&mut self) {
-        const VIEWPORT: Size = Size::new(860.0, 620.0);
         const MARGIN: f32 = 60.0;
 
         let Some(bounds) = self.session.document().content_bounds() else {
@@ -181,9 +242,13 @@ impl App {
             return;
         };
 
+        let viewport = Size::new(
+            (self.window_size.width - 430.0).max(200.0),
+            (self.window_size.height - 110.0).max(200.0),
+        );
         let (width, height) = (bounds.width as f32 + MARGIN, bounds.height as f32 + MARGIN);
-        let scaling = (VIEWPORT.width / width)
-            .min(VIEWPORT.height / height)
+        let scaling = (viewport.width / width)
+            .min(viewport.height / height)
             .clamp(Camera::MIN_SCALING, 1.5);
         let center = bounds.center();
 
@@ -303,8 +368,54 @@ impl App {
                 self.tool = Tool::Select;
                 self.canvas.invalidate();
             }
+            CanvasMessage::SetEdgeWaypoints { id, points } => {
+                let points: Vec<bpmn_core::Point> = points
+                    .iter()
+                    .map(|p| bpmn_core::Point::new(f64::from(p.x), f64::from(p.y)))
+                    .collect();
+                self.session
+                    .commit(|doc| doc.set_edge_waypoints(&id, &points));
+                self.canvas.invalidate();
+            }
             CanvasMessage::CancelTool => self.tool = Tool::Select,
         }
+    }
+
+    /// The selected element, when the selection is exactly one.
+    fn single_selection(&self) -> Option<BpmnId> {
+        (self.selection.len() == 1)
+            .then(|| self.selection.iter().next().cloned())
+            .flatten()
+    }
+
+    fn handle_property(&mut self, message: Message) {
+        let Some(id) = self.single_selection() else {
+            return;
+        };
+        match message {
+            Message::NameEdited(name) => {
+                let name = (!name.is_empty()).then_some(name);
+                self.session
+                    .commit_merged(format!("name:{id}"), |doc| doc.set_name(&id, name));
+            }
+            Message::TaskTypeChanged(choice) => {
+                self.session.commit(|doc| doc.set_task_type(&id, choice.0));
+            }
+            Message::DefaultFlowChanged(flow) => {
+                let default = (flow != NO_DEFAULT).then(|| BpmnId::new(flow.as_str()));
+                self.session
+                    .commit(|doc| doc.set_gateway_default(&id, default));
+            }
+            Message::ConditionEdited(text) => {
+                let text = (!text.is_empty()).then_some(text);
+                self.session
+                    .commit_merged(format!("condition:{id}"), |doc| {
+                        doc.set_condition(&id, text)
+                    });
+            }
+            _ => {}
+        }
+        self.canvas.invalidate();
     }
 
     /// Handles a message.
@@ -364,9 +475,73 @@ impl App {
                     self.tool = Tool::Select;
                 }
             }
+            Message::WindowResized(size) => self.window_size = size,
+            Message::SelectAll => {
+                self.selection = self
+                    .session
+                    .document()
+                    .flow_elements()
+                    .filter_map(|element| element.id().cloned())
+                    .collect();
+            }
+            message @ (Message::Copy
+            | Message::Cut
+            | Message::Paste
+            | Message::ClipboardPasted(_)) => return self.handle_clipboard(message),
+            message @ (Message::NameEdited(_)
+            | Message::TaskTypeChanged(_)
+            | Message::DefaultFlowChanged(_)
+            | Message::ConditionEdited(_)) => self.handle_property(message),
             message => return self.handle_file(message),
         }
 
+        Task::none()
+    }
+
+    /// Handles the clipboard message family (BPMN XML as the payload).
+    fn handle_clipboard(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Copy => {
+                if !self.selection.is_empty() {
+                    let xml = bpmn_xml::write(&self.session.document().extract(&self.selection));
+                    return iced::clipboard::write(xml);
+                }
+            }
+            Message::Cut => {
+                if !self.selection.is_empty() {
+                    let xml = bpmn_xml::write(&self.session.document().extract(&self.selection));
+                    let doomed = self.selection.clone();
+                    self.session.commit(|doc| {
+                        doc.delete_elements(&doomed);
+                        true
+                    });
+                    self.selection.clear();
+                    self.canvas.invalidate();
+                    return iced::clipboard::write(xml);
+                }
+            }
+            Message::Paste => {
+                return iced::clipboard::read().map(Message::ClipboardPasted);
+            }
+            Message::ClipboardPasted(Some(contents)) => {
+                if let Ok(source) = bpmn_xml::parse(&contents) {
+                    let mut pasted = Vec::new();
+                    self.session.commit(|doc| {
+                        pasted = doc.paste_from(&source, 20.0, 20.0);
+                        !pasted.is_empty()
+                    });
+                    if pasted.is_empty() {
+                        self.status("Nothing pastable on the clipboard", true);
+                    } else {
+                        self.selection = pasted.into_iter().collect();
+                        self.canvas.invalidate();
+                    }
+                } else {
+                    self.status("Clipboard does not hold BPMN XML", true);
+                }
+            }
+            _ => {}
+        }
         Task::none()
     }
 
@@ -449,7 +624,7 @@ impl App {
                 )
                 .width(Fill)
                 .height(Fill),
-                Self::properties(t),
+                self.properties(t),
             ]
             .width(Fill)
             .height(Fill),
@@ -565,19 +740,105 @@ impl App {
         .into()
     }
 
-    fn properties(t: Tokens) -> Element<'static, Message> {
-        container(
-            column![
-                text("Properties").font(theme::SANS_MEDIUM).size(14),
-                text("No selection").size(13).color(t.muted),
-            ]
-            .spacing(12),
-        )
-        .style(move |_| theme::panel(t))
-        .padding(12)
-        .width(230)
-        .height(Fill)
-        .into()
+    fn properties(&self, t: Tokens) -> Element<'_, Message> {
+        let body: Element<'_, Message> = if let Some(id) = self.single_selection() {
+            let document = self.session.document();
+            let index = document.flow_element_index();
+            match index.get(&id) {
+                Some(element) => Self::element_form(t, document, &id, element),
+                None => text("No selection").size(13).color(t.muted).into(),
+            }
+        } else if self.selection.len() > 1 {
+            text(format!("{} elements selected", self.selection.len()))
+                .size(13)
+                .color(t.muted)
+                .into()
+        } else {
+            text("No selection").size(13).color(t.muted).into()
+        };
+
+        container(column![text("Properties").font(theme::SANS_MEDIUM).size(14), body].spacing(12))
+            .style(move |_| theme::panel(t))
+            .padding(12)
+            .width(230)
+            .height(Fill)
+            .into()
+    }
+
+    fn element_form<'a>(
+        t: Tokens,
+        document: &Document,
+        id: &BpmnId,
+        element: &FlowElement,
+    ) -> Element<'a, Message> {
+        let caption = |label: &'static str| text(label).size(11).color(t.muted);
+
+        let mut form = column![
+            caption("Id"),
+            text(id.as_str().to_string()).font(theme::MONO).size(12),
+            caption("Name"),
+            text_input("Unnamed", element.name().unwrap_or(""))
+                .on_input(Message::NameEdited)
+                .size(13),
+        ]
+        .spacing(6);
+
+        match element {
+            FlowElement::Activity(activity) => {
+                let bpmn_core::model::ActivityKind::Task(task_type) = activity.kind;
+                form = form.push(caption("Task type")).push(
+                    pick_list(
+                        TASK_TYPES,
+                        Some(TaskTypeChoice(task_type)),
+                        Message::TaskTypeChanged,
+                    )
+                    .text_size(13)
+                    .width(Fill),
+                );
+            }
+            FlowElement::Gateway(gateway) => {
+                let mut options = vec![String::from(NO_DEFAULT)];
+                options.extend(
+                    document
+                        .outgoing_flows(id)
+                        .iter()
+                        .map(|flow| flow.as_str().to_string()),
+                );
+                let selected = gateway
+                    .default_flow
+                    .as_ref()
+                    .map_or_else(|| String::from(NO_DEFAULT), |d| d.as_str().to_string());
+                form = form.push(caption("Default flow")).push(
+                    pick_list(options, Some(selected), Message::DefaultFlowChanged)
+                        .text_size(13)
+                        .width(Fill),
+                );
+            }
+            FlowElement::SequenceFlow(flow) => match &flow.condition {
+                Some(Condition::Raw(_)) => {
+                    form = form.push(caption("Condition")).push(
+                        text("(complex expression, preserved as-is)")
+                            .size(12)
+                            .color(t.muted),
+                    );
+                }
+                condition => {
+                    let value = match condition {
+                        Some(Condition::Expression { text, .. }) => text.as_str(),
+                        _ => "",
+                    };
+                    form = form.push(caption("Condition")).push(
+                        text_input("${expression}", value)
+                            .on_input(Message::ConditionEdited)
+                            .font(theme::MONO)
+                            .size(13),
+                    );
+                }
+            },
+            FlowElement::Event(_) | FlowElement::Unknown(_) => {}
+        }
+
+        form.into()
     }
 
     fn status_bar(&self, t: Tokens) -> Element<'_, Message> {

@@ -64,6 +64,13 @@ pub enum CanvasMessage {
     Place(NodeKind, Point),
     /// Connect source to target with a sequence flow.
     Connect(BpmnId, BpmnId),
+    /// Replace an edge's waypoints after a handle drag.
+    SetEdgeWaypoints {
+        /// The sequence flow whose edge changed.
+        id: BpmnId,
+        /// The full new waypoint list, in world units.
+        points: Vec<Point>,
+    },
     /// Abort the armed tool (clicked empty space while connecting).
     CancelTool,
 }
@@ -148,6 +155,14 @@ enum Interaction {
         source: BpmnId,
         cursor: Point,
     },
+    /// Dragging one waypoint of the selected edge; `points` is the working
+    /// copy previewed by the overlay.
+    DraggingWaypoint {
+        flow: BpmnId,
+        points: Vec<Point>,
+        index: usize,
+        moved: bool,
+    },
 }
 
 fn snap(value: f32) -> f32 {
@@ -156,6 +171,21 @@ fn snap(value: f32) -> f32 {
 
 fn snap_point(p: Point) -> Point {
     Point::new(snap(p.x), snap(p.y))
+}
+
+fn distance(a: Point, b: Point) -> f32 {
+    (a.x - b.x).hypot(a.y - b.y)
+}
+
+/// Distance from `p` to the segment `a`..`b`.
+fn dist_to_segment(p: Point, a: Point, b: Point) -> f32 {
+    let (abx, aby) = (b.x - a.x, b.y - a.y);
+    let len_sq = abx * abx + aby * aby;
+    if len_sq == 0.0 {
+        return distance(p, a);
+    }
+    let t = (((p.x - a.x) * abx + (p.y - a.y) * aby) / len_sq).clamp(0.0, 1.0);
+    distance(p, Point::new(a.x + abx * t, a.y + aby * t))
 }
 
 fn world_rect(a: Point, b: Point) -> Rectangle {
@@ -186,6 +216,110 @@ impl View<'_> {
             }
         }
         None
+    }
+
+    /// Topmost edge whose polyline passes near a world-space point.
+    fn hit_edge(&self, world: Point) -> Option<BpmnId> {
+        let plane = self.document.diagram()?.plane.as_ref()?;
+        let index = self.document.flow_element_index();
+        let tolerance = 6.0 / self.camera.scaling;
+
+        for element in plane.elements.iter().rev() {
+            let DiElement::Edge(edge) = element else {
+                continue;
+            };
+            if !index.contains_key(&edge.bpmn_element) {
+                continue;
+            }
+            let points: Vec<Point> = edge
+                .waypoints
+                .iter()
+                .map(|p| Point::new(p.x as f32, p.y as f32))
+                .collect();
+            for pair in points.windows(2) {
+                if dist_to_segment(world, pair[0], pair[1]) <= tolerance {
+                    return Some(edge.bpmn_element.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// The waypoints of a flow's edge, in world units.
+    fn edge_points(&self, flow: &BpmnId) -> Option<Vec<Point>> {
+        let plane = self.document.diagram()?.plane.as_ref()?;
+        plane.elements.iter().find_map(|element| match element {
+            DiElement::Edge(edge) if edge.bpmn_element == *flow => Some(
+                edge.waypoints
+                    .iter()
+                    .map(|p| Point::new(p.x as f32, p.y as f32))
+                    .collect(),
+            ),
+            _ => None,
+        })
+    }
+
+    /// The selected edge, when the selection is exactly one sequence flow.
+    fn single_selected_edge(&self) -> Option<BpmnId> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection.iter().next()?;
+        let index = self.document.flow_element_index();
+        matches!(
+            index.get(id),
+            Some(bpmn_core::model::FlowElement::SequenceFlow(_))
+        )
+        .then(|| id.clone())
+    }
+
+    /// When the press lands on a waypoint or midpoint handle of the selected
+    /// edge, starts a waypoint drag and reports it.
+    fn grab_waypoint(&self, state: &mut CanvasState, world: Point) -> bool {
+        let Some(flow) = self.single_selected_edge() else {
+            return false;
+        };
+        let Some(points) = self.edge_points(&flow) else {
+            return false;
+        };
+        let grab = 7.0 / self.camera.scaling;
+
+        // Interior waypoints first (endpoints stay auto-anchored).
+        for (i, point) in points
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(points.len().saturating_sub(2))
+        {
+            if distance(world, *point) <= grab {
+                state.interaction = Interaction::DraggingWaypoint {
+                    flow,
+                    points,
+                    index: i,
+                    moved: false,
+                };
+                return true;
+            }
+        }
+        // Then segment midpoints: grabbing one inserts a new waypoint there.
+        for i in 0..points.len() - 1 {
+            let mid = Point::new(
+                f32::midpoint(points[i].x, points[i + 1].x),
+                f32::midpoint(points[i].y, points[i + 1].y),
+            );
+            if distance(world, mid) <= grab {
+                let mut points = points;
+                points.insert(i + 1, mid);
+                state.interaction = Interaction::DraggingWaypoint {
+                    flow,
+                    points,
+                    index: i + 1,
+                    moved: false,
+                };
+                return true;
+            }
+        }
+        false
     }
 
     fn world(&self, cursor: Point, bounds: Rectangle) -> Point {
@@ -233,6 +367,20 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                             CanvasMessage::SelectInRect(rect)
                         };
                         return Some(canvas::Action::publish(message).and_capture());
+                    }
+                    Interaction::DraggingWaypoint {
+                        flow,
+                        points,
+                        moved,
+                        ..
+                    } if moved => {
+                        return Some(
+                            canvas::Action::publish(CanvasMessage::SetEdgeWaypoints {
+                                id: flow,
+                                points,
+                            })
+                            .and_capture(),
+                        );
                     }
                     // A connect drag stays armed until the second click.
                     Interaction::ConnectFrom { source, cursor } => {
@@ -285,6 +433,9 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                     }
                 }
                 Tool::Select => {
+                    if self.grab_waypoint(state, world) {
+                        return Some(canvas::Action::request_redraw().and_capture());
+                    }
                     if let Some(id) = self.hit_node(world) {
                         let message = if state.shift {
                             Some(CanvasMessage::SelectToggle(id.clone()))
@@ -308,6 +459,13 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                                 )
                                 .and_capture(),
                         )
+                    } else if let Some(id) = self.hit_edge(world) {
+                        let message = if state.shift {
+                            CanvasMessage::SelectToggle(id)
+                        } else {
+                            CanvasMessage::SelectOnly(id)
+                        };
+                        Some(canvas::Action::publish(message).and_capture())
                     } else {
                         state.interaction = Interaction::Marquee {
                             start: world,
@@ -341,6 +499,16 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                 Interaction::ConnectFrom { cursor, .. } => {
                     *cursor = world;
                     Some(canvas::Action::request_redraw())
+                }
+                Interaction::DraggingWaypoint {
+                    points,
+                    index,
+                    moved,
+                    ..
+                } => {
+                    points[*index] = snap_point(world);
+                    *moved = true;
+                    Some(canvas::Action::request_redraw().and_capture())
                 }
                 Interaction::None => None,
             },
@@ -488,6 +656,21 @@ impl View<'_> {
         );
     }
 
+    fn stroke_polyline(&self, frame: &mut Frame, points: &[Point], width: f32) {
+        let path = Path::new(|builder| {
+            builder.move_to(points[0]);
+            for point in &points[1..] {
+                builder.line_to(*point);
+            }
+        });
+        frame.stroke(
+            &path,
+            Stroke::default()
+                .with_width(width.max(1.0 / self.camera.scaling))
+                .with_color(self.tokens.selection),
+        );
+    }
+
     fn draw_overlay(
         &self,
         frame: &mut Frame,
@@ -529,6 +712,92 @@ impl View<'_> {
                 );
             }
         }
+
+        self.draw_edge_overlay(frame, state);
+
+        // Marquee rectangle, connection ghost, and placement ghost follow.
+        self.draw_tool_overlay(frame, state, cursor, bounds, zoom);
+    }
+
+    /// Selected-edge highlights plus waypoint/midpoint handles.
+    fn draw_edge_overlay(&self, frame: &mut Frame, state: &CanvasState) {
+        let zoom = self.camera.scaling;
+        // Selected edges: accent polyline; a waypoint drag previews instead.
+        let dragging_edge = match &state.interaction {
+            Interaction::DraggingWaypoint { flow, .. } => Some(flow.clone()),
+            _ => None,
+        };
+        if let Some(plane) = self.document.diagram().and_then(|d| d.plane.as_ref()) {
+            for element in &plane.elements {
+                let DiElement::Edge(edge) = element else {
+                    continue;
+                };
+                if !self.selection.contains(&edge.bpmn_element)
+                    || dragging_edge.as_ref() == Some(&edge.bpmn_element)
+                    || edge.waypoints.len() < 2
+                {
+                    continue;
+                }
+                let points: Vec<Point> = edge
+                    .waypoints
+                    .iter()
+                    .map(|p| Point::new(p.x as f32, p.y as f32))
+                    .collect();
+                self.stroke_polyline(frame, &points, 2.0);
+            }
+        }
+
+        // Waypoint handles on the single selected edge (live points while
+        // dragging), plus midpoint grips for inserting new waypoints.
+        let handle_points = match &state.interaction {
+            Interaction::DraggingWaypoint { points, .. } => Some(points.clone()),
+            _ => self
+                .single_selected_edge()
+                .and_then(|flow| self.edge_points(&flow)),
+        };
+        if let Some(points) = handle_points {
+            if dragging_edge.is_some() {
+                self.stroke_polyline(frame, &points, 2.0);
+            }
+            let r = 3.5 / zoom.max(0.4);
+            for point in points.iter().skip(1).take(points.len().saturating_sub(2)) {
+                frame.fill_rectangle(
+                    Point::new(point.x - r, point.y - r),
+                    Size::new(r * 2.0, r * 2.0),
+                    self.tokens.selection,
+                );
+            }
+            for pair in points.windows(2) {
+                let mid = Point::new(
+                    f32::midpoint(pair[0].x, pair[1].x),
+                    f32::midpoint(pair[0].y, pair[1].y),
+                );
+                frame.stroke(
+                    &Path::circle(mid, r * 0.85),
+                    Stroke::default()
+                        .with_width((1.2 / zoom).max(1.0 / zoom))
+                        .with_color(self.tokens.selection),
+                );
+            }
+        }
+    }
+
+    /// Marquee rectangle, connection ghost line, and placement ghost.
+    fn draw_tool_overlay(
+        &self,
+        frame: &mut Frame,
+        state: &CanvasState,
+        cursor: mouse::Cursor,
+        bounds: Rectangle,
+        zoom: f32,
+    ) {
+        let accent = |width: f32| {
+            let mut stroke = Stroke::default()
+                .with_width(width.max(1.0 / zoom))
+                .with_color(self.tokens.selection);
+            stroke.line_dash.segments = &[5.0, 4.0];
+            stroke
+        };
 
         // Marquee rectangle.
         if let Interaction::Marquee { start, current } = &state.interaction {

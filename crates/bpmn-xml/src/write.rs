@@ -9,8 +9,9 @@ use crate::ns;
 use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiElement};
 use bpmn_core::geometry::Bounds;
 use bpmn_core::model::{
-    Activity, ActivityKind, BaseElement, Definitions, Event, EventDefinition, EventPosition,
-    FlowElement, FlowNode, Gateway, GatewayKind, Process, RootElement, SequenceFlow, TaskType,
+    Activity, ActivityKind, BaseElement, Condition, Definitions, Event, EventDefinition,
+    EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, Process, RootElement, SequenceFlow,
+    TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::escape::escape;
@@ -207,6 +208,20 @@ impl Emitter {
             self.out.push_str(name);
             self.out.push('>');
         }
+    }
+
+    /// A text element that may carry attributes, self-closing when empty.
+    fn attr_text_element(&mut self, name: &str, attrs: &Attrs, text: &str) {
+        if text.is_empty() {
+            self.empty(name, attrs);
+            return;
+        }
+        self.tag(name, attrs, false);
+        self.depth -= 1;
+        self.out.push_str(&escape(text));
+        self.out.push_str("</");
+        self.out.push_str(name);
+        self.out.push('>');
     }
 
     /// Verbatim fragment on its own line; internal formatting is preserved.
@@ -461,8 +476,17 @@ impl Emitter {
 
         self.open(&name, &attrs);
         self.base_children(&flow.base);
-        if let Some(condition) = &flow.condition {
-            self.raw(condition);
+        match &flow.condition {
+            Some(Condition::Expression { xsi_type, text }) => {
+                let tag = self.model_tag("conditionExpression");
+                let mut attrs = Attrs::default();
+                if let Some(xsi_type) = xsi_type {
+                    attrs.push("xsi:type", xsi_type);
+                }
+                self.attr_text_element(&tag, &attrs, text);
+            }
+            Some(Condition::Raw(raw)) => self.raw(raw),
+            None => {}
         }
         for raw in &flow.base.unknown_children {
             self.raw(raw);

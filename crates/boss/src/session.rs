@@ -18,6 +18,9 @@ pub struct EditSession {
     redo: Vec<Document>,
     revision: u64,
     saved_revision: u64,
+    /// When the last commit carried a merge key, further commits with the
+    /// same key amend it instead of growing the undo stack (text coalescing).
+    last_merge: Option<String>,
 }
 
 impl EditSession {
@@ -29,6 +32,7 @@ impl EditSession {
             redo: Vec::new(),
             revision: 0,
             saved_revision: 0,
+            last_merge: None,
         }
     }
 
@@ -50,14 +54,28 @@ impl EditSession {
     /// Applies `mutate` as one undo step. When `mutate` returns `false` the
     /// document is restored and nothing is recorded.
     pub fn commit(&mut self, mutate: impl FnOnce(&mut Document) -> bool) {
+        self.commit_inner(None, mutate);
+    }
+
+    /// Like [`commit`](Self::commit), but consecutive commits sharing `key`
+    /// collapse into one undo step — one undo reverts a whole typing burst.
+    pub fn commit_merged(&mut self, key: String, mutate: impl FnOnce(&mut Document) -> bool) {
+        self.commit_inner(Some(key), mutate);
+    }
+
+    fn commit_inner(&mut self, key: Option<String>, mutate: impl FnOnce(&mut Document) -> bool) {
         let snapshot = self.document.clone();
         if mutate(&mut self.document) {
-            self.undo.push(snapshot);
-            if self.undo.len() > MAX_UNDO {
-                self.undo.remove(0);
+            let merged = key.is_some() && key == self.last_merge;
+            if !merged {
+                self.undo.push(snapshot);
+                if self.undo.len() > MAX_UNDO {
+                    self.undo.remove(0);
+                }
             }
             self.redo.clear();
             self.revision += 1;
+            self.last_merge = key;
         } else {
             self.document = snapshot;
         }
@@ -81,6 +99,7 @@ impl EditSession {
         let current = std::mem::replace(&mut self.document, previous);
         self.redo.push(current);
         self.revision += 1;
+        self.last_merge = None;
         true
     }
 
@@ -92,6 +111,7 @@ impl EditSession {
         let current = std::mem::replace(&mut self.document, next);
         self.undo.push(current);
         self.revision += 1;
+        self.last_merge = None;
         true
     }
 }
@@ -124,6 +144,31 @@ mod tests {
         assert!(!session.is_dirty());
         assert!(session.undo());
         assert!(session.is_dirty());
+    }
+
+    #[test]
+    fn merged_commits_collapse_into_one_undo_step() {
+        let mut session = EditSession::new(Document::new());
+        let id = {
+            let mut created = None;
+            session.commit(|doc| {
+                created = doc.create_node(NodeKind::StartEvent, Point::new(0.0, 0.0));
+                created.is_some()
+            });
+            created.unwrap()
+        };
+
+        for text in ["R", "Re", "Rev"] {
+            session.commit_merged(format!("name:{id}"), |doc| {
+                doc.set_name(&id, Some(String::from(text)))
+            });
+        }
+        // One undo removes the whole burst, the next removes the node.
+        assert!(session.undo());
+        let index = session.document().flow_element_index();
+        assert_eq!(index[&id].name(), None);
+        assert!(session.undo());
+        assert_eq!(session.document().flow_elements().count(), 0);
     }
 
     #[test]

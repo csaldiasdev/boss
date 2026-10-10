@@ -68,13 +68,11 @@ fn parses_the_order_fixture_structurally() {
     let FlowElement::SequenceFlow(yes) = index[&BpmnId::from("Flow_Yes")] else {
         panic!("Flow_Yes is a sequence flow");
     };
-    assert!(
-        yes.condition
-            .as_ref()
-            .unwrap()
-            .as_str()
-            .contains("${inStock}")
-    );
+    assert!(matches!(
+        yes.condition.as_ref().unwrap(),
+        bpmn_core::model::Condition::Expression { xsi_type: Some(t), text }
+            if t == "bpmn:tFormalExpression" && text == "${inStock}"
+    ));
 
     let plane = doc.diagram().unwrap().plane.as_ref().unwrap();
     assert_eq!(plane.elements.len(), 13);

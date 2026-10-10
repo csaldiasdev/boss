@@ -222,8 +222,23 @@ pub struct SequenceFlow {
     pub source: BpmnId,
     /// The `targetRef` attribute.
     pub target: BpmnId,
-    /// The `conditionExpression` child, preserved verbatim (modeled in M3).
-    pub condition: Option<RawXml>,
+    /// The `conditionExpression` child.
+    pub condition: Option<Condition>,
+}
+
+/// A sequence flow condition.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Condition {
+    /// A text-only `conditionExpression`, editable in the properties panel.
+    Expression {
+        /// The `xsi:type` attribute exactly as written (usually
+        /// `bpmn:tFormalExpression`), kept so files round-trip.
+        xsi_type: Option<String>,
+        /// The expression text.
+        text: String,
+    },
+    /// A condition with structure we don't model, preserved verbatim.
+    Raw(RawXml),
 }
 
 /// A `process` root element.

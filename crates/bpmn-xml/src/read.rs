@@ -11,9 +11,9 @@ use crate::ns;
 use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiElement};
 use bpmn_core::geometry::{Bounds, Point};
 use bpmn_core::model::{
-    Activity, ActivityKind, BaseElement, Definitions, Event as BpmnEvent, EventDefinition,
-    EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, Process, RootElement, SequenceFlow,
-    TaskType,
+    Activity, ActivityKind, BaseElement, Condition, Definitions, Event as BpmnEvent,
+    EventDefinition, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, Process,
+    RootElement, SequenceFlow, TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::events::{BytesStart, Event};
@@ -656,7 +656,7 @@ fn parse_sequence_flow(
         }
 
         if nsk == Ns::Model && local(&e) == "conditionExpression" {
-            flow.condition = Some(cx.capture_any(pos, &e, is_empty)?);
+            flow.condition = Some(parse_condition(cx, pos, &e, is_empty)?);
         } else {
             flow.base
                 .unknown_children
@@ -903,5 +903,44 @@ fn parse_label(
         if !is_empty {
             cx.skip(&e)?;
         }
+    }
+}
+
+/// Models a `conditionExpression` when it is text-only with at most an
+/// `xsi:type` attribute; anything richer is preserved verbatim.
+fn parse_condition(
+    cx: &mut Cx<'_>,
+    pos: usize,
+    e: &BytesStart<'_>,
+    empty: bool,
+) -> Result<Condition, ParseError> {
+    let mut set = attr_set(e)?;
+    let xsi_type = set.take("xsi:type");
+    if !set.is_empty() {
+        return Ok(Condition::Raw(cx.capture_any(pos, e, empty)?));
+    }
+
+    if empty {
+        let _ = cx.capture_span(pos);
+        return Ok(Condition::Expression {
+            xsi_type,
+            text: String::new(),
+        });
+    }
+
+    let raw = cx.capture(pos, e)?;
+    let inner = raw
+        .as_str()
+        .find('>')
+        .and_then(|open| raw.as_str().rfind("</").map(|close| (open, close)))
+        .map(|(open, close)| &raw.as_str()[open + 1..close]);
+
+    match inner {
+        Some(inner) if !inner.contains('<') => Ok(Condition::Expression {
+            xsi_type,
+            text: quick_xml::escape::unescape(inner)
+                .map_or_else(|_| inner.to_string(), std::borrow::Cow::into_owned),
+        }),
+        _ => Ok(Condition::Raw(raw)),
     }
 }
