@@ -56,7 +56,7 @@ fn parses_the_order_fixture_structurally() {
             .base
             .unknown_attrs
             .iter()
-            .any(|(k, v)| k == "camunda:assignee" && v == "demo")
+            .any(|(k, v)| k == "acme:assignee" && v == "demo")
     );
 
     let FlowElement::Gateway(gateway) = index[&BpmnId::from("Gateway_Stock")] else {
@@ -146,11 +146,11 @@ fn vendor_extensions_survive_the_round_trip() {
     let doc = parse(ORDER).unwrap();
     let out = write(&doc);
     for needle in [
-        "camunda:assignee=\"demo\"",
-        "camunda:candidateGroups=\"sales\"",
-        "<camunda:formField id=\"approved\" label=\"Approve?\" type=\"boolean\" />",
-        "<camunda:property name=\"sla\" value=\"24h\" />",
-        "xmlns:camunda=\"http://camunda.org/schema/1.0/bpmn\"",
+        "acme:assignee=\"demo\"",
+        "acme:candidateGroups=\"sales\"",
+        "<acme:formField id=\"approved\" label=\"Approve?\" type=\"boolean\" />",
+        "<acme:property name=\"sla\" value=\"24h\" />",
+        "xmlns:acme=\"https://example.com/schema/acme/bpmn\"",
         "${inStock}",
     ] {
         assert!(out.contains(needle), "output keeps {needle:?}\n---\n{out}");
@@ -159,9 +159,9 @@ fn vendor_extensions_survive_the_round_trip() {
     let doc = parse(EXTENSIONS).unwrap();
     let out = write(&doc);
     for needle in [
-        "<zeebe:taskDefinition type=\"charge-card\" retries=\"3\" />",
-        "<zeebe:input source=\"=amount\" target=\"chargeAmount\" />",
-        "modeler:executionPlatform=\"Camunda Cloud\"",
+        "<flow:taskDefinition type=\"charge-card\" retries=\"3\" />",
+        "<flow:input source=\"=amount\" target=\"chargeAmount\" />",
+        "meta:executionPlatform=\"Example Cloud\"",
         "<bpmn:subProcess id=\"Sub_1\"",
         "PT5M",
         "<!-- hand-made fixture exercising vendor extensions and unmodeled elements -->",

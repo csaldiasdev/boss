@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_ext" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.26.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.5.0">
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:flow="https://example.com/schema/flowkit/1.0" xmlns:meta="https://example.com/schema/meta/1.0" id="Definitions_ext" targetNamespace="https://example.com/bpmn" exporter="Flowkit Studio" exporterVersion="2.4.0" meta:executionPlatform="Example Cloud" meta:executionPlatformVersion="1.2.3">
   <!-- hand-made fixture exercising vendor extensions and unmodeled elements -->
   <bpmn:message id="Message_Order" name="orderMessage" />
   <bpmn:process id="Process_Ext" isExecutable="true">
     <bpmn:startEvent id="Start_Ext" name="Begin">
       <bpmn:extensionElements>
-        <zeebe:versionTag value="v1" />
+        <flow:versionTag value="v1" />
       </bpmn:extensionElements>
       <bpmn:outgoing>Flow_A</bpmn:outgoing>
     </bpmn:startEvent>
@@ -18,10 +18,10 @@
     </bpmn:subProcess>
     <bpmn:serviceTask id="Task_Charge" name="Charge card">
       <bpmn:extensionElements>
-        <zeebe:taskDefinition type="charge-card" retries="3" />
-        <zeebe:ioMapping>
-          <zeebe:input source="=amount" target="chargeAmount" />
-        </zeebe:ioMapping>
+        <flow:taskDefinition type="charge-card" retries="3" />
+        <flow:ioMapping>
+          <flow:input source="=amount" target="chargeAmount" />
+        </flow:ioMapping>
       </bpmn:extensionElements>
       <bpmn:incoming>Flow_B</bpmn:incoming>
       <bpmn:outgoing>Flow_C</bpmn:outgoing>

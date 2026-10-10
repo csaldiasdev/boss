@@ -372,10 +372,13 @@ mod tests {
 
     #[test]
     fn branding_replaces_exporter_and_placeholder_namespace() {
-        let doc = bpmn_xml::parse(include_str!(
+        let mut doc = bpmn_xml::parse(include_str!(
             "../../../tests-fixtures/order-fulfillment.bpmn"
         ))
         .unwrap();
+        doc.definitions.target_namespace =
+            String::from(bpmn_core::model::BPMN_IO_PLACEHOLDER_NAMESPACE);
+        doc.definitions.exporter = Some(String::from("Some Other Modeler"));
         let branded = branded_for_save(&doc);
 
         let def = &branded.definitions;
@@ -390,21 +393,19 @@ mod tests {
         );
 
         let out = bpmn_xml::write(&branded);
-        assert!(!out.contains("Camunda Modeler"));
+        assert!(!out.contains("Some Other Modeler"));
         assert!(!out.contains("bpmn.io"));
         // Vendor extension content is user data and stays untouched.
-        assert!(out.contains("camunda:assignee=\"demo\""));
+        assert!(out.contains("acme:assignee=\"demo\""));
     }
 
     #[test]
     fn branding_keeps_a_real_target_namespace() {
-        let mut doc =
-            bpmn_xml::parse(include_str!("../../../tests-fixtures/minimal.bpmn")).unwrap();
-        doc.definitions.target_namespace = String::from("https://example.com/processes");
+        let doc = bpmn_xml::parse(include_str!("../../../tests-fixtures/minimal.bpmn")).unwrap();
         let branded = branded_for_save(&doc);
         assert_eq!(
             branded.definitions.target_namespace,
-            "https://example.com/processes"
+            "https://example.com/bpmn"
         );
     }
 }
