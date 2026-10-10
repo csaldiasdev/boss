@@ -10,8 +10,8 @@ use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiEl
 use bpmn_core::geometry::Bounds;
 use bpmn_core::model::{
     Activity, ActivityKind, BaseElement, Condition, Definitions, Event, EventDefinition,
-    EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, Process, RootElement, SequenceFlow,
-    TaskType,
+    EventDefinitionBody, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, LoopKind,
+    LoopMarker, Process, RootElement, SequenceFlow, TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::escape::escape;
@@ -376,27 +376,52 @@ impl Emitter {
         self.open(&name, &attrs);
         self.node_children(&event.node);
         for definition in &event.definitions {
-            match definition {
-                EventDefinition::Message { id, message_ref } => {
-                    let mut attrs = Attrs::default();
-                    attrs.push_id_opt("id", id.as_ref());
-                    attrs.push_opt("messageRef", message_ref.as_deref());
-                    let tag = self.model_tag("messageEventDefinition");
-                    self.empty(&tag, &attrs);
-                }
-                EventDefinition::Terminate { id } => {
-                    let mut attrs = Attrs::default();
-                    attrs.push_id_opt("id", id.as_ref());
-                    let tag = self.model_tag("terminateEventDefinition");
-                    self.empty(&tag, &attrs);
-                }
-                EventDefinition::Other(raw) => self.raw(raw),
-            }
+            self.event_definition(definition);
         }
         for raw in &event.node.base.unknown_children {
             self.raw(raw);
         }
         self.close(&name);
+    }
+
+    fn event_definition(&mut self, definition: &EventDefinition) {
+        match (&definition.body, definition.kind.tag()) {
+            (EventDefinitionBody::Message { id, message_ref }, Some(tag)) => {
+                let mut attrs = Attrs::default();
+                attrs.push_id_opt("id", id.as_ref());
+                attrs.push_opt("messageRef", message_ref.as_deref());
+                let tag = self.model_tag(tag);
+                self.empty(&tag, &attrs);
+            }
+            (EventDefinitionBody::Empty { id }, Some(tag)) => {
+                let mut attrs = Attrs::default();
+                attrs.push_id_opt("id", id.as_ref());
+                let tag = self.model_tag(tag);
+                self.empty(&tag, &attrs);
+            }
+            (EventDefinitionBody::Raw(raw), _) => self.raw(raw),
+            // A structured body with no tag cannot happen (kind Other always
+            // carries Raw); emit nothing rather than invent markup.
+            (_, None) => {}
+        }
+    }
+
+    fn loop_marker(&mut self, marker: &LoopMarker) {
+        if let Some(raw) = &marker.raw {
+            self.raw(raw);
+            return;
+        }
+        let (tag, sequential) = match marker.kind {
+            LoopKind::Standard => ("standardLoopCharacteristics", false),
+            LoopKind::MultiInstanceParallel => ("multiInstanceLoopCharacteristics", false),
+            LoopKind::MultiInstanceSequential => ("multiInstanceLoopCharacteristics", true),
+        };
+        let mut attrs = Attrs::default();
+        if sequential {
+            attrs.push("isSequential", "true");
+        }
+        let tag = self.model_tag(tag);
+        self.empty(&tag, &attrs);
     }
 
     fn activity(&mut self, activity: &Activity) {
@@ -415,13 +440,16 @@ impl Emitter {
         attrs.push_unknown(&activity.node.base.unknown_attrs);
 
         let name = self.model_tag(local);
-        if !Self::node_has_children(&activity.node) {
+        if !Self::node_has_children(&activity.node) && activity.loop_marker.is_none() {
             self.empty(&name, &attrs);
             return;
         }
 
         self.open(&name, &attrs);
         self.node_children(&activity.node);
+        if let Some(marker) = &activity.loop_marker {
+            self.loop_marker(marker);
+        }
         for raw in &activity.node.base.unknown_children {
             self.raw(raw);
         }

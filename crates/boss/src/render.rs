@@ -9,8 +9,8 @@ use crate::theme::CanvasTokens;
 use bpmn_core::Document;
 use bpmn_core::di::{BpmnLabel, BpmnShape, DiElement};
 use bpmn_core::model::{
-    ActivityKind, Event as BpmnEvent, EventDefinition, EventPosition, FlowElement, Gateway,
-    GatewayKind, TaskType,
+    ActivityKind, Event as BpmnEvent, EventDefinitionKind, EventPosition, FlowElement, Gateway,
+    GatewayKind, LoopKind, TaskType,
 };
 use iced::alignment::Vertical;
 use iced::widget::canvas::path::Builder;
@@ -35,10 +35,20 @@ fn rect(b: bpmn_core::Bounds) -> Rectangle {
     }
 }
 
+/// A validation badge on an element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Badge {
+    /// Amber dot.
+    Warning,
+    /// Red dot.
+    Error,
+}
+
 /// Draws `document`'s first diagram into an already camera-transformed frame.
 pub fn draw(
     frame: &mut Frame,
     document: &Document,
+    badges: &std::collections::HashMap<bpmn_core::BpmnId, Badge>,
     tokens: CanvasTokens,
     zoom: f32,
     visible: Rectangle,
@@ -93,6 +103,18 @@ pub fn draw(
             if !bounds.intersects(&visible) {
                 continue;
             }
+            if let Some(badge) = badges.get(&shape.bpmn_element) {
+                let color = match badge {
+                    Badge::Warning => tokens.warning,
+                    Badge::Error => tokens.danger,
+                };
+                let center = Point::new(bounds.x + bounds.width - 2.0, bounds.y + 2.0);
+                frame.fill(&Path::circle(center, 5.0), color);
+                frame.stroke(
+                    &Path::circle(center, 5.0),
+                    Stroke::default().with_width(1.5).with_color(tokens.bg),
+                );
+            }
 
             match index.get(&shape.bpmn_element).copied() {
                 Some(FlowElement::Event(event)) => {
@@ -109,6 +131,9 @@ pub fn draw(
 
                     let ActivityKind::Task(task_type) = activity.kind;
                     task_icon(frame, task_type, bounds, stroke_width, tokens);
+                    if let Some(marker) = &activity.loop_marker {
+                        loop_marker_icon(frame, marker.kind, bounds, stroke_width, tokens);
+                    }
 
                     if let Some(name) = &activity.node.name {
                         wrapped_label(frame, name, bounds, 12.0, tokens.label);
@@ -255,14 +280,20 @@ fn draw_event(
         }
     }
 
+    let filled = matches!(
+        event.position,
+        EventPosition::IntermediateThrow | EventPosition::End
+    );
     for definition in &event.definitions {
-        match definition {
-            EventDefinition::Message { .. } => envelope(frame, center, stroke_width, tokens),
-            EventDefinition::Terminate { .. } => {
-                frame.fill(&Path::circle(center, radius - 7.0), tokens.stroke);
-            }
-            EventDefinition::Other(_) => {}
-        }
+        definition_icon(
+            frame,
+            definition.kind,
+            center,
+            radius,
+            filled,
+            stroke_width,
+            tokens,
+        );
     }
 
     if let Some(name) = &event.node.name {
@@ -311,7 +342,40 @@ fn draw_gateway(
             });
             frame.stroke(&plus, marker_stroke);
         }
-        _ => {}
+        GatewayKind::Inclusive => {
+            frame.stroke(&Path::circle(center, r * 1.1), marker_stroke);
+        }
+        GatewayKind::EventBased => {
+            frame.stroke(&Path::circle(center, r * 1.5), stroke);
+            frame.stroke(&Path::circle(center, r * 1.2), stroke);
+            let pentagon = Path::new(|builder| {
+                for i in 0..5u8 {
+                    let angle =
+                        f32::from(i) * std::f32::consts::TAU / 5.0 - std::f32::consts::FRAC_PI_2;
+                    let (sin, cos) = angle.sin_cos();
+                    let point = Point::new(center.x + cos * r * 0.75, center.y + sin * r * 0.75);
+                    if i == 0 {
+                        builder.move_to(point);
+                    } else {
+                        builder.line_to(point);
+                    }
+                }
+                builder.close();
+            });
+            frame.stroke(&pentagon, stroke);
+        }
+        GatewayKind::Complex => {
+            let star = Path::new(|builder| {
+                for i in 0..4u8 {
+                    let angle = f32::from(i) * std::f32::consts::FRAC_PI_4;
+                    let (sin, cos) = angle.sin_cos();
+                    builder.move_to(Point::new(center.x - cos * r, center.y - sin * r));
+                    builder.line_to(Point::new(center.x + cos * r, center.y + sin * r));
+                }
+            });
+            frame.stroke(&star, marker_stroke);
+        }
+        GatewayKind::Exclusive => {}
     }
 
     if let Some(name) = &gateway.node.name {
@@ -319,7 +383,13 @@ fn draw_gateway(
     }
 }
 
-fn envelope(frame: &mut Frame, center: Point, stroke_width: f32, tokens: CanvasTokens) {
+fn envelope(
+    frame: &mut Frame,
+    center: Point,
+    filled: bool,
+    stroke_width: f32,
+    tokens: CanvasTokens,
+) {
     let (half_w, half_h) = (8.0, 5.5);
     let stroke = Stroke::default()
         .with_width(stroke_width * 0.9)
@@ -334,10 +404,182 @@ fn envelope(frame: &mut Frame, center: Point, stroke_width: f32, tokens: CanvasT
         builder.line_to(Point::new(center.x, center.y + 1.0));
         builder.line_to(Point::new(center.x + half_w, center.y - half_h));
     });
-    frame.stroke(&body, stroke);
-    frame.stroke(&flap, stroke);
+    if filled {
+        frame.fill(&body, tokens.stroke);
+        let light = Stroke::default()
+            .with_width(stroke_width * 0.9)
+            .with_color(tokens.fill);
+        frame.stroke(&flap, light);
+    } else {
+        frame.stroke(&body, stroke);
+        frame.stroke(&flap, stroke);
+    }
 }
 
+/// The trigger icon inside an event circle. Throwing events get filled icons.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one icon per trigger kind; a table of small drawings"
+)]
+fn definition_icon(
+    frame: &mut Frame,
+    kind: EventDefinitionKind,
+    center: Point,
+    radius: f32,
+    filled: bool,
+    stroke_width: f32,
+    tokens: CanvasTokens,
+) {
+    let stroke = Stroke::default()
+        .with_width(stroke_width * 0.9)
+        .with_color(tokens.stroke);
+    let c = center;
+
+    match kind {
+        EventDefinitionKind::Message => envelope(frame, c, filled, stroke_width, tokens),
+        EventDefinitionKind::Timer => {
+            frame.stroke(&Path::circle(c, radius * 0.62), stroke);
+            // Ticks.
+            let ticks = Path::new(|b| {
+                for i in 0..12u8 {
+                    let angle = f32::from(i) * std::f32::consts::TAU / 12.0;
+                    let (sin, cos) = angle.sin_cos();
+                    b.move_to(Point::new(
+                        c.x + cos * radius * 0.52,
+                        c.y + sin * radius * 0.52,
+                    ));
+                    b.line_to(Point::new(
+                        c.x + cos * radius * 0.62,
+                        c.y + sin * radius * 0.62,
+                    ));
+                }
+            });
+            frame.stroke(&ticks, stroke);
+            // Hands at ten past ten.
+            let hands = Path::new(|b| {
+                b.move_to(c);
+                b.line_to(Point::new(c.x + radius * 0.34, c.y - radius * 0.12));
+                b.move_to(c);
+                b.line_to(Point::new(c.x - radius * 0.05, c.y - radius * 0.42));
+            });
+            frame.stroke(&hands, stroke);
+        }
+        EventDefinitionKind::Signal => {
+            let triangle = Path::new(|b| {
+                b.move_to(Point::new(c.x, c.y - radius * 0.52));
+                b.line_to(Point::new(c.x + radius * 0.5, c.y + radius * 0.38));
+                b.line_to(Point::new(c.x - radius * 0.5, c.y + radius * 0.38));
+                b.close();
+            });
+            if filled {
+                frame.fill(&triangle, tokens.stroke);
+            } else {
+                frame.stroke(&triangle, stroke);
+            }
+        }
+        EventDefinitionKind::Error => {
+            let bolt = Path::new(|b| {
+                b.move_to(Point::new(c.x - radius * 0.42, c.y + radius * 0.5));
+                b.line_to(Point::new(c.x - radius * 0.12, c.y - radius * 0.5));
+                b.line_to(Point::new(c.x + radius * 0.18, c.y + radius * 0.1));
+                b.line_to(Point::new(c.x + radius * 0.42, c.y - radius * 0.5));
+                b.line_to(Point::new(c.x + radius * 0.12, c.y + radius * 0.5));
+                b.line_to(Point::new(c.x - radius * 0.18, c.y - radius * 0.1));
+                b.close();
+            });
+            if filled {
+                frame.fill(&bolt, tokens.stroke);
+            } else {
+                frame.stroke(&bolt, stroke);
+            }
+        }
+        EventDefinitionKind::Escalation => {
+            let arrow = Path::new(|b| {
+                b.move_to(Point::new(c.x, c.y - radius * 0.55));
+                b.line_to(Point::new(c.x + radius * 0.4, c.y + radius * 0.45));
+                b.line_to(Point::new(c.x, c.y + radius * 0.08));
+                b.line_to(Point::new(c.x - radius * 0.4, c.y + radius * 0.45));
+                b.close();
+            });
+            if filled {
+                frame.fill(&arrow, tokens.stroke);
+            } else {
+                frame.stroke(&arrow, stroke);
+            }
+        }
+        EventDefinitionKind::Conditional => {
+            let half = radius * 0.5;
+            frame.stroke(
+                &Path::rectangle(
+                    Point::new(c.x - half * 0.8, c.y - half),
+                    Size::new(half * 1.6, half * 2.0),
+                ),
+                stroke,
+            );
+            let lines = Path::new(|b| {
+                for i in 0..4u8 {
+                    let y = c.y - half + half * 0.5 * (f32::from(i) + 0.4);
+                    b.move_to(Point::new(c.x - half * 0.55, y));
+                    b.line_to(Point::new(c.x + half * 0.55, y));
+                }
+            });
+            frame.stroke(&lines, stroke);
+        }
+        EventDefinitionKind::Compensate => {
+            let arrows = Path::new(|b| {
+                b.move_to(Point::new(c.x - radius * 0.55, c.y));
+                b.line_to(Point::new(c.x - radius * 0.05, c.y - radius * 0.4));
+                b.line_to(Point::new(c.x - radius * 0.05, c.y + radius * 0.4));
+                b.close();
+                b.move_to(Point::new(c.x - radius * 0.05, c.y));
+                b.line_to(Point::new(c.x + radius * 0.45, c.y - radius * 0.4));
+                b.line_to(Point::new(c.x + radius * 0.45, c.y + radius * 0.4));
+                b.close();
+            });
+            if filled {
+                frame.fill(&arrows, tokens.stroke);
+            } else {
+                frame.stroke(&arrows, stroke);
+            }
+        }
+        EventDefinitionKind::Link => {
+            let arrow = Path::new(|b| {
+                b.move_to(Point::new(c.x - radius * 0.5, c.y - radius * 0.18));
+                b.line_to(Point::new(c.x + radius * 0.05, c.y - radius * 0.18));
+                b.line_to(Point::new(c.x + radius * 0.05, c.y - radius * 0.42));
+                b.line_to(Point::new(c.x + radius * 0.55, c.y));
+                b.line_to(Point::new(c.x + radius * 0.05, c.y + radius * 0.42));
+                b.line_to(Point::new(c.x + radius * 0.05, c.y + radius * 0.18));
+                b.line_to(Point::new(c.x - radius * 0.5, c.y + radius * 0.18));
+                b.close();
+            });
+            if filled {
+                frame.fill(&arrow, tokens.stroke);
+            } else {
+                frame.stroke(&arrow, stroke);
+            }
+        }
+        EventDefinitionKind::Cancel => {
+            let r = radius * 0.5;
+            let x = Path::new(|b| {
+                b.move_to(Point::new(c.x - r, c.y - r));
+                b.line_to(Point::new(c.x + r, c.y + r));
+                b.move_to(Point::new(c.x + r, c.y - r));
+                b.line_to(Point::new(c.x - r, c.y + r));
+            });
+            frame.stroke(&x, stroke.with_width(stroke_width * 1.6));
+        }
+        EventDefinitionKind::Terminate => {
+            frame.fill(&Path::circle(c, radius - 7.0), tokens.stroke);
+        }
+        EventDefinitionKind::Other => {}
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one icon per task type; a table of small drawings"
+)]
 fn task_icon(
     frame: &mut Frame,
     task_type: TaskType,
@@ -383,10 +625,137 @@ fn task_icon(
         TaskType::Send => envelope(
             frame,
             Point::new(origin.x + 7.0, origin.y + 5.5),
+            true,
             stroke_width,
             tokens,
         ),
-        // The remaining icons (script, manual, receive, business rule) land in M4.
-        _ => {}
+        TaskType::Receive => envelope(
+            frame,
+            Point::new(origin.x + 7.0, origin.y + 5.5),
+            false,
+            stroke_width,
+            tokens,
+        ),
+        TaskType::Script => {
+            // A scroll: curly left/right edges with text lines.
+            let scroll = Path::new(|b: &mut Builder| {
+                b.move_to(Point::new(origin.x + 2.0, origin.y));
+                b.line_to(Point::new(origin.x + 12.0, origin.y));
+                b.quadratic_curve_to(
+                    Point::new(origin.x + 8.0, origin.y + 6.5),
+                    Point::new(origin.x + 12.0, origin.y + 13.0),
+                );
+                b.line_to(Point::new(origin.x + 2.0, origin.y + 13.0));
+                b.quadratic_curve_to(
+                    Point::new(origin.x + 6.0, origin.y + 6.5),
+                    Point::new(origin.x + 2.0, origin.y),
+                );
+            });
+            frame.stroke(&scroll, stroke);
+            let lines = Path::new(|b: &mut Builder| {
+                for i in 0..3u8 {
+                    let y = origin.y + 3.5 + f32::from(i) * 3.0;
+                    b.move_to(Point::new(origin.x + 4.5, y));
+                    b.line_to(Point::new(origin.x + 10.0, y));
+                }
+            });
+            frame.stroke(&lines, stroke);
+        }
+        TaskType::Manual => {
+            // A simplified hand: palm with thumb notch.
+            let hand = Path::new(|b: &mut Builder| {
+                b.move_to(Point::new(origin.x, origin.y + 6.0));
+                b.quadratic_curve_to(
+                    Point::new(origin.x + 1.0, origin.y + 2.0),
+                    Point::new(origin.x + 5.0, origin.y + 3.0),
+                );
+                b.line_to(Point::new(origin.x + 13.0, origin.y + 3.0));
+                b.line_to(Point::new(origin.x + 13.0, origin.y + 11.0));
+                b.line_to(Point::new(origin.x + 3.0, origin.y + 11.0));
+                b.close();
+            });
+            frame.stroke(&hand, stroke);
+            let fingers = Path::new(|b: &mut Builder| {
+                for i in 0..3u8 {
+                    let y = origin.y + 5.0 + f32::from(i) * 2.7;
+                    b.move_to(Point::new(origin.x + 7.0, y));
+                    b.line_to(Point::new(origin.x + 13.0, y));
+                }
+            });
+            frame.stroke(&fingers, stroke);
+        }
+        TaskType::BusinessRule => {
+            // A decision table: header band plus grid.
+            let (w, h) = (14.0, 10.0);
+            frame.stroke(&Path::rectangle(origin, Size::new(w, h)), stroke);
+            frame.fill_rectangle(origin, Size::new(w, 3.0), tokens.stroke);
+            let grid = Path::new(|b: &mut Builder| {
+                b.move_to(Point::new(origin.x, origin.y + 6.5));
+                b.line_to(Point::new(origin.x + w, origin.y + 6.5));
+                b.move_to(Point::new(origin.x + 4.5, origin.y + 3.0));
+                b.line_to(Point::new(origin.x + 4.5, origin.y + h));
+            });
+            frame.stroke(&grid, stroke);
+        }
+        TaskType::Generic => {}
+    }
+}
+
+/// Loop / multi-instance marker at the bottom center of a task.
+fn loop_marker_icon(
+    frame: &mut Frame,
+    kind: LoopKind,
+    bounds: Rectangle,
+    stroke_width: f32,
+    tokens: CanvasTokens,
+) {
+    let stroke = Stroke::default()
+        .with_width(stroke_width * 0.9)
+        .with_color(tokens.stroke);
+    let c = Point::new(
+        bounds.x + bounds.width / 2.0,
+        bounds.y + bounds.height - 9.0,
+    );
+
+    match kind {
+        LoopKind::Standard => {
+            // Circular arrow: three quarters of a circle plus an arrowhead.
+            let r = 5.0;
+            let arc = Path::new(|b: &mut Builder| {
+                b.arc(iced::widget::canvas::path::Arc {
+                    center: c,
+                    radius: r,
+                    start_angle: iced::Radians(-std::f32::consts::FRAC_PI_2),
+                    end_angle: iced::Radians(std::f32::consts::PI),
+                });
+            });
+            frame.stroke(&arc, stroke);
+            let head = Path::new(|b: &mut Builder| {
+                b.move_to(Point::new(c.x - r - 2.5, c.y + 1.5));
+                b.line_to(Point::new(c.x - r, c.y));
+                b.line_to(Point::new(c.x - r + 2.5, c.y + 2.0));
+            });
+            frame.stroke(&head, stroke);
+        }
+        LoopKind::MultiInstanceParallel => {
+            let bars = Path::new(|b: &mut Builder| {
+                for i in 0..3u8 {
+                    let x = c.x - 4.0 + f32::from(i) * 4.0;
+                    b.move_to(Point::new(x, c.y - 5.0));
+                    b.line_to(Point::new(x, c.y + 5.0));
+                }
+            });
+            frame.stroke(&bars, stroke.with_width(stroke_width * 1.4));
+        }
+        LoopKind::MultiInstanceSequential => {
+            let bars = Path::new(|b: &mut Builder| {
+                for i in 0..3u8 {
+                    let y = c.y - 4.0 + f32::from(i) * 4.0;
+                    b.move_to(Point::new(c.x - 5.0, y));
+                    b.line_to(Point::new(c.x + 5.0, y));
+                }
+            });
+            frame.stroke(&bars, stroke.with_width(stroke_width * 1.4));
+        }
     }
 }

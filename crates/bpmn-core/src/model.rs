@@ -124,24 +124,82 @@ pub enum EventPosition {
     },
 }
 
-/// What an event reacts to or produces (M1 models message and terminate; the
-/// rest round-trips verbatim until M4).
+/// What an event reacts to or produces: the trigger kind (always known, it
+/// drives the icon) plus the definition body (structured when simple,
+/// verbatim otherwise).
 #[derive(Debug, Clone, PartialEq)]
-pub enum EventDefinition {
+pub struct EventDefinition {
+    /// Which trigger this is, from the XML tag name.
+    pub kind: EventDefinitionKind,
+    /// The definition's content.
+    pub body: EventDefinitionBody,
+}
+
+/// The trigger kinds of BPMN 2.0, by XML tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventDefinitionKind {
     /// `messageEventDefinition`.
+    Message,
+    /// `timerEventDefinition`.
+    Timer,
+    /// `signalEventDefinition`.
+    Signal,
+    /// `errorEventDefinition`.
+    Error,
+    /// `escalationEventDefinition`.
+    Escalation,
+    /// `conditionalEventDefinition`.
+    Conditional,
+    /// `compensateEventDefinition`.
+    Compensate,
+    /// `linkEventDefinition`.
+    Link,
+    /// `cancelEventDefinition`.
+    Cancel,
+    /// `terminateEventDefinition`.
+    Terminate,
+    /// A definition tag we do not recognize.
+    Other,
+}
+
+impl EventDefinitionKind {
+    /// The XML local tag name, when the kind maps to one.
+    pub fn tag(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Message => "messageEventDefinition",
+            Self::Timer => "timerEventDefinition",
+            Self::Signal => "signalEventDefinition",
+            Self::Error => "errorEventDefinition",
+            Self::Escalation => "escalationEventDefinition",
+            Self::Conditional => "conditionalEventDefinition",
+            Self::Compensate => "compensateEventDefinition",
+            Self::Link => "linkEventDefinition",
+            Self::Cancel => "cancelEventDefinition",
+            Self::Terminate => "terminateEventDefinition",
+            Self::Other => return None,
+        })
+    }
+}
+
+/// An event definition's content.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventDefinitionBody {
+    /// A message definition the editor understands.
     Message {
         /// Id of the element itself, if present.
         id: Option<BpmnId>,
         /// The `messageRef` attribute.
         message_ref: Option<String>,
     },
-    /// `terminateEventDefinition`.
-    Terminate {
+    /// A bare definition element with no content beyond an optional id
+    /// (what the editor creates for timers, signals, terminate, ...).
+    Empty {
         /// Id of the element itself, if present.
         id: Option<BpmnId>,
     },
-    /// Any other definition (timer, signal, error, ...), preserved verbatim.
-    Other(RawXml),
+    /// Anything richer (timer durations, error refs, vendor content),
+    /// preserved verbatim.
+    Raw(RawXml),
 }
 
 /// An activity.
@@ -151,6 +209,29 @@ pub struct Activity {
     pub node: FlowNode,
     /// What kind of activity this is.
     pub kind: ActivityKind,
+    /// Loop / multi-instance marker, when present.
+    pub loop_marker: Option<LoopMarker>,
+}
+
+/// A loop or multi-instance characteristic on an activity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoopMarker {
+    /// Which marker is drawn.
+    pub kind: LoopKind,
+    /// The original element, verbatim, when it carried more than the editor
+    /// understands (cardinalities, completion conditions, vendor content).
+    pub raw: Option<RawXml>,
+}
+
+/// The loop marker kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopKind {
+    /// `standardLoopCharacteristics`.
+    Standard,
+    /// `multiInstanceLoopCharacteristics` (parallel, the default).
+    MultiInstanceParallel,
+    /// `multiInstanceLoopCharacteristics isSequential="true"`.
+    MultiInstanceSequential,
 }
 
 /// The kinds of activity (M1: tasks only).

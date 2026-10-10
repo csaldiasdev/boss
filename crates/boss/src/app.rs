@@ -6,9 +6,14 @@ use crate::platform::{self, OpenedFile, SavedFile};
 use crate::session::EditSession;
 use crate::theme::{self, Mode, Tokens};
 use bpmn_core::di::DiElement;
-use bpmn_core::model::{Condition, FlowElement, GatewayKind, TaskType};
+use bpmn_core::model::{
+    Condition, EventDefinitionKind, EventPosition, FlowElement, GatewayKind, LoopKind, TaskType,
+};
 use bpmn_core::{BpmnId, Document, NodeKind};
-use iced::widget::{button, column, container, pick_list, row, space, text, text_input};
+use bpmn_validate::{Issue, Severity, Validator};
+use iced::widget::{
+    button, column, container, pick_list, row, scrollable, space, text, text_input,
+};
 use iced::{Center, Element, Fill, Size, Subscription, Task, Theme, Vector};
 use std::collections::HashSet;
 
@@ -65,6 +70,88 @@ const TASK_TYPES: [TaskTypeChoice; 8] = [
 /// The "(none)" entry in the default-flow pick list.
 const NO_DEFAULT: &str = "(none)";
 
+/// An event trigger with a human label, for the properties pick list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TriggerChoice(Option<EventDefinitionKind>);
+
+impl std::fmt::Display for TriggerChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            None => "None",
+            Some(EventDefinitionKind::Message) => "Message",
+            Some(EventDefinitionKind::Timer) => "Timer",
+            Some(EventDefinitionKind::Signal) => "Signal",
+            Some(EventDefinitionKind::Error) => "Error",
+            Some(EventDefinitionKind::Escalation) => "Escalation",
+            Some(EventDefinitionKind::Conditional) => "Conditional",
+            Some(EventDefinitionKind::Compensate) => "Compensate",
+            Some(EventDefinitionKind::Link) => "Link",
+            Some(EventDefinitionKind::Cancel) => "Cancel",
+            Some(EventDefinitionKind::Terminate) => "Terminate",
+            Some(EventDefinitionKind::Other) => "(vendor-specific)",
+        })
+    }
+}
+
+/// The triggers that make sense for an event position (BPMN 2.0 table 10.x,
+/// abridged to what boss can author).
+fn trigger_options(position: &EventPosition) -> Vec<TriggerChoice> {
+    use EventDefinitionKind as K;
+    let kinds: &[K] = match position {
+        EventPosition::Start { .. } => &[K::Message, K::Timer, K::Signal, K::Conditional],
+        EventPosition::IntermediateCatch => {
+            &[K::Message, K::Timer, K::Signal, K::Conditional, K::Link]
+        }
+        EventPosition::IntermediateThrow => {
+            &[K::Message, K::Signal, K::Escalation, K::Link, K::Compensate]
+        }
+        EventPosition::Boundary { .. } => &[
+            K::Message,
+            K::Timer,
+            K::Signal,
+            K::Error,
+            K::Escalation,
+            K::Conditional,
+            K::Compensate,
+            K::Cancel,
+        ],
+        EventPosition::End => &[
+            K::Message,
+            K::Signal,
+            K::Error,
+            K::Escalation,
+            K::Compensate,
+            K::Cancel,
+            K::Terminate,
+        ],
+    };
+    std::iter::once(TriggerChoice(None))
+        .chain(kinds.iter().map(|k| TriggerChoice(Some(*k))))
+        .collect()
+}
+
+/// A loop marker with a human label, for the properties pick list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopChoice(Option<LoopKind>);
+
+impl std::fmt::Display for LoopChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            None => "None",
+            Some(LoopKind::Standard) => "Loop",
+            Some(LoopKind::MultiInstanceParallel) => "Multi-instance (parallel)",
+            Some(LoopKind::MultiInstanceSequential) => "Multi-instance (sequential)",
+        })
+    }
+}
+
+const LOOP_CHOICES: [LoopChoice; 4] = [
+    LoopChoice(None),
+    LoopChoice(Some(LoopKind::Standard)),
+    LoopChoice(Some(LoopKind::MultiInstanceParallel)),
+    LoopChoice(Some(LoopKind::MultiInstanceSequential)),
+];
+
 /// Top-level application state.
 pub struct App {
     camera: Camera,
@@ -79,6 +166,9 @@ pub struct App {
     tool: Tool,
     status: Option<StatusLine>,
     window_size: Size,
+    validator: Validator,
+    issues: Vec<Issue>,
+    badges: std::collections::HashMap<BpmnId, crate::render::Badge>,
 }
 
 impl Default for App {
@@ -96,6 +186,9 @@ impl Default for App {
             tool: Tool::Select,
             status: None,
             window_size: Size::new(1280.0, 800.0),
+            validator: Validator::with_default_rules(),
+            issues: Vec::new(),
+            badges: std::collections::HashMap::new(),
         }
     }
 }
@@ -145,6 +238,12 @@ pub enum Message {
     DefaultFlowChanged(String),
     /// The condition of the selected sequence flow changed.
     ConditionEdited(String),
+    /// The trigger of the selected event changed.
+    TriggerChanged(TriggerChoice),
+    /// The loop marker of the selected activity changed.
+    LoopChanged(LoopChoice),
+    /// An issue row was clicked: select and center its element.
+    IssueClicked(Option<BpmnId>),
     /// Start a fresh document.
     NewRequested,
     /// The user asked to open a file.
@@ -225,6 +324,29 @@ impl App {
         theme::tokens(self.mode)
     }
 
+    /// Re-runs validation and refreshes the canvas; call after any document
+    /// mutation (documents are small — a full pass is microseconds).
+    fn document_changed(&mut self) {
+        self.issues = self.validator.run(self.session.document());
+        self.badges.clear();
+        for issue in &self.issues {
+            if let Some(id) = &issue.element {
+                let badge = match issue.severity {
+                    Severity::Error => crate::render::Badge::Error,
+                    Severity::Warning | Severity::Info => crate::render::Badge::Warning,
+                };
+                let entry = self
+                    .badges
+                    .entry(id.clone())
+                    .or_insert(crate::render::Badge::Warning);
+                if badge == crate::render::Badge::Error {
+                    *entry = crate::render::Badge::Error;
+                }
+            }
+        }
+        self.canvas.invalidate();
+    }
+
     fn status(&mut self, text: impl Into<String>, is_error: bool) {
         self.status = Some(StatusLine {
             text: text.into(),
@@ -301,6 +423,80 @@ impl App {
                 }
                 self.canvas.invalidate();
             }
+            CanvasMessage::SelectOnly(_)
+            | CanvasMessage::SelectToggle(_)
+            | CanvasMessage::ClearSelection
+            | CanvasMessage::SelectInRect(_) => self.handle_selection(message),
+            CanvasMessage::MoveSelection { dx, dy } => {
+                let selection = self.selection.clone();
+                self.session.commit(|doc| {
+                    doc.move_shapes(&selection, f64::from(dx), f64::from(dy));
+                    true
+                });
+                self.document_changed();
+            }
+            CanvasMessage::Place(kind, at) => {
+                let mut created = None;
+                self.session.commit(|doc| {
+                    created = doc.create_node(
+                        kind,
+                        bpmn_core::Point::new(f64::from(at.x), f64::from(at.y)),
+                    );
+                    created.is_some()
+                });
+                if let Some(id) = created {
+                    self.selection.clear();
+                    self.selection.insert(id);
+                }
+                self.tool = Tool::Select;
+                self.document_changed();
+            }
+            CanvasMessage::Connect(source, target) => {
+                let mut connected = false;
+                self.session.commit(|doc| {
+                    connected = doc.connect(&source, &target).is_some();
+                    connected
+                });
+                if !connected {
+                    self.status("Cannot connect those elements", true);
+                }
+                self.tool = Tool::Select;
+                self.document_changed();
+            }
+            CanvasMessage::SetEdgeWaypoints { id, points } => {
+                let points: Vec<bpmn_core::Point> = points
+                    .iter()
+                    .map(|p| bpmn_core::Point::new(f64::from(p.x), f64::from(p.y)))
+                    .collect();
+                self.session
+                    .commit(|doc| doc.set_edge_waypoints(&id, &points));
+                self.document_changed();
+            }
+            CanvasMessage::PlaceBoundary(host, at) => {
+                let mut created = None;
+                self.session.commit(|doc| {
+                    created = doc.create_boundary_event(
+                        &host,
+                        bpmn_core::Point::new(f64::from(at.x), f64::from(at.y)),
+                    );
+                    created.is_some()
+                });
+                match created {
+                    Some(id) => {
+                        self.selection.clear();
+                        self.selection.insert(id);
+                    }
+                    None => self.status("Boundary events attach to tasks", true),
+                }
+                self.tool = Tool::Select;
+                self.document_changed();
+            }
+            CanvasMessage::CancelTool => self.tool = Tool::Select,
+        }
+    }
+
+    fn handle_selection(&mut self, message: CanvasMessage) {
+        match message {
             CanvasMessage::SelectOnly(id) => {
                 self.selection.clear();
                 self.selection.insert(id);
@@ -332,52 +528,7 @@ impl App {
                     }
                 }
             }
-            CanvasMessage::MoveSelection { dx, dy } => {
-                let selection = self.selection.clone();
-                self.session.commit(|doc| {
-                    doc.move_shapes(&selection, f64::from(dx), f64::from(dy));
-                    true
-                });
-                self.canvas.invalidate();
-            }
-            CanvasMessage::Place(kind, at) => {
-                let mut created = None;
-                self.session.commit(|doc| {
-                    created = doc.create_node(
-                        kind,
-                        bpmn_core::Point::new(f64::from(at.x), f64::from(at.y)),
-                    );
-                    created.is_some()
-                });
-                if let Some(id) = created {
-                    self.selection.clear();
-                    self.selection.insert(id);
-                }
-                self.tool = Tool::Select;
-                self.canvas.invalidate();
-            }
-            CanvasMessage::Connect(source, target) => {
-                let mut connected = false;
-                self.session.commit(|doc| {
-                    connected = doc.connect(&source, &target).is_some();
-                    connected
-                });
-                if !connected {
-                    self.status("Cannot connect those elements", true);
-                }
-                self.tool = Tool::Select;
-                self.canvas.invalidate();
-            }
-            CanvasMessage::SetEdgeWaypoints { id, points } => {
-                let points: Vec<bpmn_core::Point> = points
-                    .iter()
-                    .map(|p| bpmn_core::Point::new(f64::from(p.x), f64::from(p.y)))
-                    .collect();
-                self.session
-                    .commit(|doc| doc.set_edge_waypoints(&id, &points));
-                self.canvas.invalidate();
-            }
-            CanvasMessage::CancelTool => self.tool = Tool::Select,
+            _ => {}
         }
     }
 
@@ -413,9 +564,17 @@ impl App {
                         doc.set_condition(&id, text)
                     });
             }
+            Message::TriggerChanged(choice) => {
+                self.session
+                    .commit(|doc| doc.set_event_definition(&id, choice.0));
+            }
+            Message::LoopChanged(choice) => {
+                self.session
+                    .commit(|doc| doc.set_loop_marker(&id, choice.0));
+            }
             _ => {}
         }
-        self.canvas.invalidate();
+        self.document_changed();
     }
 
     /// Handles a message.
@@ -443,13 +602,13 @@ impl App {
             Message::Undo => {
                 if self.session.undo() {
                     self.selection.clear();
-                    self.canvas.invalidate();
+                    self.document_changed();
                 }
             }
             Message::Redo => {
                 if self.session.redo() {
                     self.selection.clear();
-                    self.canvas.invalidate();
+                    self.document_changed();
                 }
             }
             Message::DeleteSelection => {
@@ -460,7 +619,7 @@ impl App {
                         true
                     });
                     self.selection.clear();
-                    self.canvas.invalidate();
+                    self.document_changed();
                 }
             }
             Message::Keyboard(event) => {
@@ -491,7 +650,19 @@ impl App {
             message @ (Message::NameEdited(_)
             | Message::TaskTypeChanged(_)
             | Message::DefaultFlowChanged(_)
-            | Message::ConditionEdited(_)) => self.handle_property(message),
+            | Message::ConditionEdited(_)
+            | Message::TriggerChanged(_)
+            | Message::LoopChanged(_)) => self.handle_property(message),
+            Message::IssueClicked(Some(id)) => {
+                if let Some((_, bounds)) = self.session.document().node_outline(&id) {
+                    let center = bounds.center();
+                    self.camera.translation = Vector::new(-(center.x as f32), -(center.y as f32));
+                }
+                self.selection.clear();
+                self.selection.insert(id);
+                self.canvas.invalidate();
+            }
+            Message::IssueClicked(None) => {}
             message => return self.handle_file(message),
         }
 
@@ -516,7 +687,7 @@ impl App {
                         true
                     });
                     self.selection.clear();
-                    self.canvas.invalidate();
+                    self.document_changed();
                     return iced::clipboard::write(xml);
                 }
             }
@@ -534,7 +705,7 @@ impl App {
                         self.status("Nothing pastable on the clipboard", true);
                     } else {
                         self.selection = pasted.into_iter().collect();
-                        self.canvas.invalidate();
+                        self.document_changed();
                     }
                 } else {
                     self.status("Clipboard does not hold BPMN XML", true);
@@ -560,7 +731,7 @@ impl App {
                     }
                     self.selection.clear();
                     self.camera = Camera::default();
-                    self.canvas.invalidate();
+                    self.document_changed();
                 }
             }
             Message::OpenRequested => {
@@ -582,7 +753,7 @@ impl App {
                     self.selection.clear();
                     self.tool = Tool::Select;
                     self.zoom_to_fit();
-                    self.canvas.invalidate();
+                    self.document_changed();
                 }
                 Err(error) => self.status(format!("Could not open {}: {error}", file.name), true),
             },
@@ -617,6 +788,7 @@ impl App {
                             &self.camera,
                             self.session.document(),
                             &self.selection,
+                            &self.badges,
                             self.tool,
                             t.canvas,
                         )
@@ -628,8 +800,45 @@ impl App {
             ]
             .width(Fill)
             .height(Fill),
+            self.issues_panel(t),
             self.status_bar(t),
         ]
+        .into()
+    }
+
+    fn issues_panel(&self, t: Tokens) -> Element<'_, Message> {
+        if self.issues.is_empty() {
+            return space::vertical().height(0).into();
+        }
+
+        let rows = self.issues.iter().map(|issue| {
+            let dot_color = match issue.severity {
+                Severity::Error => t.danger,
+                Severity::Warning | Severity::Info => t.warning,
+            };
+            button(
+                row![
+                    text("\u{25cf}").size(11).color(dot_color),
+                    text(issue.rule).font(theme::MONO).size(11).color(t.muted),
+                    text(issue.message.clone()).size(12),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            )
+            .style(theme::issue_row(t))
+            .padding([2, 8])
+            .width(Fill)
+            .on_press(Message::IssueClicked(issue.element.clone()))
+            .into()
+        });
+
+        container(
+            scrollable(column(rows).spacing(2))
+                .height(f32::min(94.0, 22.0 * self.issues.len() as f32 + 8.0)),
+        )
+        .style(move |_| theme::panel(t))
+        .padding([4, 8])
+        .width(Fill)
         .into()
     }
 
@@ -706,20 +915,28 @@ impl App {
         };
         let section = |label: &'static str| text(label).font(theme::SANS_MEDIUM).size(14);
 
-        container(
+        container(scrollable(
             column![
                 section("Tools"),
                 entry("Select", Tool::Select),
                 entry("Connect", Tool::Connect),
                 section("Events"),
-                entry("Start event", Tool::Place(NodeKind::StartEvent)),
-                entry("End event", Tool::Place(NodeKind::EndEvent)),
+                entry("Start", Tool::Place(NodeKind::StartEvent)),
+                entry("Catch", Tool::Place(NodeKind::IntermediateCatch)),
+                entry("Throw", Tool::Place(NodeKind::IntermediateThrow)),
+                entry("Boundary", Tool::Place(NodeKind::Boundary)),
+                entry("End", Tool::Place(NodeKind::EndEvent)),
                 section("Tasks"),
                 entry("Task", Tool::Place(NodeKind::Task(TaskType::Generic))),
-                entry("User task", Tool::Place(NodeKind::Task(TaskType::User))),
+                entry("User", Tool::Place(NodeKind::Task(TaskType::User))),
+                entry("Service", Tool::Place(NodeKind::Task(TaskType::Service))),
+                entry("Script", Tool::Place(NodeKind::Task(TaskType::Script))),
+                entry("Manual", Tool::Place(NodeKind::Task(TaskType::Manual))),
+                entry("Send", Tool::Place(NodeKind::Task(TaskType::Send))),
+                entry("Receive", Tool::Place(NodeKind::Task(TaskType::Receive))),
                 entry(
-                    "Service task",
-                    Tool::Place(NodeKind::Task(TaskType::Service))
+                    "Business rule",
+                    Tool::Place(NodeKind::Task(TaskType::BusinessRule))
                 ),
                 section("Gateways"),
                 entry(
@@ -730,9 +947,17 @@ impl App {
                     "Parallel",
                     Tool::Place(NodeKind::Gateway(GatewayKind::Parallel))
                 ),
+                entry(
+                    "Inclusive",
+                    Tool::Place(NodeKind::Gateway(GatewayKind::Inclusive))
+                ),
+                entry(
+                    "Event-based",
+                    Tool::Place(NodeKind::Gateway(GatewayKind::EventBased))
+                ),
             ]
             .spacing(6),
-        )
+        ))
         .style(move |_| theme::panel(t))
         .padding(12)
         .width(170)
@@ -795,6 +1020,15 @@ impl App {
                     .text_size(13)
                     .width(Fill),
                 );
+                form = form.push(caption("Marker")).push(
+                    pick_list(
+                        LOOP_CHOICES,
+                        Some(LoopChoice(activity.loop_marker.as_ref().map(|m| m.kind))),
+                        Message::LoopChanged,
+                    )
+                    .text_size(13)
+                    .width(Fill),
+                );
             }
             FlowElement::Gateway(gateway) => {
                 let mut options = vec![String::from(NO_DEFAULT)];
@@ -835,7 +1069,19 @@ impl App {
                     );
                 }
             },
-            FlowElement::Event(_) | FlowElement::Unknown(_) => {}
+            FlowElement::Event(event) => {
+                let current = TriggerChoice(event.definitions.first().map(|d| d.kind));
+                form = form.push(caption("Trigger")).push(
+                    pick_list(
+                        trigger_options(&event.position),
+                        Some(current),
+                        Message::TriggerChanged,
+                    )
+                    .text_size(13)
+                    .width(Fill),
+                );
+            }
+            FlowElement::Unknown(_) => {}
         }
 
         form.into()
@@ -860,6 +1106,17 @@ impl App {
             n => format!("· {n} selected"),
         };
 
+        let issue_chip: Element<'_, Message> = if self.issues.is_empty() {
+            text("").size(11).into()
+        } else {
+            let worst_is_error = self.issues.iter().any(|i| i.severity == Severity::Error);
+            let color = if worst_is_error { t.danger } else { t.warning };
+            text(format!("\u{25cf} {} issues", self.issues.len()))
+                .size(11)
+                .color(color)
+                .into()
+        };
+
         container(
             row![
                 text(format!("zoom {}%", self.camera.zoom_percent()))
@@ -869,6 +1126,7 @@ impl App {
                     .font(theme::MONO)
                     .size(11)
                     .color(t.muted),
+                issue_chip,
                 space::horizontal(),
                 info,
             ]

@@ -95,7 +95,10 @@ fn parses_extension_fixture_event_details() {
     );
     assert!(matches!(
         boundary.definitions.as_slice(),
-        [EventDefinition::Other(raw)] if raw.as_str().contains("PT5M")
+        [EventDefinition {
+            kind: bpmn_core::model::EventDefinitionKind::Timer,
+            body: bpmn_core::model::EventDefinitionBody::Raw(raw),
+        }] if raw.as_str().contains("PT5M")
     ));
 
     let FlowElement::Event(catch) = index[&BpmnId::from("Catch_Order")] else {
@@ -103,7 +106,10 @@ fn parses_extension_fixture_event_details() {
     };
     assert!(matches!(
         catch.definitions.as_slice(),
-        [EventDefinition::Message { message_ref: Some(m), .. }] if m == "Message_Order"
+        [EventDefinition {
+            kind: bpmn_core::model::EventDefinitionKind::Message,
+            body: bpmn_core::model::EventDefinitionBody::Message { message_ref: Some(m), .. },
+        }] if m == "Message_Order"
     ));
 
     // The subprocess is outside the modeled subset but must survive verbatim.

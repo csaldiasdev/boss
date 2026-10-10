@@ -62,6 +62,8 @@ pub enum CanvasMessage {
     },
     /// Place a new node of this kind at this (snapped) world position.
     Place(NodeKind, Point),
+    /// Place a boundary event on this host activity, toward this point.
+    PlaceBoundary(BpmnId, Point),
     /// Connect source to target with a sequence flow.
     Connect(BpmnId, BpmnId),
     /// Replace an edge's waypoints after a handle drag.
@@ -89,6 +91,7 @@ impl DiagramCanvas {
         camera: &'a Camera,
         document: &'a Document,
         selection: &'a HashSet<BpmnId>,
+        badges: &'a std::collections::HashMap<BpmnId, crate::render::Badge>,
         tool: Tool,
         tokens: CanvasTokens,
     ) -> Element<'a, CanvasMessage> {
@@ -98,6 +101,7 @@ impl DiagramCanvas {
             camera,
             document,
             selection,
+            badges,
             tool,
             tokens,
         })
@@ -120,6 +124,7 @@ struct View<'a> {
     camera: &'a Camera,
     document: &'a Document,
     selection: &'a HashSet<BpmnId>,
+    badges: &'a std::collections::HashMap<BpmnId, crate::render::Badge>,
     tool: Tool,
     tokens: CanvasTokens,
 }
@@ -404,6 +409,18 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                 Some(canvas::Action::request_redraw().and_capture())
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => match self.tool {
+                Tool::Place(NodeKind::Boundary) => {
+                    // Boundary events need a host activity under the cursor.
+                    self.hit_node(world).map_or_else(
+                        || Some(canvas::Action::request_redraw().and_capture()),
+                        |host| {
+                            Some(
+                                canvas::Action::publish(CanvasMessage::PlaceBoundary(host, world))
+                                    .and_capture(),
+                            )
+                        },
+                    )
+                }
                 Tool::Place(kind) => Some(
                     canvas::Action::publish(CanvasMessage::Place(kind, snap_point(world)))
                         .and_capture(),
@@ -582,6 +599,7 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                 render::draw(
                     frame,
                     self.document,
+                    self.badges,
                     self.tokens,
                     self.camera.scaling,
                     region,

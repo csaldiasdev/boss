@@ -11,8 +11,8 @@ use crate::geometry::{Bounds, Point, Size};
 use crate::ids::BpmnId;
 use crate::model::{
     Activity, ActivityKind, BOSS_TARGET_NAMESPACE, BaseElement, Condition, Definitions, Event,
-    EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, Process, RootElement, SequenceFlow,
-    TaskType,
+    EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, LoopKind, LoopMarker, Process,
+    RootElement, SequenceFlow, TaskType,
 };
 use std::collections::HashSet;
 
@@ -23,6 +23,12 @@ pub enum NodeKind {
     StartEvent,
     /// A plain end event.
     EndEvent,
+    /// A plain intermediate catch event.
+    IntermediateCatch,
+    /// A plain intermediate throw event.
+    IntermediateThrow,
+    /// A boundary event (requires a host activity under the cursor).
+    Boundary,
     /// A task of the given type.
     Task(TaskType),
     /// A gateway of the given kind.
@@ -33,7 +39,11 @@ impl NodeKind {
     /// Default shape size when placed, per BPMN conventions.
     pub fn default_size(self) -> Size {
         match self {
-            NodeKind::StartEvent | NodeKind::EndEvent => Size::new(36.0, 36.0),
+            NodeKind::StartEvent
+            | NodeKind::EndEvent
+            | NodeKind::IntermediateCatch
+            | NodeKind::IntermediateThrow
+            | NodeKind::Boundary => Size::new(36.0, 36.0),
             NodeKind::Task(_) => Size::new(100.0, 80.0),
             NodeKind::Gateway(_) => Size::new(50.0, 50.0),
         }
@@ -41,7 +51,11 @@ impl NodeKind {
 
     fn id_prefix(self) -> &'static str {
         match self {
-            NodeKind::StartEvent | NodeKind::EndEvent => "Event",
+            NodeKind::StartEvent
+            | NodeKind::EndEvent
+            | NodeKind::IntermediateCatch
+            | NodeKind::IntermediateThrow
+            | NodeKind::Boundary => "Event",
             NodeKind::Task(_) => "Activity",
             NodeKind::Gateway(_) => "Gateway",
         }
@@ -241,9 +255,22 @@ impl Document {
                 position: EventPosition::End,
                 definitions: Vec::new(),
             }),
+            NodeKind::IntermediateCatch => FlowElement::Event(Event {
+                node,
+                position: EventPosition::IntermediateCatch,
+                definitions: Vec::new(),
+            }),
+            NodeKind::IntermediateThrow => FlowElement::Event(Event {
+                node,
+                position: EventPosition::IntermediateThrow,
+                definitions: Vec::new(),
+            }),
+            // Boundary events go through create_boundary_event (need a host).
+            NodeKind::Boundary => return None,
             NodeKind::Task(task_type) => FlowElement::Activity(Activity {
                 node,
                 kind: ActivityKind::Task(task_type),
+                loop_marker: None,
             }),
             NodeKind::Gateway(gateway_kind) => FlowElement::Gateway(Gateway {
                 node,
@@ -320,6 +347,95 @@ impl Document {
         Some(id)
     }
 
+    /// Creates a boundary event attached to `host`, sitting on its border at
+    /// the point nearest to `toward`.
+    pub fn create_boundary_event(&mut self, host: &BpmnId, toward: Point) -> Option<BpmnId> {
+        let (outline, bounds) = self.node_outline(host)?;
+        if !matches!(
+            self.flow_element_index().get(host),
+            Some(FlowElement::Activity(_))
+        ) {
+            return None;
+        }
+        let center = outline.anchor(bounds, toward);
+
+        let id = self.fresh_id("Event");
+        let shape_id = BpmnId::new(format!("{id}_di").as_str());
+        let element = FlowElement::Event(Event {
+            node: FlowNode {
+                base: BaseElement::new(id.clone()),
+                ..FlowNode::default()
+            },
+            position: EventPosition::Boundary {
+                attached_to: host.clone(),
+                cancel_activity: None,
+            },
+            definitions: Vec::new(),
+        });
+
+        self.first_process_mut()?.flow_elements.push(element);
+        self.plane_mut()?.elements.push(DiElement::Shape(BpmnShape {
+            id: Some(shape_id),
+            bpmn_element: id.clone(),
+            bounds: Bounds::new(center.x - 18.0, center.y - 18.0, 36.0, 36.0),
+            ..BpmnShape::default()
+        }));
+        Some(id)
+    }
+
+    /// Sets an event's (single) trigger; `None` makes it a plain event. A
+    /// definition whose body we only hold verbatim is replaced wholesale.
+    pub fn set_event_definition(
+        &mut self,
+        id: &BpmnId,
+        kind: Option<crate::model::EventDefinitionKind>,
+    ) -> bool {
+        use crate::model::{EventDefinition, EventDefinitionBody, EventDefinitionKind};
+        let Some(FlowElement::Event(event)) = self.flow_element_mut(id) else {
+            return false;
+        };
+        event.definitions = match kind {
+            None => Vec::new(),
+            Some(EventDefinitionKind::Message) => vec![EventDefinition {
+                kind: EventDefinitionKind::Message,
+                body: EventDefinitionBody::Message {
+                    id: None,
+                    message_ref: None,
+                },
+            }],
+            Some(kind) => vec![EventDefinition {
+                kind,
+                body: EventDefinitionBody::Empty { id: None },
+            }],
+        };
+        true
+    }
+
+    /// Sets an activity's loop marker; `None` clears it. A marker holding
+    /// verbatim content is replaced wholesale.
+    pub fn set_loop_marker(&mut self, id: &BpmnId, kind: Option<LoopKind>) -> bool {
+        let Some(FlowElement::Activity(activity)) = self.flow_element_mut(id) else {
+            return false;
+        };
+        activity.loop_marker = kind.map(|kind| LoopMarker { kind, raw: None });
+        true
+    }
+
+    /// The boundary events attached to any of `hosts`.
+    pub fn attached_boundaries(&self, hosts: &HashSet<BpmnId>) -> Vec<BpmnId> {
+        self.flow_elements()
+            .filter_map(|element| match element {
+                FlowElement::Event(event) => match &event.position {
+                    EventPosition::Boundary { attached_to, .. } if hosts.contains(attached_to) => {
+                        Some(event.node.base.id.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The outline and DI bounds of a flow node.
     pub fn node_outline(&self, id: &BpmnId) -> Option<(Outline, Bounds)> {
         let index = self.flow_element_index();
@@ -333,26 +449,76 @@ impl Document {
     }
 
     /// Moves the shapes of `ids` by `(dx, dy)` and re-anchors affected edges.
+    /// Boundary events follow their host; a boundary moved on its own is
+    /// clamped back onto its host's border.
     pub fn move_shapes(&mut self, ids: &HashSet<BpmnId>, dx: f64, dy: f64) {
+        let mut moving: HashSet<BpmnId> = ids.clone();
+        moving.extend(self.attached_boundaries(ids));
+
+        {
+            let Some(plane) = self.plane_mut() else {
+                return;
+            };
+            for element in &mut plane.elements {
+                match element {
+                    DiElement::Shape(shape) if moving.contains(&shape.bpmn_element) => {
+                        shape.bounds.x += dx;
+                        shape.bounds.y += dy;
+                        if let Some(label) = &mut shape.label
+                            && let Some(bounds) = &mut label.bounds
+                        {
+                            bounds.x += dx;
+                            bounds.y += dy;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.clamp_boundaries(&moving, ids);
+        self.reanchor_edges(&moving);
+    }
+
+    /// Clamps moved boundary events back onto their host borders, unless the
+    /// host moved too (then the boundary already followed it rigidly).
+    fn clamp_boundaries(&mut self, moved: &HashSet<BpmnId>, explicit: &HashSet<BpmnId>) {
+        let mut clamps: Vec<(BpmnId, Point)> = Vec::new();
+        for id in moved {
+            let Some(FlowElement::Event(event)) = self.flow_element_index().get(id).copied() else {
+                continue;
+            };
+            let EventPosition::Boundary { attached_to, .. } = &event.position else {
+                continue;
+            };
+            // Host moved along: boundary keeps its relative spot.
+            if explicit.contains(attached_to) || moved.contains(attached_to) {
+                continue;
+            }
+            let Some((outline, host_bounds)) = self.node_outline(attached_to) else {
+                continue;
+            };
+            let Some((_, own_bounds)) = self.node_outline(id) else {
+                continue;
+            };
+            clamps.push((id.clone(), outline.anchor(host_bounds, own_bounds.center())));
+        }
+
+        if clamps.is_empty() {
+            return;
+        }
         let Some(plane) = self.plane_mut() else {
             return;
         };
-        for element in &mut plane.elements {
-            match element {
-                DiElement::Shape(shape) if ids.contains(&shape.bpmn_element) => {
-                    shape.bounds.x += dx;
-                    shape.bounds.y += dy;
-                    if let Some(label) = &mut shape.label
-                        && let Some(bounds) = &mut label.bounds
-                    {
-                        bounds.x += dx;
-                        bounds.y += dy;
-                    }
+        for (id, center) in clamps {
+            for element in &mut plane.elements {
+                if let DiElement::Shape(shape) = element
+                    && shape.bpmn_element == id
+                {
+                    shape.bounds.x = center.x - shape.bounds.width / 2.0;
+                    shape.bounds.y = center.y - shape.bounds.height / 2.0;
                 }
-                _ => {}
             }
         }
-        self.reanchor_edges(ids);
     }
 
     /// Recomputes the endpoint waypoints of every edge touching `ids`.

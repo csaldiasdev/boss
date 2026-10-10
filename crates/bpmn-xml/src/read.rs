@@ -12,8 +12,9 @@ use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiEl
 use bpmn_core::geometry::{Bounds, Point};
 use bpmn_core::model::{
     Activity, ActivityKind, BaseElement, Condition, Definitions, Event as BpmnEvent,
-    EventDefinition, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, Process,
-    RootElement, SequenceFlow, TaskType,
+    EventDefinition, EventDefinitionBody, EventDefinitionKind, EventPosition, FlowElement,
+    FlowNode, Gateway, GatewayKind, LoopKind, LoopMarker, Process, RootElement, SequenceFlow,
+    TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::events::{BytesStart, Event};
@@ -481,36 +482,49 @@ fn parse_event(
     }
 }
 
-/// Models `messageEventDefinition`/`terminateEventDefinition` when they carry
-/// nothing we would lose; any extra attribute or child content falls back to
-/// verbatim preservation.
+/// The trigger kind is always taken from the tag; the body is structured only
+/// when the element carries nothing we would lose, and verbatim otherwise.
 fn parse_event_definition(
     cx: &mut Cx<'_>,
     pos: usize,
     e: &BytesStart<'_>,
     empty: bool,
 ) -> Result<EventDefinition, ParseError> {
-    if empty {
+    let kind = match local(e) {
+        "messageEventDefinition" => EventDefinitionKind::Message,
+        "timerEventDefinition" => EventDefinitionKind::Timer,
+        "signalEventDefinition" => EventDefinitionKind::Signal,
+        "errorEventDefinition" => EventDefinitionKind::Error,
+        "escalationEventDefinition" => EventDefinitionKind::Escalation,
+        "conditionalEventDefinition" => EventDefinitionKind::Conditional,
+        "compensateEventDefinition" => EventDefinitionKind::Compensate,
+        "linkEventDefinition" => EventDefinitionKind::Link,
+        "cancelEventDefinition" => EventDefinitionKind::Cancel,
+        "terminateEventDefinition" => EventDefinitionKind::Terminate,
+        _ => EventDefinitionKind::Other,
+    };
+
+    let body = if empty && kind != EventDefinitionKind::Other {
         let mut set = attr_set(e)?;
-        match local(e) {
-            "messageEventDefinition" => {
-                let id = set.take_id("id");
-                let message_ref = set.take("messageRef");
-                if set.is_empty() {
-                    return Ok(EventDefinition::Message { id, message_ref });
-                }
+        let id = set.take_id("id");
+        let message_ref = (kind == EventDefinitionKind::Message)
+            .then(|| set.take("messageRef"))
+            .flatten();
+        if set.is_empty() {
+            let _ = cx.capture_span(pos);
+            if kind == EventDefinitionKind::Message {
+                EventDefinitionBody::Message { id, message_ref }
+            } else {
+                EventDefinitionBody::Empty { id }
             }
-            "terminateEventDefinition" => {
-                let id = set.take_id("id");
-                if set.is_empty() {
-                    return Ok(EventDefinition::Terminate { id });
-                }
-            }
-            _ => {}
+        } else {
+            EventDefinitionBody::Raw(cx.capture_span(pos))
         }
-        return Ok(EventDefinition::Other(cx.capture_span(pos)));
-    }
-    Ok(EventDefinition::Other(cx.capture(pos, e)?))
+    } else {
+        EventDefinitionBody::Raw(cx.capture_any(pos, e, empty)?)
+    };
+
+    Ok(EventDefinition { kind, body })
 }
 
 fn parse_task(
@@ -526,6 +540,7 @@ fn parse_task(
     let mut activity = Activity {
         node,
         kind: ActivityKind::Task(task_type),
+        loop_marker: None,
     };
 
     if !empty {
@@ -548,7 +563,18 @@ fn parse_task(
                 _ => continue,
             };
 
-            if !node_child(cx, &mut activity.node, pos, nsk, &e, is_empty)? {
+            if node_child(cx, &mut activity.node, pos, nsk, &e, is_empty)? {
+                continue;
+            }
+
+            if nsk == Ns::Model
+                && matches!(
+                    local(&e),
+                    "standardLoopCharacteristics" | "multiInstanceLoopCharacteristics"
+                )
+            {
+                activity.loop_marker = Some(parse_loop_marker(cx, pos, &e, is_empty)?);
+            } else {
                 activity
                     .node
                     .base
@@ -943,4 +969,30 @@ fn parse_condition(
         }),
         _ => Ok(Condition::Raw(raw)),
     }
+}
+
+/// Loop markers keep the original element verbatim unless it is a bare,
+/// attribute-free tag the editor could have created itself.
+fn parse_loop_marker(
+    cx: &mut Cx<'_>,
+    pos: usize,
+    e: &BytesStart<'_>,
+    empty: bool,
+) -> Result<LoopMarker, ParseError> {
+    let mut set = attr_set(e)?;
+    let sequential = set.take_bool("isSequential").unwrap_or(false);
+    let kind = if local(e) == "standardLoopCharacteristics" {
+        LoopKind::Standard
+    } else if sequential {
+        LoopKind::MultiInstanceSequential
+    } else {
+        LoopKind::MultiInstanceParallel
+    };
+
+    let raw = cx.capture_any(pos, e, empty)?;
+    let bare = empty && set.is_empty();
+    Ok(LoopMarker {
+        kind,
+        raw: (!bare).then_some(raw),
+    })
 }

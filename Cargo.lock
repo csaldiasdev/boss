@@ -323,6 +323,7 @@ name = "boss"
 version = "0.1.0"
 dependencies = [
  "bpmn-core",
+ "bpmn-validate",
  "bpmn-xml",
  "console_error_panic_hook",
  "iced",

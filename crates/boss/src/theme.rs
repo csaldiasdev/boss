@@ -68,6 +68,10 @@ pub struct CanvasTokens {
     pub edge_label: Color,
     /// Selection outlines, marquee, and interaction ghosts (the accent).
     pub selection: Color,
+    /// Validation warning badges.
+    pub warning: Color,
+    /// Validation error badges.
+    pub danger: Color,
 }
 
 /// The full Slate token set for one mode.
@@ -117,6 +121,8 @@ const LIGHT: Tokens = Tokens {
         label: Color::from_rgb8(0x1b, 0x21, 0x29),
         edge_label: Color::from_rgb8(0x5d, 0x67, 0x73),
         selection: Color::from_rgb8(0x25, 0x63, 0xeb),
+        warning: Color::from_rgb8(0xb2, 0x6a, 0x0c),
+        danger: Color::from_rgb8(0xc2, 0x36, 0x2f),
     },
 };
 
@@ -140,6 +146,8 @@ const DARK: Tokens = Tokens {
         label: Color::from_rgb8(0xe5, 0xe9, 0xee),
         edge_label: Color::from_rgb8(0x98, 0xa2, 0xae),
         selection: Color::from_rgb8(0x6a, 0x99, 0xf5),
+        warning: Color::from_rgb8(0xe8, 0xa1, 0x3c),
+        danger: Color::from_rgb8(0xe5, 0x73, 0x6b),
     },
 };
 
@@ -222,6 +230,25 @@ pub fn palette_button(t: Tokens, active: bool) -> impl Fn(&Theme, button::Status
                 color: if active { t.accent } else { t.border },
                 width: 1.0,
                 radius: 6.0.into(),
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Style for rows in the issues panel: flat, hover tint only.
+pub fn issue_row(t: Tokens) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => t.bg,
+            _ => t.surface,
+        };
+        button::Style {
+            background: Some(background.into()),
+            text_color: t.text,
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
             },
             ..button::Style::default()
         }
