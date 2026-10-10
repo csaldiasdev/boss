@@ -10,6 +10,14 @@ publish.workspace = true
 
 [dependencies]
 bpmn-core.workspace = true
+bpmn-validate.workspace = true
+bpmn-xml.workspace = true
+rmcp.workspace = true
+tokio = { workspace = true, features = ["sync", "net", "rt", "macros"] }
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 [lints]
 workspace = true

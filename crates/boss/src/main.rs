@@ -3,6 +3,8 @@
 mod app;
 mod camera;
 mod canvas;
+#[cfg(not(target_arch = "wasm32"))]
+mod mcp_bridge;
 mod platform;
 mod render;
 mod session;

@@ -36,6 +36,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## MCP
+
+The desktop app can expose a [Model Context Protocol](https://modelcontextprotocol.io)
+server so AI agents edit the open diagram live on your canvas (every change is
+undoable). Start it with the toolbar button or `cargo run -p boss -- --mcp`,
+then connect a client to `http://127.0.0.1:4555/`, e.g.:
+
+```sh
+claude mcp add --transport http boss http://127.0.0.1:4555/
+```
+
+The endpoint binds to localhost only.
+
 UI fonts (IBM Plex, OFL licensed) are embedded from `assets/fonts/`.
 
 ## License

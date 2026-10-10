@@ -169,6 +169,8 @@ pub struct App {
     validator: Validator,
     issues: Vec<Issue>,
     badges: std::collections::HashMap<BpmnId, crate::render::Badge>,
+    #[cfg(not(target_arch = "wasm32"))]
+    mcp_running: bool,
 }
 
 impl Default for App {
@@ -189,6 +191,8 @@ impl Default for App {
             validator: Validator::with_default_rules(),
             issues: Vec::new(),
             badges: std::collections::HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            mcp_running: false,
         }
     }
 }
@@ -244,6 +248,12 @@ pub enum Message {
     LoopChanged(LoopChoice),
     /// An issue row was clicked: select and center its element.
     IssueClicked(Option<BpmnId>),
+    /// Start the MCP server (native only; it runs until the app exits).
+    #[cfg(not(target_arch = "wasm32"))]
+    McpStart,
+    /// A request from an MCP tool handler.
+    #[cfg(not(target_arch = "wasm32"))]
+    Mcp(crate::mcp_bridge::McpRequest),
     /// Start a fresh document.
     NewRequested,
     /// The user asked to open a file.
@@ -261,20 +271,30 @@ pub enum Message {
 }
 
 impl App {
-    /// Initial state, plus opening a file passed as a CLI argument on native.
+    /// Initial state. On native, `--mcp` starts the MCP server immediately
+    /// and the first non-flag argument opens as a file.
     pub fn boot() -> (Self, Task<Message>) {
         #[cfg(not(target_arch = "wasm32"))]
-        let task = match std::env::args().nth(1) {
-            Some(path) => Task::perform(
-                async move { platform::read_path(&path) },
-                Message::FileOpened,
-            ),
-            None => Task::none(),
-        };
-        #[cfg(target_arch = "wasm32")]
-        let task = Task::none();
+        {
+            let mut app = Self::default();
+            let mut task = Task::none();
 
-        (Self::default(), task)
+            for argument in std::env::args().skip(1) {
+                if argument == "--mcp" {
+                    let _ = app.update(Message::McpStart);
+                } else if !argument.starts_with('-') {
+                    task = Task::perform(
+                        async move { platform::read_path(&argument) },
+                        Message::FileOpened,
+                    );
+                }
+            }
+            (app, task)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            (Self::default(), Task::none())
+        }
     }
 
     /// Window title: file name plus a dirty marker.
@@ -288,13 +308,21 @@ impl App {
         self.theme.clone()
     }
 
-    /// Keyboard shortcuts (events no widget consumed) and window resizes.
+    /// Keyboard shortcuts (events no widget consumed), window resizes, and —
+    /// once started — the MCP server.
     pub fn subscription(&self) -> Subscription<Message> {
-        let _ = self;
-        Subscription::batch([
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut subscriptions = vec![
             iced::keyboard::listen().map(Message::Keyboard),
             iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
-        ])
+        ];
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.mcp_running {
+            subscriptions.push(crate::mcp_bridge::subscription().map(Message::Mcp));
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = self;
+        Subscription::batch(subscriptions)
     }
 
     fn shortcut(event: &iced::keyboard::Event) -> Option<Message> {
@@ -663,10 +691,168 @@ impl App {
                 self.canvas.invalidate();
             }
             Message::IssueClicked(None) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            message @ (Message::McpStart | Message::Mcp(_)) => self.handle_mcp_message(message),
             message => return self.handle_file(message),
         }
 
         Task::none()
+    }
+
+    /// Handles the MCP message family.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handle_mcp_message(&mut self, message: Message) {
+        match message {
+            Message::McpStart => {
+                self.mcp_running = true;
+                self.status(
+                    format!(
+                        "MCP server listening on http://127.0.0.1:{port} — connect with: \
+                         claude mcp add --transport http boss http://127.0.0.1:{port}/",
+                        port = boss_mcp::DEFAULT_PORT
+                    ),
+                    false,
+                );
+            }
+            Message::Mcp(request) => {
+                if let Some(request) = request.take() {
+                    self.handle_mcp(request);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Services one request from an MCP tool handler. Reads answer with a
+    /// snapshot; writes go through the same edit session as user input.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handle_mcp(&mut self, request: boss_mcp::EditorRequest) {
+        use boss_mcp::EditorRequest;
+        match request {
+            EditorRequest::Snapshot { reply } => {
+                let _ = reply.send(self.session.document().clone());
+            }
+            EditorRequest::Apply { action, reply } => {
+                let summary = format!("{action:?}");
+                let outcome = self.apply_mcp_action(action);
+                if let Ok(outcome) = &outcome {
+                    if !matches!(outcome, boss_mcp::ApplyOutcome::Nothing) {
+                        self.document_changed();
+                        let summary: String = summary.chars().take(80).collect();
+                        self.status(format!("MCP agent: {summary}"), false);
+                    }
+                }
+                let _ = reply.send(outcome);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_mcp_action(
+        &mut self,
+        action: boss_mcp::EditAction,
+    ) -> Result<boss_mcp::ApplyOutcome, String> {
+        use boss_mcp::{ApplyOutcome, EditAction};
+
+        match action {
+            EditAction::CreateNode { kind, x, y, name } => {
+                let mut created = None;
+                self.session.commit(|doc| {
+                    created = doc.create_node(kind, bpmn_core::Point::new(x, y));
+                    if let (Some(id), Some(name)) = (&created, &name) {
+                        doc.set_name(id, Some(name.clone()));
+                    }
+                    created.is_some()
+                });
+                created
+                    .map(ApplyOutcome::Created)
+                    .ok_or_else(|| String::from("could not create that element"))
+            }
+            EditAction::CreateBoundary { host, x, y } => {
+                let mut created = None;
+                self.session.commit(|doc| {
+                    created = doc.create_boundary_event(&host, bpmn_core::Point::new(x, y));
+                    created.is_some()
+                });
+                created
+                    .map(ApplyOutcome::Created)
+                    .ok_or_else(|| format!("{host} is not a task; boundary events attach to tasks"))
+            }
+            EditAction::Connect {
+                source,
+                target,
+                name,
+            } => {
+                let mut created = None;
+                self.session.commit(|doc| {
+                    created = doc.connect(&source, &target);
+                    if let (Some(id), Some(name)) = (&created, &name) {
+                        doc.set_name(id, Some(name.clone()));
+                    }
+                    created.is_some()
+                });
+                created.map(ApplyOutcome::Created).ok_or_else(|| {
+                    String::from("cannot connect: unknown endpoint ids or a self-connection")
+                })
+            }
+            EditAction::SetName { id, name } => {
+                let mut renamed = false;
+                self.session.commit(|doc| {
+                    renamed = doc.set_name(&id, name.clone());
+                    renamed
+                });
+                if renamed {
+                    Ok(ApplyOutcome::Changed)
+                } else {
+                    Err(format!("no element with id {id}"))
+                }
+            }
+            EditAction::Delete { ids } => {
+                if ids.is_empty() {
+                    return Ok(ApplyOutcome::Nothing);
+                }
+                let doomed: HashSet<BpmnId> = ids.into_iter().collect();
+                self.session.commit(|doc| {
+                    doc.delete_elements(&doomed);
+                    true
+                });
+                self.selection.clear();
+                Ok(ApplyOutcome::Changed)
+            }
+            EditAction::Move { ids, dx, dy } => {
+                let ids: HashSet<BpmnId> = ids.into_iter().collect();
+                self.session.commit(|doc| {
+                    doc.move_shapes(&ids, dx, dy);
+                    true
+                });
+                Ok(ApplyOutcome::Changed)
+            }
+            EditAction::Replace { document } => {
+                self.session.commit(|doc| {
+                    *doc = *document;
+                    true
+                });
+                self.selection.clear();
+                self.zoom_to_fit();
+                Ok(ApplyOutcome::Changed)
+            }
+            EditAction::Undo => {
+                if self.session.undo() {
+                    self.selection.clear();
+                    Ok(ApplyOutcome::Changed)
+                } else {
+                    Ok(ApplyOutcome::Nothing)
+                }
+            }
+            EditAction::Redo => {
+                if self.session.redo() {
+                    self.selection.clear();
+                    Ok(ApplyOutcome::Changed)
+                } else {
+                    Ok(ApplyOutcome::Nothing)
+                }
+            }
+        }
     }
 
     /// Handles the clipboard message family (BPMN XML as the payload).
@@ -871,6 +1057,15 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             bar = bar.push(tool("Save as…", Message::SaveAsRequested, true));
+            bar = bar.push(tool(
+                if self.mcp_running {
+                    "MCP on"
+                } else {
+                    "Start MCP"
+                },
+                Message::McpStart,
+                !self.mcp_running,
+            ));
         }
 
         bar = bar
@@ -1106,6 +1301,19 @@ impl App {
             n => format!("· {n} selected"),
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let mcp_chip: Element<'_, Message> = if self.mcp_running {
+            text(format!("MCP :{}", boss_mcp::DEFAULT_PORT))
+                .font(theme::MONO)
+                .size(11)
+                .color(t.accent)
+                .into()
+        } else {
+            text("").size(11).into()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let mcp_chip: Element<'_, Message> = text("").size(11).into();
+
         let issue_chip: Element<'_, Message> = if self.issues.is_empty() {
             text("").size(11).into()
         } else {
@@ -1127,6 +1335,7 @@ impl App {
                     .size(11)
                     .color(t.muted),
                 issue_chip,
+                mcp_chip,
                 space::horizontal(),
                 info,
             ]
