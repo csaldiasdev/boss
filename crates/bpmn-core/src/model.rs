@@ -250,6 +250,14 @@ pub enum RootElement {
     Unknown(RawXml),
 }
 
+/// The `targetNamespace` boss stamps on documents it creates or re-brands.
+pub const BOSS_TARGET_NAMESPACE: &str = "https://github.com/csaldiasdev/boss/schema/bpmn";
+
+/// The placeholder `targetNamespace` that bpmn.io-based tools (Camunda
+/// Modeler included) write by default. Safe to replace; a real corporate
+/// namespace is not.
+pub const BPMN_IO_PLACEHOLDER_NAMESPACE: &str = "http://bpmn.io/schema/bpmn";
+
 /// The `definitions` document root.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Definitions {
