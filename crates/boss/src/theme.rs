@@ -49,6 +49,18 @@ impl Mode {
     }
 }
 
+/// The fill-and-stroke pair of one BPMN element family. `fill_top` is a
+/// slightly lighter fill for the top of the depth gradient.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ElementColors {
+    /// Shape fill (gradient bottom).
+    pub fill: Color,
+    /// Gradient top, a touch lighter than `fill`.
+    pub fill_top: Color,
+    /// Shape outline and inner icon strokes.
+    pub stroke: Color,
+}
+
 /// Diagram canvas colors.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CanvasTokens {
@@ -72,6 +84,22 @@ pub struct CanvasTokens {
     pub warning: Color,
     /// Validation error badges.
     pub danger: Color,
+    /// Drop shadow under elevated shapes.
+    pub shadow: Color,
+    /// Start events (green).
+    pub start: ElementColors,
+    /// End events (red).
+    pub end: ElementColors,
+    /// Intermediate and boundary events (amber).
+    pub intermediate: ElementColors,
+    /// Tasks (blue).
+    pub task: ElementColors,
+    /// Gateways (yellow).
+    pub gateway: ElementColors,
+    /// Data elements and artifacts (slate).
+    pub data: ElementColors,
+    /// Containers: subprocesses, call activities, pool bands (neutral).
+    pub container: ElementColors,
 }
 
 /// The full Slate token set for one mode.
@@ -123,6 +151,42 @@ const LIGHT: Tokens = Tokens {
         selection: Color::from_rgb8(0x25, 0x63, 0xeb),
         warning: Color::from_rgb8(0xb2, 0x6a, 0x0c),
         danger: Color::from_rgb8(0xc2, 0x36, 0x2f),
+        shadow: Color::from_rgba8(0x1b, 0x21, 0x29, 0.14),
+        start: ElementColors {
+            fill: Color::from_rgb8(0xdc, 0xf5, 0xe7),
+            fill_top: Color::from_rgb8(0xef, 0xfc, 0xf5),
+            stroke: Color::from_rgb8(0x13, 0x7a, 0x4e),
+        },
+        end: ElementColors {
+            fill: Color::from_rgb8(0xfd, 0xe4, 0xe2),
+            fill_top: Color::from_rgb8(0xfe, 0xf3, 0xf2),
+            stroke: Color::from_rgb8(0xbe, 0x35, 0x2d),
+        },
+        intermediate: ElementColors {
+            fill: Color::from_rgb8(0xfd, 0xf0, 0xd4),
+            fill_top: Color::from_rgb8(0xfe, 0xf9, 0xea),
+            stroke: Color::from_rgb8(0xb2, 0x6a, 0x0c),
+        },
+        task: ElementColors {
+            fill: Color::from_rgb8(0xe3, 0xed, 0xfd),
+            fill_top: Color::from_rgb8(0xf2, 0xf7, 0xfe),
+            stroke: Color::from_rgb8(0x2a, 0x5c, 0xc8),
+        },
+        gateway: ElementColors {
+            fill: Color::from_rgb8(0xfc, 0xf4, 0xc7),
+            fill_top: Color::from_rgb8(0xfe, 0xfa, 0xe3),
+            stroke: Color::from_rgb8(0xa1, 0x7c, 0x0a),
+        },
+        data: ElementColors {
+            fill: Color::from_rgb8(0xee, 0xf1, 0xf5),
+            fill_top: Color::from_rgb8(0xf8, 0xfa, 0xfc),
+            stroke: Color::from_rgb8(0x54, 0x5f, 0x6d),
+        },
+        container: ElementColors {
+            fill: Color::from_rgb8(0xf5, 0xf7, 0xfa),
+            fill_top: Color::from_rgb8(0xfb, 0xfc, 0xfd),
+            stroke: Color::from_rgb8(0x45, 0x50, 0x5e),
+        },
     },
 };
 
@@ -148,8 +212,65 @@ const DARK: Tokens = Tokens {
         selection: Color::from_rgb8(0x6a, 0x99, 0xf5),
         warning: Color::from_rgb8(0xe8, 0xa1, 0x3c),
         danger: Color::from_rgb8(0xe5, 0x73, 0x6b),
+        shadow: Color::from_rgba8(0x00, 0x00, 0x00, 0.35),
+        start: ElementColors {
+            fill: Color::from_rgb8(0x12, 0x30, 0x24),
+            fill_top: Color::from_rgb8(0x18, 0x3b, 0x2c),
+            stroke: Color::from_rgb8(0x53, 0xc5, 0x8b),
+        },
+        end: ElementColors {
+            fill: Color::from_rgb8(0x3a, 0x1d, 0x1c),
+            fill_top: Color::from_rgb8(0x45, 0x24, 0x23),
+            stroke: Color::from_rgb8(0xe5, 0x73, 0x6b),
+        },
+        intermediate: ElementColors {
+            fill: Color::from_rgb8(0x38, 0x29, 0x12),
+            fill_top: Color::from_rgb8(0x42, 0x32, 0x18),
+            stroke: Color::from_rgb8(0xe8, 0xa1, 0x3c),
+        },
+        task: ElementColors {
+            fill: Color::from_rgb8(0x1a, 0x2a, 0x45),
+            fill_top: Color::from_rgb8(0x20, 0x33, 0x52),
+            stroke: Color::from_rgb8(0x7d, 0xa5, 0xf0),
+        },
+        gateway: ElementColors {
+            fill: Color::from_rgb8(0x33, 0x2d, 0x10),
+            fill_top: Color::from_rgb8(0x3d, 0x36, 0x16),
+            stroke: Color::from_rgb8(0xdd, 0xc2, 0x4a),
+        },
+        data: ElementColors {
+            fill: Color::from_rgb8(0x25, 0x2b, 0x34),
+            fill_top: Color::from_rgb8(0x2b, 0x32, 0x3c),
+            stroke: Color::from_rgb8(0x9d, 0xa9, 0xb7),
+        },
+        container: ElementColors {
+            fill: Color::from_rgb8(0x1e, 0x24, 0x2c),
+            fill_top: Color::from_rgb8(0x23, 0x2a, 0x33),
+            stroke: Color::from_rgb8(0x8d, 0x99, 0xa8),
+        },
     },
 };
+
+/// The right-click placement menu: a floating card with a soft shadow.
+pub fn context_menu(t: Tokens) -> container::Style {
+    container::Style {
+        background: Some(t.surface.into()),
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: iced::Shadow {
+            color: Color {
+                a: 0.25,
+                ..Color::BLACK
+            },
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 16.0,
+        },
+        ..container::Style::default()
+    }
+}
 
 /// The Slate tokens for `mode`.
 pub fn tokens(mode: Mode) -> Tokens {

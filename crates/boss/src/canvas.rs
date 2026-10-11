@@ -85,6 +85,13 @@ pub enum CanvasMessage {
     /// Drag the window (macOS: press in the strip under the hidden
     /// titlebar, where the canvas reaches the top of the window).
     DragWindow,
+    /// Right-click on empty space: open the placement menu.
+    ContextMenu {
+        /// Cursor position in window coordinates (where the menu opens).
+        screen: Point,
+        /// The projected diagram point (where the element will land).
+        world: Point,
+    },
     /// Abort the armed tool (clicked empty space while connecting).
     CancelTool,
 }
@@ -145,7 +152,8 @@ struct View<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct CanvasState {
     interaction: Interaction,
-    shift: bool,
+    /// The latest keyboard modifiers (wheel events carry none themselves).
+    modifiers: iced::keyboard::Modifiers,
     /// The previous left click, for double-click detection.
     last_click: Option<mouse::Click>,
     /// The last cursor position reported to the status bar.
@@ -159,6 +167,7 @@ enum Interaction {
     Panning {
         translation: Vector,
         start: Point,
+        moved: bool,
     },
     /// Dragging selected shapes; `delta` is in world units, snapped.
     Moving {
@@ -167,15 +176,9 @@ enum Interaction {
         moved: bool,
     },
     /// Rubber-band selection, both corners in world units.
-    Marquee {
-        start: Point,
-        current: Point,
-    },
+    Marquee { start: Point, current: Point },
     /// Connection in progress from this node; cursor in world units.
-    ConnectFrom {
-        source: BpmnId,
-        cursor: Point,
-    },
+    ConnectFrom { source: BpmnId, cursor: Point },
     /// Dragging one waypoint of the selected edge; `points` is the working
     /// copy previewed by the overlay.
     DraggingWaypoint {
@@ -412,6 +415,39 @@ impl View<'_> {
     fn world(&self, cursor: Point, bounds: Rectangle) -> Point {
         self.camera.project(cursor, bounds.size())
     }
+
+    /// Zooms by `amount` (a signed fraction), keeping the point under the
+    /// cursor fixed.
+    fn zoom_at_cursor(
+        &self,
+        amount: f32,
+        cursor: mouse::Cursor,
+        bounds: Rectangle,
+    ) -> canvas::Action<CanvasMessage> {
+        let can_zoom = (amount < 0.0 && self.camera.scaling > Camera::MIN_SCALING)
+            || (amount > 0.0 && self.camera.scaling < Camera::MAX_SCALING);
+        if !can_zoom {
+            return canvas::Action::capture();
+        }
+        let old_scaling = self.camera.scaling;
+        let scaling =
+            (old_scaling * (1.0 + amount)).clamp(Camera::MIN_SCALING, Camera::MAX_SCALING);
+        let translation = cursor
+            .position_from(bounds.center())
+            .map(|cursor_to_center| {
+                let factor = scaling - old_scaling;
+                self.camera.translation
+                    - Vector::new(
+                        cursor_to_center.x * factor / (old_scaling * old_scaling),
+                        cursor_to_center.y * factor / (old_scaling * old_scaling),
+                    )
+            });
+        canvas::Action::publish(CanvasMessage::Zoomed {
+            scaling,
+            translation,
+        })
+        .and_capture()
+    }
 }
 
 impl canvas::Program<CanvasMessage> for View<'_> {
@@ -429,7 +465,7 @@ impl canvas::Program<CanvasMessage> for View<'_> {
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<CanvasMessage>> {
         if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
-            state.shift = modifiers.shift();
+            state.modifiers = *modifiers;
             return None;
         }
 
@@ -469,6 +505,11 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                             .and_capture(),
                         );
                     }
+                    Interaction::Panning { moved: false, .. } => {
+                        return Some(
+                            canvas::Action::publish(CanvasMessage::ClearSelection).and_capture(),
+                        );
+                    }
                     // A connect drag stays armed until the second click.
                     Interaction::ConnectFrom { source, cursor } => {
                         state.interaction = Interaction::ConnectFrom { source, cursor };
@@ -487,8 +528,20 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                 state.interaction = Interaction::Panning {
                     translation: self.camera.translation,
                     start: cursor_position,
+                    moved: true,
                 };
                 Some(canvas::Action::request_redraw().and_capture())
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                if let Some(id) = self.hit_node(world).or_else(|| self.hit_edge(world)) {
+                    Some(canvas::Action::publish(CanvasMessage::SelectOnly(id)).and_capture())
+                } else {
+                    let screen = cursor.position()?;
+                    Some(
+                        canvas::Action::publish(CanvasMessage::ContextMenu { screen, world })
+                            .and_capture(),
+                    )
+                }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                 if cfg!(target_os = "macos") && cursor.position().is_some_and(|p| p.y < 28.0) =>
@@ -556,14 +609,14 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                         return Some(canvas::Action::request_redraw().and_capture());
                     }
                     if let Some(id) = self.hit_node(world) {
-                        let message = if state.shift {
+                        let message = if state.modifiers.shift() {
                             Some(CanvasMessage::SelectToggle(id.clone()))
                         } else if !self.selection.contains(&id) {
                             Some(CanvasMessage::SelectOnly(id.clone()))
                         } else {
                             None
                         };
-                        if !state.shift {
+                        if !state.modifiers.shift() {
                             state.interaction = Interaction::Moving {
                                 start_world: world,
                                 delta: Vector::new(0.0, 0.0),
@@ -579,28 +632,45 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                                 .and_capture(),
                         )
                     } else if let Some(id) = self.hit_edge(world) {
-                        let message = if state.shift {
+                        let message = if state.modifiers.shift() {
                             CanvasMessage::SelectToggle(id)
                         } else {
                             CanvasMessage::SelectOnly(id)
                         };
                         Some(canvas::Action::publish(message).and_capture())
-                    } else {
+                    } else if state.modifiers.shift() {
                         state.interaction = Interaction::Marquee {
                             start: world,
                             current: world,
+                        };
+                        Some(canvas::Action::request_redraw().and_capture())
+                    } else {
+                        // Click-and-hold on empty space moves the workspace;
+                        // a plain click still clears the selection on release.
+                        state.interaction = Interaction::Panning {
+                            translation: self.camera.translation,
+                            start: cursor_position,
+                            moved: false,
                         };
                         Some(canvas::Action::request_redraw().and_capture())
                     }
                 }
             },
             Event::Mouse(mouse::Event::CursorMoved { .. }) => match &mut state.interaction {
-                Interaction::Panning { translation, start } => Some(
-                    canvas::Action::publish(CanvasMessage::Panned(
-                        *translation + (cursor_position - *start) * (1.0 / self.camera.scaling),
-                    ))
-                    .and_capture(),
-                ),
+                Interaction::Panning {
+                    translation,
+                    start,
+                    moved,
+                } => {
+                    let delta = cursor_position - *start;
+                    *moved = *moved || delta.x.abs() + delta.y.abs() > 2.0;
+                    Some(
+                        canvas::Action::publish(CanvasMessage::Panned(
+                            *translation + delta * (1.0 / self.camera.scaling),
+                        ))
+                        .and_capture(),
+                    )
+                }
                 Interaction::Moving {
                     start_world,
                     delta,
@@ -641,39 +711,27 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                     }
                 }
             },
-            Event::Mouse(mouse::Event::WheelScrolled { delta }) => match *delta {
-                mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => {
-                    let can_zoom = (y < 0.0 && self.camera.scaling > Camera::MIN_SCALING)
-                        || (y > 0.0 && self.camera.scaling < Camera::MAX_SCALING);
-                    if can_zoom {
-                        let old_scaling = self.camera.scaling;
-                        let scaling = (old_scaling * (1.0 + y / 30.0))
-                            .clamp(Camera::MIN_SCALING, Camera::MAX_SCALING);
-                        let translation =
-                            cursor
-                                .position_from(bounds.center())
-                                .map(|cursor_to_center| {
-                                    let factor = scaling - old_scaling;
-                                    self.camera.translation
-                                        - Vector::new(
-                                            cursor_to_center.x * factor
-                                                / (old_scaling * old_scaling),
-                                            cursor_to_center.y * factor
-                                                / (old_scaling * old_scaling),
-                                        )
-                                });
-                        Some(
-                            canvas::Action::publish(CanvasMessage::Zoomed {
-                                scaling,
-                                translation,
-                            })
-                            .and_capture(),
-                        )
-                    } else {
-                        Some(canvas::Action::capture())
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                // A notched wheel zooms; trackpad two-finger scroll pans the
+                // workspace, or zooms while Cmd/Ctrl is held (the trackpad
+                // pinch never reaches the widget layer in iced).
+                let zoom_held = state.modifiers.command() || state.modifiers.control();
+                match *delta {
+                    mouse::ScrollDelta::Lines { y, .. } => {
+                        Some(self.zoom_at_cursor(y / 30.0, cursor, bounds))
                     }
+                    mouse::ScrollDelta::Pixels { y, .. } if zoom_held => {
+                        Some(self.zoom_at_cursor(y / 200.0, cursor, bounds))
+                    }
+                    mouse::ScrollDelta::Pixels { x, y } => Some(
+                        canvas::Action::publish(CanvasMessage::Panned(
+                            self.camera.translation
+                                + Vector::new(x, y) * (1.0 / self.camera.scaling),
+                        ))
+                        .and_capture(),
+                    ),
                 }
-            },
+            }
             _ => None,
         }
     }

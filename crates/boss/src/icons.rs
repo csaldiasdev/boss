@@ -119,12 +119,15 @@ impl<Message> canvas::Program<Message> for Glyph {
                 draw_node_glyph(&mut frame, kind, center, stroke, self.tokens);
             }
             ShapeGlyph::Pool => {
+                let colors = self.tokens.container;
+                let stroke = stroke.with_color(colors.stroke);
                 let rect = Rectangle {
                     x: center.x - 11.0,
                     y: center.y - 8.0,
                     width: 22.0,
                     height: 16.0,
                 };
+                frame.fill(&Path::rectangle(rect.position(), rect.size()), colors.fill);
                 frame.stroke(&Path::rectangle(rect.position(), rect.size()), stroke);
                 frame.stroke(
                     &Path::line(
@@ -150,7 +153,32 @@ fn draw_node_glyph(
     stroke: Stroke<'_>,
     tokens: CanvasTokens,
 ) {
+    // The palette doubles as a color legend: each mini-shape carries its
+    // family's fill and stroke.
+    let colors = match kind {
+        NodeKind::StartEvent => tokens.start,
+        NodeKind::EndEvent => tokens.end,
+        NodeKind::IntermediateCatch | NodeKind::IntermediateThrow | NodeKind::Boundary => {
+            tokens.intermediate
+        }
+        NodeKind::Task(_) => tokens.task,
+        NodeKind::Gateway(_) => tokens.gateway,
+        NodeKind::SubProcess(_) | NodeKind::CallActivity => tokens.container,
+        NodeKind::DataObject | NodeKind::DataStore | NodeKind::TextAnnotation | NodeKind::Group => {
+            tokens.data
+        }
+    };
+    let stroke = stroke.with_color(colors.stroke);
+
     let rounded = |frame: &mut Frame, half_w: f32, half_h: f32, stroke: Stroke<'_>| {
+        frame.fill(
+            &Path::rounded_rectangle(
+                Point::new(c.x - half_w, c.y - half_h),
+                Size::new(half_w * 2.0, half_h * 2.0),
+                3.0.into(),
+            ),
+            colors.fill,
+        );
         frame.stroke(
             &Path::rounded_rectangle(
                 Point::new(c.x - half_w, c.y - half_h),
@@ -163,23 +191,28 @@ fn draw_node_glyph(
 
     match kind {
         NodeKind::StartEvent => {
+            frame.fill(&Path::circle(c, 7.0), colors.fill);
             frame.stroke(&Path::circle(c, 7.0), stroke);
         }
         NodeKind::EndEvent => {
+            frame.fill(&Path::circle(c, 7.0), colors.fill);
             frame.stroke(&Path::circle(c, 7.0), stroke.with_width(2.6));
         }
         NodeKind::IntermediateCatch => {
+            frame.fill(&Path::circle(c, 7.0), colors.fill);
             frame.stroke(&Path::circle(c, 7.0), stroke);
             frame.stroke(&Path::circle(c, 4.6), stroke);
         }
         NodeKind::IntermediateThrow => {
+            frame.fill(&Path::circle(c, 7.0), colors.fill);
             frame.stroke(&Path::circle(c, 7.0), stroke);
             frame.stroke(&Path::circle(c, 4.6), stroke);
-            frame.fill(&Path::circle(c, 2.0), tokens.stroke);
+            frame.fill(&Path::circle(c, 2.0), colors.stroke);
         }
         NodeKind::Boundary => {
             let mut dashed = stroke;
             dashed.line_dash.segments = &[2.0, 2.0];
+            frame.fill(&Path::circle(c, 7.0), colors.fill);
             frame.stroke(&Path::circle(c, 7.0), dashed);
             frame.stroke(&Path::circle(c, 4.6), dashed);
         }
@@ -193,7 +226,7 @@ fn draw_node_glyph(
                 width: 30.0,
                 height: 29.0,
             };
-            render::task_icon(frame, task_type, bounds, 1.4, tokens);
+            render::task_icon(frame, task_type, bounds, 1.4, tokens.task);
         }
         NodeKind::Gateway(gateway) => {
             let half = 9.0;
@@ -204,6 +237,7 @@ fn draw_node_glyph(
                 builder.line_to(Point::new(c.x - half, c.y));
                 builder.close();
             });
+            frame.fill(&diamond, colors.fill);
             frame.stroke(&diamond, stroke);
             render::gateway_marker(
                 frame,
@@ -249,6 +283,7 @@ fn draw_node_glyph(
                 builder.line_to(Point::new(c.x - half_w, c.y + half_h));
                 builder.close();
             });
+            frame.fill(&page, colors.fill);
             frame.stroke(&page, stroke);
         }
         NodeKind::DataStore => {
@@ -266,6 +301,7 @@ fn draw_node_glyph(
                 );
                 builder.close();
             });
+            frame.fill(&body, colors.fill);
             frame.stroke(&body, stroke);
             let lid = Path::new(|builder| {
                 builder.move_to(Point::new(c.x - half_w, c.y - half_h + ry));

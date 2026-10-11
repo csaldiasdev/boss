@@ -199,6 +199,8 @@ pub struct App {
     cursor_world: Option<(i32, i32)>,
     /// The main window, for chrome actions like dragging.
     window_id: Option<iced::window::Id>,
+    /// An open right-click placement menu: (screen position, diagram point).
+    context_menu: Option<(iced::Point, iced::Point)>,
     session: EditSession,
     file_name: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -227,6 +229,7 @@ impl Default for App {
             issues_open: true,
             cursor_world: None,
             window_id: None,
+            context_menu: None,
             session: EditSession::new(Document::new()),
             file_name: String::from("untitled.bpmn"),
             #[cfg(not(target_arch = "wasm32"))]
@@ -269,6 +272,12 @@ pub enum Message {
     ToggleProperties,
     /// Show or hide the validation issues panel.
     ToggleIssues,
+    /// Close the right-click placement menu.
+    CloseContextMenu,
+    /// Place this kind from the context menu at the remembered point.
+    ContextPlace(NodeKind),
+    /// Place a pool from the context menu at the remembered point.
+    ContextPlacePool,
     /// Copy the MCP connect command to the clipboard (native only; the chip
     /// is inert on the web).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -587,6 +596,9 @@ impl App {
         match message {
             CanvasMessage::EditLabel(id) => return self.edit_label(id),
             CanvasMessage::CursorAt(x, y) => self.cursor_world = Some((x, y)),
+            CanvasMessage::ContextMenu { screen, world } => {
+                self.context_menu = Some((screen, world));
+            }
             CanvasMessage::DragWindow => {
                 if let Some(id) = self.window_id {
                     return iced::window::drag(id);
@@ -894,7 +906,21 @@ impl App {
                     return self.update(message);
                 }
             }
+            Message::CloseContextMenu => self.context_menu = None,
+            Message::ContextPlace(kind) => {
+                if let Some((_, world)) = self.context_menu.take() {
+                    self.handle_place(Some(kind), world);
+                }
+            }
+            Message::ContextPlacePool => {
+                if let Some((_, world)) = self.context_menu.take() {
+                    self.handle_place(None, world);
+                }
+            }
             Message::Escape => {
+                if self.context_menu.take().is_some() {
+                    return Task::none();
+                }
                 if self.tool == Tool::Select {
                     self.selection.clear();
                 } else {
@@ -1303,10 +1329,93 @@ impl App {
             .width(Fill)
             .height(Fill),
         );
-        layout
+        let base: Element<'_, Message> = layout
             .push(self.issues_panel(t))
             .push(self.status_bar(t))
-            .into()
+            .into();
+
+        match self.context_menu {
+            Some((at, _)) => self.with_context_menu(base, at, t),
+            None => base,
+        }
+    }
+
+    /// Stacks the right-click placement menu over the layout: a transparent
+    /// click-catcher that closes it, then the menu itself at the cursor.
+    fn with_context_menu<'a>(
+        &'a self,
+        base: Element<'a, Message>,
+        at: iced::Point,
+        t: Tokens,
+    ) -> Element<'a, Message> {
+        const MENU_WIDTH: f32 = 190.0;
+        const MENU_HEIGHT: f32 = 420.0;
+
+        let mut list = column![].spacing(2);
+        for (section, entries) in Self::PALETTE {
+            if *section == "Tools" {
+                continue; // only placeables belong in the menu
+            }
+            list = list.push(
+                text(*section)
+                    .font(theme::SANS_MEDIUM)
+                    .size(11)
+                    .color(t.muted),
+            );
+            for (label, target) in *entries {
+                let (glyph, message): (Element<'_, Message>, Message) = match target {
+                    Tool::Place(kind) => (
+                        icons::shape_glyph(icons::ShapeGlyph::Node(*kind), t.canvas),
+                        Message::ContextPlace(*kind),
+                    ),
+                    Tool::PlacePool => (
+                        icons::shape_glyph(icons::ShapeGlyph::Pool, t.canvas),
+                        Message::ContextPlacePool,
+                    ),
+                    _ => continue,
+                };
+                list = list.push(
+                    button(
+                        row![container(glyph).width(26), text(*label).size(12)]
+                            .spacing(4)
+                            .align_y(Center),
+                    )
+                    .style(theme::palette_button(t, false))
+                    .padding([1, 6])
+                    .width(Fill)
+                    .on_press(message),
+                );
+            }
+        }
+
+        let menu = container(scrollable(list).height(iced::Shrink))
+            .style(move |_| theme::context_menu(t))
+            .padding(8)
+            .width(MENU_WIDTH)
+            .max_height(MENU_HEIGHT);
+
+        // Clamp so the menu never runs off the window.
+        let x =
+            at.x.min(self.window_size.width - MENU_WIDTH - 12.0)
+                .max(0.0);
+        let y = at
+            .y
+            .min(self.window_size.height - MENU_HEIGHT.min(self.window_size.height * 0.6) - 40.0)
+            .max(0.0);
+
+        iced::widget::stack![
+            base,
+            iced::widget::mouse_area(space::vertical().width(Fill).height(Fill))
+                .on_press(Message::CloseContextMenu)
+                .on_right_press(Message::CloseContextMenu),
+            container(menu).padding(iced::Padding {
+                top: y,
+                left: x,
+                right: 0.0,
+                bottom: 0.0,
+            }),
+        ]
+        .into()
     }
 
     fn issues_panel(&self, t: Tokens) -> Element<'_, Message> {
@@ -1894,7 +2003,7 @@ impl App {
 
     fn status_bar(&self, t: Tokens) -> Element<'_, Message> {
         let hint = match self.tool {
-            Tool::Select => "click to select · shift-click to add · drag empty space to marquee",
+            Tool::Select => "drag to pan · shift-drag to select · right-click to add elements",
             Tool::Place(_) => "click to place · Esc to cancel",
             Tool::PlacePool => "click to place a pool · Esc to cancel",
             Tool::Connect => {

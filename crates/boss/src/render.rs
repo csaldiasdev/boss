@@ -5,7 +5,7 @@
 //! colors come from [`CanvasTokens`]. DI references outside the modeled subset
 //! (subprocesses, pools, ...) render as dashed placeholders.
 
-use crate::theme::CanvasTokens;
+use crate::theme::{CanvasTokens, ElementColors};
 use bpmn_core::Document;
 use bpmn_core::di::{BpmnLabel, BpmnShape, DiElement};
 use bpmn_core::model::{
@@ -15,13 +15,44 @@ use bpmn_core::model::{
 };
 use iced::alignment::Vertical;
 use iced::widget::canvas::path::Builder;
-use iced::widget::canvas::{Frame, Path, Stroke, Text};
+use iced::widget::canvas::{Frame, Path, Stroke, Text, gradient};
 use iced::{Point, Rectangle, Size, Vector};
 
 use crate::theme;
 
 /// Corner radius of task shapes.
 const TASK_RADIUS: f32 = 8.0;
+
+/// Fills `path` with depth: a drop shadow offset below, then a subtle
+/// vertical gradient from the family's lighter top to its base fill.
+fn depth_fill(
+    frame: &mut Frame,
+    path: &Path,
+    top: f32,
+    height: f32,
+    colors: ElementColors,
+    tokens: CanvasTokens,
+) {
+    frame.with_save(|frame| {
+        frame.translate(Vector::new(0.0, 2.0));
+        frame.fill(path, tokens.shadow);
+    });
+    let fill = gradient::Linear::new(Point::new(0.0, top), Point::new(0.0, top + height))
+        .add_stop(0.0, colors.fill_top)
+        .add_stop(1.0, colors.fill);
+    frame.fill(path, fill);
+}
+
+/// The color family of an event, by its position in the process.
+fn event_colors(position: &EventPosition, tokens: CanvasTokens) -> ElementColors {
+    match position {
+        EventPosition::Start { .. } => tokens.start,
+        EventPosition::End => tokens.end,
+        EventPosition::IntermediateCatch
+        | EventPosition::IntermediateThrow
+        | EventPosition::Boundary { .. } => tokens.intermediate,
+    }
+}
 
 fn pt(p: bpmn_core::Point) -> Point {
     Point::new(p.x as f32, p.y as f32)
@@ -231,10 +262,17 @@ fn draw_band(
 ) {
     const HEADER: f32 = 30.0;
 
+    let colors = tokens.container;
+    let stroke = stroke.with_color(colors.stroke);
     if is_pool {
         frame.fill(
             &Path::rectangle(bounds.position(), bounds.size()),
-            tokens.fill,
+            colors.fill,
+        );
+        // The name band gets the lighter tone, like a card header.
+        frame.fill(
+            &Path::rectangle(bounds.position(), Size::new(HEADER, bounds.height)),
+            colors.fill_top,
         );
     }
     frame.stroke(&Path::rectangle(bounds.position(), bounds.size()), stroke);
@@ -346,6 +384,8 @@ fn draw_data(
     stroke: Stroke<'_>,
     tokens: CanvasTokens,
 ) {
+    let colors = tokens.data;
+    let stroke = stroke.with_color(colors.stroke);
     match data.kind {
         DataKind::Object | DataKind::ObjectReference { .. } => {
             let fold = (bounds.width * 0.3).min(14.0);
@@ -360,7 +400,7 @@ fn draw_data(
                 b.line_to(Point::new(bounds.x, bounds.y + bounds.height));
                 b.close();
             });
-            frame.fill(&page, tokens.fill);
+            depth_fill(frame, &page, bounds.y, bounds.height, colors, tokens);
             frame.stroke(&page, stroke);
             let corner = Path::new(|b| {
                 b.move_to(Point::new(bounds.x + bounds.width - fold, bounds.y));
@@ -391,7 +431,7 @@ fn draw_data(
                 );
                 b.close();
             });
-            frame.fill(&body, tokens.fill);
+            depth_fill(frame, &body, bounds.y, bounds.height, colors, tokens);
             frame.stroke(&body, stroke);
             // The lid ellipse, approximated with two arcs worth of curve.
             for offset in [0.0, 3.0, 6.0] {
@@ -421,6 +461,7 @@ fn draw_artifact(
     stroke: Stroke<'_>,
     tokens: CanvasTokens,
 ) {
+    let stroke = stroke.with_color(tokens.data.stroke);
     match &artifact.kind {
         ArtifactKind::TextAnnotation { text } => {
             let bracket = Path::new(|b| {
@@ -463,8 +504,25 @@ fn draw_activity(
     stroke_width: f32,
     tokens: CanvasTokens,
 ) {
+    let expanded =
+        matches!(&activity.kind, ActivityKind::SubProcess(_)) && shape.is_expanded == Some(true);
+    let colors = match &activity.kind {
+        ActivityKind::Task(_) => tokens.task,
+        ActivityKind::SubProcess(_) | ActivityKind::CallActivity(_) => tokens.container,
+    };
+    let stroke = stroke.with_color(colors.stroke);
+
     let body = Path::rounded_rectangle(bounds.position(), bounds.size(), TASK_RADIUS.into());
-    frame.fill(&body, tokens.fill);
+    if expanded {
+        // The body is a backdrop for children: shadow, but a flat fill.
+        frame.with_save(|frame| {
+            frame.translate(Vector::new(0.0, 2.0));
+            frame.fill(&body, tokens.shadow);
+        });
+        frame.fill(&body, colors.fill);
+    } else {
+        depth_fill(frame, &body, bounds.y, bounds.height, colors, tokens);
+    }
 
     // Border per activity kind: dotted for event subprocesses, doubled for
     // transactions, thick for call activities, plain otherwise.
@@ -493,9 +551,6 @@ fn draw_activity(
         ActivityKind::Task(_) => frame.stroke(&body, stroke),
     }
 
-    let expanded =
-        matches!(&activity.kind, ActivityKind::SubProcess(_)) && shape.is_expanded == Some(true);
-
     // Bottom-center markers: the [+] of collapsed containers plus any loop
     // marker, laid out side by side.
     let mut marker_slots: Vec<bool> = Vec::new(); // true = plus, false = loop
@@ -518,15 +573,15 @@ fn draw_activity(
             bounds.y + bounds.height - 9.0,
         );
         if *is_plus {
-            plus_marker(frame, center, stroke_width, tokens);
+            plus_marker(frame, center, stroke_width, colors.stroke);
         } else if let Some(marker) = &activity.loop_marker {
-            loop_marker_icon(frame, marker.kind, center, stroke_width, tokens);
+            loop_marker_icon(frame, marker.kind, center, stroke_width, colors.stroke);
         }
     }
 
     match &activity.kind {
         ActivityKind::Task(task_type) => {
-            task_icon(frame, *task_type, bounds, stroke_width, tokens);
+            task_icon(frame, *task_type, bounds, stroke_width, colors);
         }
         ActivityKind::SubProcess(_) | ActivityKind::CallActivity(_) => {}
     }
@@ -548,10 +603,10 @@ fn draw_activity(
 }
 
 /// The collapsed-container marker: a small square with a plus.
-fn plus_marker(frame: &mut Frame, center: Point, stroke_width: f32, tokens: CanvasTokens) {
+fn plus_marker(frame: &mut Frame, center: Point, stroke_width: f32, color: iced::Color) {
     let stroke = Stroke::default()
         .with_width(stroke_width * 0.9)
-        .with_color(tokens.stroke);
+        .with_color(color);
     let half = 6.0;
     frame.stroke(
         &Path::rectangle(
@@ -675,9 +730,18 @@ fn draw_event(
 ) {
     let center = bounds.center();
     let radius = bounds.width.min(bounds.height) / 2.0;
+    let colors = event_colors(&event.position, tokens);
+    let stroke = stroke.with_color(colors.stroke);
 
     let circle = Path::circle(center, radius);
-    frame.fill(&circle, tokens.fill);
+    depth_fill(
+        frame,
+        &circle,
+        center.y - radius,
+        radius * 2.0,
+        colors,
+        tokens,
+    );
 
     match event.position {
         EventPosition::Start { .. } => frame.stroke(&circle, stroke),
@@ -702,7 +766,7 @@ fn draw_event(
             radius,
             filled,
             stroke_width,
-            tokens,
+            colors,
         );
     }
 
@@ -728,7 +792,9 @@ fn draw_gateway(
         builder.line_to(Point::new(bounds.x, center.y));
         builder.close();
     });
-    frame.fill(&diamond, tokens.fill);
+    let colors = tokens.gateway;
+    let stroke = stroke.with_color(colors.stroke);
+    depth_fill(frame, &diamond, bounds.y, bounds.height, colors, tokens);
     frame.stroke(&diamond, stroke);
 
     gateway_marker(
@@ -818,12 +884,13 @@ fn envelope(
     center: Point,
     filled: bool,
     stroke_width: f32,
-    tokens: CanvasTokens,
+    color: iced::Color,
+    bg: iced::Color,
 ) {
     let (half_w, half_h) = (8.0, 5.5);
     let stroke = Stroke::default()
         .with_width(stroke_width * 0.9)
-        .with_color(tokens.stroke);
+        .with_color(color);
 
     let body = Path::rectangle(
         Point::new(center.x - half_w, center.y - half_h),
@@ -835,10 +902,10 @@ fn envelope(
         builder.line_to(Point::new(center.x + half_w, center.y - half_h));
     });
     if filled {
-        frame.fill(&body, tokens.stroke);
+        frame.fill(&body, color);
         let light = Stroke::default()
             .with_width(stroke_width * 0.9)
-            .with_color(tokens.fill);
+            .with_color(bg);
         frame.stroke(&flap, light);
     } else {
         frame.stroke(&body, stroke);
@@ -858,15 +925,17 @@ fn definition_icon(
     radius: f32,
     filled: bool,
     stroke_width: f32,
-    tokens: CanvasTokens,
+    colors: ElementColors,
 ) {
     let stroke = Stroke::default()
         .with_width(stroke_width * 0.9)
-        .with_color(tokens.stroke);
+        .with_color(colors.stroke);
     let c = center;
 
     match kind {
-        EventDefinitionKind::Message => envelope(frame, c, filled, stroke_width, tokens),
+        EventDefinitionKind::Message => {
+            envelope(frame, c, filled, stroke_width, colors.stroke, colors.fill)
+        }
         EventDefinitionKind::Timer => {
             frame.stroke(&Path::circle(c, radius * 0.62), stroke);
             // Ticks.
@@ -902,7 +971,7 @@ fn definition_icon(
                 b.close();
             });
             if filled {
-                frame.fill(&triangle, tokens.stroke);
+                frame.fill(&triangle, colors.stroke);
             } else {
                 frame.stroke(&triangle, stroke);
             }
@@ -918,7 +987,7 @@ fn definition_icon(
                 b.close();
             });
             if filled {
-                frame.fill(&bolt, tokens.stroke);
+                frame.fill(&bolt, colors.stroke);
             } else {
                 frame.stroke(&bolt, stroke);
             }
@@ -932,7 +1001,7 @@ fn definition_icon(
                 b.close();
             });
             if filled {
-                frame.fill(&arrow, tokens.stroke);
+                frame.fill(&arrow, colors.stroke);
             } else {
                 frame.stroke(&arrow, stroke);
             }
@@ -967,7 +1036,7 @@ fn definition_icon(
                 b.close();
             });
             if filled {
-                frame.fill(&arrows, tokens.stroke);
+                frame.fill(&arrows, colors.stroke);
             } else {
                 frame.stroke(&arrows, stroke);
             }
@@ -984,7 +1053,7 @@ fn definition_icon(
                 b.close();
             });
             if filled {
-                frame.fill(&arrow, tokens.stroke);
+                frame.fill(&arrow, colors.stroke);
             } else {
                 frame.stroke(&arrow, stroke);
             }
@@ -1000,7 +1069,7 @@ fn definition_icon(
             frame.stroke(&x, stroke.with_width(stroke_width * 1.6));
         }
         EventDefinitionKind::Terminate => {
-            frame.fill(&Path::circle(c, radius - 7.0), tokens.stroke);
+            frame.fill(&Path::circle(c, radius - 7.0), colors.stroke);
         }
         EventDefinitionKind::Other => {}
     }
@@ -1015,11 +1084,11 @@ pub(crate) fn task_icon(
     task_type: TaskType,
     bounds: Rectangle,
     stroke_width: f32,
-    tokens: CanvasTokens,
+    colors: ElementColors,
 ) {
     let stroke = Stroke::default()
         .with_width(stroke_width * 0.9)
-        .with_color(tokens.stroke);
+        .with_color(colors.stroke);
     let origin = Point::new(bounds.x + 8.0, bounds.y + 8.0);
 
     match task_type {
@@ -1057,14 +1126,16 @@ pub(crate) fn task_icon(
             Point::new(origin.x + 7.0, origin.y + 5.5),
             true,
             stroke_width,
-            tokens,
+            colors.stroke,
+            colors.fill,
         ),
         TaskType::Receive => envelope(
             frame,
             Point::new(origin.x + 7.0, origin.y + 5.5),
             false,
             stroke_width,
-            tokens,
+            colors.stroke,
+            colors.fill,
         ),
         TaskType::Script => {
             // A scroll: curly left/right edges with text lines.
@@ -1118,7 +1189,7 @@ pub(crate) fn task_icon(
             // A decision table: header band plus grid.
             let (w, h) = (14.0, 10.0);
             frame.stroke(&Path::rectangle(origin, Size::new(w, h)), stroke);
-            frame.fill_rectangle(origin, Size::new(w, 3.0), tokens.stroke);
+            frame.fill_rectangle(origin, Size::new(w, 3.0), colors.stroke);
             let grid = Path::new(|b: &mut Builder| {
                 b.move_to(Point::new(origin.x, origin.y + 6.5));
                 b.line_to(Point::new(origin.x + w, origin.y + 6.5));
@@ -1137,11 +1208,11 @@ fn loop_marker_icon(
     kind: LoopKind,
     c: Point,
     stroke_width: f32,
-    tokens: CanvasTokens,
+    color: iced::Color,
 ) {
     let stroke = Stroke::default()
         .with_width(stroke_width * 0.9)
-        .with_color(tokens.stroke);
+        .with_color(color);
 
     match kind {
         LoopKind::Standard => {

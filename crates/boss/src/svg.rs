@@ -129,7 +129,7 @@ pub fn export(document: &Document) -> String {
 
 fn band(svg: &mut String, b: Bounds, name: Option<&str>, tokens: CanvasTokens, is_pool: bool) {
     let fill = if is_pool {
-        hex(tokens.fill)
+        hex(tokens.container.fill)
     } else {
         String::from("none")
     };
@@ -140,14 +140,14 @@ fn band(svg: &mut String, b: Bounds, name: Option<&str>, tokens: CanvasTokens, i
         b.y,
         b.width,
         b.height,
-        hex(tokens.stroke),
+        hex(tokens.container.stroke),
     );
     let _ = writeln!(
         svg,
         "  <line x1=\"{x}\" y1=\"{}\" x2=\"{x}\" y2=\"{}\" stroke=\"{}\" stroke-width=\"1.5\" />",
         b.y,
         b.y + b.height,
-        hex(tokens.stroke),
+        hex(tokens.container.stroke),
         x = b.x + POOL_HEADER,
     );
     if let Some(name) = name {
@@ -197,10 +197,14 @@ fn node_shape(
     tokens: CanvasTokens,
 ) {
     let b = shape.bounds;
-    let stroke = hex(tokens.stroke);
-    let fill = hex(tokens.fill);
     match index.get(&shape.bpmn_element).copied() {
         Some(FlowElement::Event(event)) => {
+            let colors = match event.position {
+                EventPosition::Start { .. } => tokens.start,
+                EventPosition::End => tokens.end,
+                _ => tokens.intermediate,
+            };
+            let (stroke, fill) = (hex(colors.stroke), hex(colors.fill));
             let r = b.width.min(b.height) / 2.0;
             let (cx, cy) = (b.x + b.width / 2.0, b.y + b.height / 2.0);
             let width = if event.position == EventPosition::End {
@@ -229,6 +233,7 @@ fn node_shape(
             }
         }
         Some(FlowElement::Gateway(gateway)) => {
+            let (stroke, fill) = (hex(tokens.gateway.stroke), hex(tokens.gateway.fill));
             let (cx, cy) = (b.x + b.width / 2.0, b.y + b.height / 2.0);
             let _ = writeln!(
                 svg,
@@ -286,6 +291,7 @@ fn node_shape(
         }
         Some(FlowElement::Activity(activity)) => activity_shape(svg, activity, shape, tokens),
         Some(FlowElement::Data(data)) => {
+            let (stroke, fill) = (hex(tokens.data.stroke), hex(tokens.data.fill));
             match data.kind {
                 DataKind::Object | DataKind::ObjectReference { .. } => {
                     let fold = (b.width * 0.3).min(14.0);
@@ -336,42 +342,46 @@ fn node_shape(
                 label_below(svg, b, name, tokens);
             }
         }
-        Some(FlowElement::Artifact(artifact)) => match &artifact.kind {
-            ArtifactKind::TextAnnotation { text } => {
-                let _ = writeln!(
-                    svg,
-                    "  <path d=\"M {} {} L {} {} L {} {} L {} {}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1.5\" />",
-                    b.x + 10.0,
-                    b.y,
-                    b.x,
-                    b.y,
-                    b.x,
-                    b.y + b.height,
-                    b.x + 10.0,
-                    b.y + b.height,
-                );
-                if let Some(text) = text {
+        Some(FlowElement::Artifact(artifact)) => {
+            let stroke = hex(tokens.data.stroke);
+            match &artifact.kind {
+                ArtifactKind::TextAnnotation { text } => {
                     let _ = writeln!(
                         svg,
-                        "  <text x=\"{}\" y=\"{}\" font-size=\"11\" fill=\"{}\" dominant-baseline=\"central\">{}</text>",
-                        b.x + 7.0,
-                        b.y + b.height / 2.0,
-                        hex(tokens.label),
-                        escape(text),
+                        "  <path d=\"M {} {} L {} {} L {} {} L {} {}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1.5\" />",
+                        b.x + 10.0,
+                        b.y,
+                        b.x,
+                        b.y,
+                        b.x,
+                        b.y + b.height,
+                        b.x + 10.0,
+                        b.y + b.height,
+                    );
+                    if let Some(text) = text {
+                        let _ = writeln!(
+                            svg,
+                            "  <text x=\"{}\" y=\"{}\" font-size=\"11\" fill=\"{}\" dominant-baseline=\"central\">{}</text>",
+                            b.x + 7.0,
+                            b.y + b.height / 2.0,
+                            hex(tokens.label),
+                            escape(text),
+                        );
+                    }
+                }
+                ArtifactKind::Group { .. } => {
+                    let _ = writeln!(
+                        svg,
+                        "  <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"8\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1.5\" stroke-dasharray=\"8 4 2 4\" />",
+                        b.x, b.y, b.width, b.height,
                     );
                 }
+                ArtifactKind::Association { .. } => {}
             }
-            ArtifactKind::Group { .. } => {
-                let _ = writeln!(
-                    svg,
-                    "  <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"8\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1.5\" stroke-dasharray=\"8 4 2 4\" />",
-                    b.x, b.y, b.width, b.height,
-                );
-            }
-            ArtifactKind::Association { .. } => {}
-        },
+        }
         // Unmodeled references keep the canvas's dashed placeholder.
         _ => {
+            let stroke = hex(tokens.stroke);
             let _ = writeln!(
                 svg,
                 "  <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"8\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1.5\" stroke-dasharray=\"6 4\" />",
@@ -385,7 +395,11 @@ fn node_shape(
 
 fn activity_shape(svg: &mut String, activity: &Activity, shape: &BpmnShape, tokens: CanvasTokens) {
     let b = shape.bounds;
-    let stroke = hex(tokens.stroke);
+    let colors = match &activity.kind {
+        ActivityKind::Task(_) => tokens.task,
+        _ => tokens.container,
+    };
+    let stroke = hex(colors.stroke);
     let (dash, width) = match &activity.kind {
         ActivityKind::SubProcess(sub) if sub.kind == SubProcessKind::Event => {
             (" stroke-dasharray=\"2.5 3.5\"", 1.5)
@@ -400,7 +414,7 @@ fn activity_shape(svg: &mut String, activity: &Activity, shape: &BpmnShape, toke
         b.y,
         b.width,
         b.height,
-        hex(tokens.fill),
+        hex(colors.fill),
     );
     if matches!(
         &activity.kind,
