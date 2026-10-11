@@ -1,8 +1,11 @@
 name: pages
 
+# Manual-only for now: GitHub Pages needs a public repository (or a paid
+# plan) to deploy, so the automatic trigger on main stays disabled until the
+# repository goes public. Restore the push trigger then:
+#   push:
+#     branches: [main]
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
