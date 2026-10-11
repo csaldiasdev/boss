@@ -4,7 +4,15 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>boss</title>
-    <link data-trunk rel="rust" data-bin="boss" href="../crates/boss/Cargo.toml" />
+    <!-- Rust 1.82+ emits bulk-memory and nontrapping-fptoint instructions by
+         default; wasm-opt rejects them unless the features are enabled. -->
+    <link
+      data-trunk
+      rel="rust"
+      data-bin="boss"
+      href="../crates/boss/Cargo.toml"
+      data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int"
+    />
     <style>
       html,
       body {
