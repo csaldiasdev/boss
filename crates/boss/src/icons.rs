@@ -47,20 +47,12 @@ pub const MOON: char = '\u{e11e}';
 /// `plug-zap` (MCP server; native only).
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub const MCP: char = '\u{e460}';
-/// `mouse-pointer-2` (select tool).
-pub const SELECT: char = '\u{e1c3}';
-/// `move-up-right` (connect tool).
-pub const CONNECT: char = '\u{e497}';
-/// `chevron-left`.
-pub const CHEVRON_LEFT: char = '\u{e06e}';
 /// `chevron-right`.
 pub const CHEVRON_RIGHT: char = '\u{e06f}';
 /// `check`.
 pub const CHECK: char = '\u{e06c}';
 /// `circle-alert`.
 pub const ALERT: char = '\u{e077}';
-/// `panel-left`.
-pub const PANEL_LEFT: char = '\u{e12a}';
 /// `panel-right`.
 pub const PANEL_RIGHT: char = '\u{e435}';
 

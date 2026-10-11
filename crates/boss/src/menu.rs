@@ -80,7 +80,6 @@ fn build() -> muda::Result<Menu> {
         &item("view.zoom-fit", "Zoom to Fit", Some("CmdOrCtrl+0")),
         &PredefinedMenuItem::separator(),
         &item("view.toggle-theme", "Toggle Dark Mode", None),
-        &item("view.toggle-palette", "Toggle Tools Panel", None),
         &item("view.toggle-properties", "Toggle Properties Panel", None),
     ])?;
 
@@ -183,7 +182,6 @@ fn message_for(id: &str) -> Option<Message> {
         "view.zoom-out" => Message::ZoomOut,
         "view.zoom-fit" => Message::ZoomFit,
         "view.toggle-theme" => Message::ToggleTheme,
-        "view.toggle-palette" => Message::TogglePalette,
         "view.toggle-properties" => Message::ToggleProperties,
         "server.mcp" => Message::McpStart,
         _ => return None,

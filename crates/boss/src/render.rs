@@ -934,7 +934,7 @@ fn definition_icon(
 
     match kind {
         EventDefinitionKind::Message => {
-            envelope(frame, c, filled, stroke_width, colors.stroke, colors.fill)
+            envelope(frame, c, filled, stroke_width, colors.stroke, colors.fill);
         }
         EventDefinitionKind::Timer => {
             frame.stroke(&Path::circle(c, radius * 0.62), stroke);

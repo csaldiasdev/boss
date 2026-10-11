@@ -6,7 +6,7 @@ use crate::render;
 use crate::theme::CanvasTokens;
 use bpmn_core::di::DiElement;
 use bpmn_core::edit::outline_of;
-use bpmn_core::{BpmnId, Document, NodeKind};
+use bpmn_core::{BpmnId, Document};
 use iced::advanced::mouse;
 use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, Geometry, Path, Stroke};
 use iced::{Element, Fill, Point, Rectangle, Renderer, Size, Theme, Vector};
@@ -20,21 +20,8 @@ const MAJOR_EVERY: i64 = 5;
 const GRID_MIN_SCALING: f32 = 0.3;
 /// Placement and movement snap to this step (half the grid).
 const SNAP_STEP: f32 = 10.0;
-
-/// The active editing tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Tool {
-    /// Select, move, and marquee.
-    #[default]
-    Select,
-    /// Place a new node on click.
-    Place(NodeKind),
-    /// Place a new pool on click.
-    PlacePool,
-    /// Connect two nodes: a sequence flow inside a container, a message flow
-    /// across pools.
-    Connect,
-}
+/// Screen-size radius of the connect pad beside the selected element.
+const CONNECT_PAD_RADIUS: f32 = 10.0;
 
 /// What canvas interaction asks the app to do.
 #[derive(Debug, Clone)]
@@ -63,13 +50,7 @@ pub enum CanvasMessage {
         /// Vertical delta.
         dy: f32,
     },
-    /// Place a new node of this kind at this (snapped) world position.
-    Place(NodeKind, Point),
-    /// Place a new pool centered at this (snapped) world position.
-    PlacePool(Point),
-    /// Place a boundary event on this host activity, toward this point.
-    PlaceBoundary(BpmnId, Point),
-    /// Connect source to target with a sequence flow.
+    /// Connect source to target (the document picks the flow kind).
     Connect(BpmnId, BpmnId),
     /// Replace an edge's waypoints after a handle drag.
     SetEdgeWaypoints {
@@ -78,8 +59,13 @@ pub enum CanvasMessage {
         /// The full new waypoint list, in world units.
         points: Vec<Point>,
     },
-    /// Double-click on an element: select it and focus its name field.
-    EditLabel(BpmnId),
+    /// Double-click on an element: open the inline name editor.
+    EditLabel {
+        /// The element to rename.
+        id: BpmnId,
+        /// Cursor position in window coordinates (where the editor opens).
+        screen: Point,
+    },
     /// The cursor moved to this diagram position (status-bar readout).
     CursorAt(i32, i32),
     /// Drag the window (macOS: press in the strip under the hidden
@@ -92,8 +78,15 @@ pub enum CanvasMessage {
         /// The projected diagram point (where the element will land).
         world: Point,
     },
-    /// Abort the armed tool (clicked empty space while connecting).
-    CancelTool,
+    /// Right-click on an element: open its menu (boundary/rename/delete).
+    ElementMenu {
+        /// The element under the cursor.
+        id: BpmnId,
+        /// Cursor position in window coordinates (where the menu opens).
+        screen: Point,
+        /// The projected diagram point (for boundary placement).
+        world: Point,
+    },
 }
 
 /// Retained canvas state owned by the app (drawing caches).
@@ -111,7 +104,6 @@ impl DiagramCanvas {
         document: &'a Document,
         selection: &'a HashSet<BpmnId>,
         badges: &'a std::collections::HashMap<BpmnId, crate::render::Badge>,
-        tool: Tool,
         tokens: CanvasTokens,
     ) -> Element<'a, CanvasMessage> {
         Canvas::new(View {
@@ -121,7 +113,6 @@ impl DiagramCanvas {
             document,
             selection,
             badges,
-            tool,
             tokens,
         })
         .width(Fill)
@@ -144,7 +135,6 @@ struct View<'a> {
     document: &'a Document,
     selection: &'a HashSet<BpmnId>,
     badges: &'a std::collections::HashMap<BpmnId, crate::render::Badge>,
-    tool: Tool,
     tokens: CanvasTokens,
 }
 
@@ -416,6 +406,25 @@ impl View<'_> {
         self.camera.project(cursor, bounds.size())
     }
 
+    /// The connect pad beside the single selected element: its source id and
+    /// world-space center. `None` when zero/many elements are selected or the
+    /// selection has no shape (flows).
+    fn connect_pad(&self) -> Option<(BpmnId, Point)> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection.iter().next()?;
+        let (_, bounds) = self.document.node_outline(id)?;
+        let offset = (CONNECT_PAD_RADIUS + 8.0) / self.camera.scaling;
+        Some((
+            id.clone(),
+            Point::new(
+                (bounds.x + bounds.width) as f32 + offset,
+                bounds.center().y as f32,
+            ),
+        ))
+    }
+
     /// Zooms by `amount` (a signed fraction), keeping the point under the
     /// cursor fixed.
     fn zoom_at_cursor(
@@ -467,6 +476,17 @@ impl canvas::Program<CanvasMessage> for View<'_> {
         if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
             state.modifiers = *modifiers;
             return None;
+        }
+        if let Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            ..
+        }) = event
+            && !matches!(state.interaction, Interaction::None)
+        {
+            // Cancel the pending gesture; the app's own Escape handling
+            // (selection, overlays) still runs since this is not captured.
+            state.interaction = Interaction::None;
+            return Some(canvas::Action::request_redraw());
         }
 
         if let Event::Mouse(mouse::Event::ButtonReleased(button)) = event {
@@ -533,10 +553,14 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                 Some(canvas::Action::request_redraw().and_capture())
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let screen = cursor.position()?;
+                state.interaction = Interaction::None;
                 if let Some(id) = self.hit_node(world).or_else(|| self.hit_edge(world)) {
-                    Some(canvas::Action::publish(CanvasMessage::SelectOnly(id)).and_capture())
+                    Some(
+                        canvas::Action::publish(CanvasMessage::ElementMenu { id, screen, world })
+                            .and_capture(),
+                    )
                 } else {
-                    let screen = cursor.position()?;
                     Some(
                         canvas::Action::publish(CanvasMessage::ContextMenu { screen, world })
                             .and_capture(),
@@ -548,114 +572,91 @@ impl canvas::Program<CanvasMessage> for View<'_> {
             {
                 Some(canvas::Action::publish(CanvasMessage::DragWindow).and_capture())
             }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => match self.tool {
-                Tool::Place(NodeKind::Boundary) => {
-                    // Boundary events need a host activity under the cursor.
-                    self.hit_node(world).map_or_else(
-                        || Some(canvas::Action::request_redraw().and_capture()),
-                        |host| {
-                            Some(
-                                canvas::Action::publish(CanvasMessage::PlaceBoundary(host, world))
-                                    .and_capture(),
-                            )
-                        },
-                    )
-                }
-                Tool::Place(kind) => Some(
-                    canvas::Action::publish(CanvasMessage::Place(kind, snap_point(world)))
-                        .and_capture(),
-                ),
-                Tool::PlacePool => Some(
-                    canvas::Action::publish(CanvasMessage::PlacePool(snap_point(world)))
-                        .and_capture(),
-                ),
-                Tool::Connect => {
-                    let hit = self.hit_node(world);
-                    match (&state.interaction, hit) {
-                        (Interaction::ConnectFrom { source, .. }, Some(target)) => {
-                            let source = source.clone();
-                            state.interaction = Interaction::None;
-                            Some(
-                                canvas::Action::publish(CanvasMessage::Connect(source, target))
-                                    .and_capture(),
-                            )
-                        }
-                        (_, Some(source)) => {
-                            state.interaction = Interaction::ConnectFrom {
-                                source,
-                                cursor: world,
-                            };
-                            Some(canvas::Action::request_redraw().and_capture())
-                        }
-                        (_, None) => {
-                            state.interaction = Interaction::None;
-                            Some(canvas::Action::publish(CanvasMessage::CancelTool).and_capture())
-                        }
-                    }
-                }
-                Tool::Select => {
-                    let click =
-                        mouse::Click::new(cursor_position, mouse::Button::Left, state.last_click);
-                    state.last_click = Some(click);
-                    if click.kind() == mouse::click::Kind::Double
-                        && let Some(id) = self.hit_node(world).or_else(|| self.hit_edge(world))
-                    {
-                        state.interaction = Interaction::None;
-                        return Some(
-                            canvas::Action::publish(CanvasMessage::EditLabel(id)).and_capture(),
-                        );
-                    }
-                    if self.grab_waypoint(state, world) {
-                        return Some(canvas::Action::request_redraw().and_capture());
-                    }
-                    if let Some(id) = self.hit_node(world) {
-                        let message = if state.modifiers.shift() {
-                            Some(CanvasMessage::SelectToggle(id.clone()))
-                        } else if !self.selection.contains(&id) {
-                            Some(CanvasMessage::SelectOnly(id.clone()))
-                        } else {
-                            None
-                        };
-                        if !state.modifiers.shift() {
-                            state.interaction = Interaction::Moving {
-                                start_world: world,
-                                delta: Vector::new(0.0, 0.0),
-                                moved: false,
-                            };
-                        }
-                        Some(
-                            message
-                                .map_or_else(
-                                    canvas::Action::request_redraw,
-                                    canvas::Action::publish,
-                                )
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                // An armed connection resolves (or cancels) on this click.
+                if let Interaction::ConnectFrom { source, .. } = &state.interaction {
+                    let source = source.clone();
+                    state.interaction = Interaction::None;
+                    return match self.hit_node(world) {
+                        Some(target) => Some(
+                            canvas::Action::publish(CanvasMessage::Connect(source, target))
                                 .and_capture(),
-                        )
-                    } else if let Some(id) = self.hit_edge(world) {
-                        let message = if state.modifiers.shift() {
-                            CanvasMessage::SelectToggle(id)
-                        } else {
-                            CanvasMessage::SelectOnly(id)
-                        };
-                        Some(canvas::Action::publish(message).and_capture())
-                    } else if state.modifiers.shift() {
-                        state.interaction = Interaction::Marquee {
-                            start: world,
-                            current: world,
-                        };
-                        Some(canvas::Action::request_redraw().and_capture())
+                        ),
+                        None => Some(canvas::Action::request_redraw().and_capture()),
+                    };
+                }
+
+                // The connect pad next to the single selected element.
+                if let Some((source, center)) = self.connect_pad()
+                    && distance(world, center) <= CONNECT_PAD_RADIUS / self.camera.scaling
+                {
+                    state.interaction = Interaction::ConnectFrom {
+                        source,
+                        cursor: world,
+                    };
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
+
+                let click =
+                    mouse::Click::new(cursor_position, mouse::Button::Left, state.last_click);
+                state.last_click = Some(click);
+                if click.kind() == mouse::click::Kind::Double
+                    && let Some(id) = self.hit_node(world).or_else(|| self.hit_edge(world))
+                {
+                    state.interaction = Interaction::None;
+                    let screen = cursor.position()?;
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::EditLabel { id, screen })
+                            .and_capture(),
+                    );
+                }
+                if self.grab_waypoint(state, world) {
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
+                if let Some(id) = self.hit_node(world) {
+                    let message = if state.modifiers.shift() {
+                        Some(CanvasMessage::SelectToggle(id.clone()))
+                    } else if !self.selection.contains(&id) {
+                        Some(CanvasMessage::SelectOnly(id.clone()))
                     } else {
-                        // Click-and-hold on empty space moves the workspace;
-                        // a plain click still clears the selection on release.
-                        state.interaction = Interaction::Panning {
-                            translation: self.camera.translation,
-                            start: cursor_position,
+                        None
+                    };
+                    if !state.modifiers.shift() {
+                        state.interaction = Interaction::Moving {
+                            start_world: world,
+                            delta: Vector::new(0.0, 0.0),
                             moved: false,
                         };
-                        Some(canvas::Action::request_redraw().and_capture())
                     }
+                    Some(
+                        message
+                            .map_or_else(canvas::Action::request_redraw, canvas::Action::publish)
+                            .and_capture(),
+                    )
+                } else if let Some(id) = self.hit_edge(world) {
+                    let message = if state.modifiers.shift() {
+                        CanvasMessage::SelectToggle(id)
+                    } else {
+                        CanvasMessage::SelectOnly(id)
+                    };
+                    Some(canvas::Action::publish(message).and_capture())
+                } else if state.modifiers.shift() {
+                    state.interaction = Interaction::Marquee {
+                        start: world,
+                        current: world,
+                    };
+                    Some(canvas::Action::request_redraw().and_capture())
+                } else {
+                    // Click-and-hold on empty space moves the workspace;
+                    // a plain click still clears the selection on release.
+                    state.interaction = Interaction::Panning {
+                        translation: self.camera.translation,
+                        start: cursor_position,
+                        moved: false,
+                    };
+                    Some(canvas::Action::request_redraw().and_capture())
                 }
-            },
+            }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => match &mut state.interaction {
                 Interaction::Panning {
                     translation,
@@ -792,10 +793,10 @@ impl canvas::Program<CanvasMessage> for View<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        match (&state.interaction, self.tool) {
-            (Interaction::Panning { .. }, _) => mouse::Interaction::Grabbing,
-            (Interaction::Moving { .. }, _) => mouse::Interaction::Move,
-            (_, Tool::Place(_) | Tool::PlacePool | Tool::Connect) if cursor.is_over(bounds) => {
+        match &state.interaction {
+            Interaction::Panning { .. } => mouse::Interaction::Grabbing,
+            Interaction::Moving { .. } => mouse::Interaction::Move,
+            Interaction::ConnectFrom { .. } if cursor.is_over(bounds) => {
                 mouse::Interaction::Crosshair
             }
             _ => mouse::Interaction::default(),
@@ -1015,26 +1016,28 @@ impl View<'_> {
             );
         }
 
-        // Placement ghost.
-        let ghost_size = match self.tool {
-            Tool::Place(kind) => {
-                let size = kind.default_size();
-                Some((size.width as f32, size.height as f32))
-            }
-            Tool::PlacePool => Some((600.0, 250.0)),
-            _ => None,
-        };
-        if let Some((w, h)) = ghost_size
-            && let Some(position) = cursor.position_in(bounds)
+        // The connect pad beside the single selected element (hidden while
+        // a drag or connection is in flight).
+        if matches!(state.interaction, Interaction::None)
+            && let Some((_, center)) = self.connect_pad()
         {
-            let world = snap_point(self.camera.project(position, bounds.size()));
+            let radius = CONNECT_PAD_RADIUS / zoom;
+            frame.fill(&Path::circle(center, radius), self.tokens.selection);
+            let arrow = Path::new(|b| {
+                let r = radius * 0.45;
+                b.move_to(Point::new(center.x - r, center.y));
+                b.line_to(Point::new(center.x + r, center.y));
+                b.move_to(Point::new(center.x + r * 0.2, center.y - r * 0.8));
+                b.line_to(Point::new(center.x + r, center.y));
+                b.line_to(Point::new(center.x + r * 0.2, center.y + r * 0.8));
+            });
             frame.stroke(
-                &Path::rectangle(
-                    Point::new(world.x - w / 2.0, world.y - h / 2.0),
-                    Size::new(w, h),
-                ),
-                accent(1.2),
+                &arrow,
+                Stroke::default()
+                    .with_width((1.8 / zoom).max(1.0 / zoom))
+                    .with_color(self.tokens.bg),
             );
         }
+        let _ = (cursor, bounds);
     }
 }

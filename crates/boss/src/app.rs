@@ -1,7 +1,7 @@
 //! The application shell: model, messages, update, and view.
 
 use crate::camera::Camera;
-use crate::canvas::{CanvasMessage, DiagramCanvas, Tool};
+use crate::canvas::{CanvasMessage, DiagramCanvas};
 use crate::icons;
 use crate::platform::{self, OpenedFile, SavedFile};
 use crate::session::EditSession;
@@ -56,6 +56,29 @@ fn boss_mcp_port() -> u16 {
     {
         4555
     }
+}
+
+/// What the right-click placement catalog can create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placeable {
+    /// A flow node, data element, or artifact.
+    Node(NodeKind),
+    /// A pool.
+    Pool,
+}
+
+/// A floating element stacked over the canvas, anchored at a window point.
+enum CanvasOverlay {
+    /// The right-click placement catalog (empty-space click).
+    PlaceMenu { at: iced::Point, world: iced::Point },
+    /// The element menu (right-click on an element).
+    ElementMenu {
+        at: iced::Point,
+        world: iced::Point,
+        id: BpmnId,
+    },
+    /// The inline name editor (double-click).
+    LabelEdit { at: iced::Point, id: BpmnId },
 }
 
 /// A transient message for the status bar.
@@ -192,21 +215,19 @@ pub struct App {
     /// A manual Light/Dark choice overriding the OS until restart.
     mode_override: Option<Mode>,
     theme: Theme,
-    palette_open: bool,
     properties_open: bool,
     issues_open: bool,
     /// The cursor position in diagram units, for the status bar.
     cursor_world: Option<(i32, i32)>,
     /// The main window, for chrome actions like dragging.
     window_id: Option<iced::window::Id>,
-    /// An open right-click placement menu: (screen position, diagram point).
-    context_menu: Option<(iced::Point, iced::Point)>,
+    /// The floating canvas overlay (menus or the inline name editor).
+    overlay: Option<CanvasOverlay>,
     session: EditSession,
     file_name: String,
     #[cfg(not(target_arch = "wasm32"))]
     path: Option<std::path::PathBuf>,
     selection: HashSet<BpmnId>,
-    tool: Tool,
     status: Option<StatusLine>,
     window_size: Size,
     validator: Validator,
@@ -224,18 +245,16 @@ impl Default for App {
             system_mode: Mode::default(),
             mode_override: None,
             theme: theme::iced_theme(Mode::default()),
-            palette_open: true,
             properties_open: true,
             issues_open: true,
             cursor_world: None,
             window_id: None,
-            context_menu: None,
+            overlay: None,
             session: EditSession::new(Document::new()),
             file_name: String::from("untitled.bpmn"),
             #[cfg(not(target_arch = "wasm32"))]
             path: None,
             selection: HashSet::new(),
-            tool: Tool::Select,
             status: None,
             window_size: Size::new(1280.0, 800.0),
             validator: Validator::with_default_rules(),
@@ -266,24 +285,22 @@ pub enum Message {
     WindowFocused,
     /// A window opened (Windows attaches its native menu here).
     WindowOpened(iced::window::Id),
-    /// Collapse or expand the tools panel.
-    TogglePalette,
     /// Collapse or expand the properties panel.
     ToggleProperties,
     /// Show or hide the validation issues panel.
     ToggleIssues,
-    /// Close the right-click placement menu.
-    CloseContextMenu,
-    /// Place this kind from the context menu at the remembered point.
-    ContextPlace(NodeKind),
-    /// Place a pool from the context menu at the remembered point.
-    ContextPlacePool,
+    /// Close whatever floats over the canvas (menus, inline editor).
+    CloseOverlay,
+    /// Place from the context menu at the remembered point.
+    ContextPlace(Placeable),
+    /// Add a boundary event to the element-menu's element, toward the click.
+    AddBoundaryHere,
+    /// Open the inline name editor from the element menu.
+    RenameHere,
     /// Copy the MCP connect command to the clipboard (native only; the chip
     /// is inert on the web).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     CopyMcpCommand,
-    /// A palette/toolbar tool was picked.
-    ToolSelected(Tool),
     /// Undo one step.
     Undo,
     /// Redo one step.
@@ -518,11 +535,10 @@ impl App {
         });
     }
 
-    /// The width the side panels occupy, honoring their collapsed state.
+    /// The width the side panels occupy, honoring the collapsed state.
     fn side_panels_width(&self) -> f32 {
-        let palette = if self.palette_open { 170.0 } else { 36.0 };
         let properties = if self.properties_open { 230.0 } else { 36.0 };
-        palette + properties + 30.0
+        properties + 30.0
     }
 
     /// Centers the camera on the document and picks a zoom that shows all of
@@ -585,8 +601,21 @@ impl App {
         iced::advanced::widget::Id::new("element-name")
     }
 
-    /// Selects an element and moves focus into its name field.
-    fn edit_label(&mut self, id: BpmnId) -> Task<Message> {
+    /// The id of the inline (floating) name editor.
+    fn inline_input_id() -> iced::advanced::widget::Id {
+        iced::advanced::widget::Id::new("inline-name")
+    }
+
+    /// Opens the floating name editor over the element at `at`.
+    fn edit_label(&mut self, id: BpmnId, at: iced::Point) -> Task<Message> {
+        self.selection.clear();
+        self.selection.insert(id.clone());
+        self.overlay = Some(CanvasOverlay::LabelEdit { at, id });
+        iced::widget::operation::focus(Self::inline_input_id())
+    }
+
+    /// Selects an element and moves focus into the properties name field.
+    fn focus_properties_name(&mut self, id: BpmnId) -> Task<Message> {
         self.selection.clear();
         self.selection.insert(id);
         iced::widget::operation::focus(Self::name_input_id())
@@ -594,10 +623,19 @@ impl App {
 
     fn handle_canvas(&mut self, message: CanvasMessage) -> Task<Message> {
         match message {
-            CanvasMessage::EditLabel(id) => return self.edit_label(id),
+            CanvasMessage::EditLabel { id, screen } => return self.edit_label(id, screen),
             CanvasMessage::CursorAt(x, y) => self.cursor_world = Some((x, y)),
             CanvasMessage::ContextMenu { screen, world } => {
-                self.context_menu = Some((screen, world));
+                self.overlay = Some(CanvasOverlay::PlaceMenu { at: screen, world });
+            }
+            CanvasMessage::ElementMenu { id, screen, world } => {
+                self.selection.clear();
+                self.selection.insert(id.clone());
+                self.overlay = Some(CanvasOverlay::ElementMenu {
+                    at: screen,
+                    world,
+                    id,
+                });
             }
             CanvasMessage::DragWindow => {
                 if let Some(id) = self.window_id {
@@ -630,8 +668,7 @@ impl App {
                 });
                 self.document_changed();
             }
-            CanvasMessage::Place(kind, at) => self.handle_place(Some(kind), at),
-            CanvasMessage::PlacePool(at) => self.handle_place(None, at),
+
             CanvasMessage::Connect(source, target) => {
                 let mut connected = false;
                 self.session.commit(|doc| {
@@ -641,7 +678,6 @@ impl App {
                 if !connected {
                     self.status("Cannot connect those elements", true);
                 }
-                self.tool = Tool::Select;
                 self.document_changed();
             }
             CanvasMessage::SetEdgeWaypoints { id, points } => {
@@ -653,26 +689,6 @@ impl App {
                     .commit(|doc| doc.set_edge_waypoints(&id, &points));
                 self.document_changed();
             }
-            CanvasMessage::PlaceBoundary(host, at) => {
-                let mut created = None;
-                self.session.commit(|doc| {
-                    created = doc.create_boundary_event(
-                        &host,
-                        bpmn_core::Point::new(f64::from(at.x), f64::from(at.y)),
-                    );
-                    created.is_some()
-                });
-                match created {
-                    Some(id) => {
-                        self.selection.clear();
-                        self.selection.insert(id);
-                    }
-                    None => self.status("Boundary events attach to tasks", true),
-                }
-                self.tool = Tool::Select;
-                self.document_changed();
-            }
-            CanvasMessage::CancelTool => self.tool = Tool::Select,
         }
         Task::none()
     }
@@ -695,7 +711,6 @@ impl App {
             }
             None => self.status("In a collaboration, nodes go inside a pool", true),
         }
-        self.tool = Tool::Select;
         self.document_changed();
     }
 
@@ -833,7 +848,6 @@ impl App {
                 let _ = id;
             }
             Message::WindowResized(size) => self.window_size = size,
-            Message::TogglePalette => self.palette_open = !self.palette_open,
             Message::ToggleProperties => self.properties_open = !self.properties_open,
             Message::ToggleIssues => self.issues_open = !self.issues_open,
             Message::CopyMcpCommand => {
@@ -874,11 +888,9 @@ impl App {
             | Message::WindowFocused
             | Message::WindowOpened(_)
             | Message::WindowResized(_)
-            | Message::TogglePalette
             | Message::ToggleProperties
             | Message::ToggleIssues
             | Message::CopyMcpCommand) => return self.handle_chrome(message),
-            Message::ToolSelected(tool) => self.tool = tool,
             message @ (Message::Undo | Message::Redo) => {
                 let stepped = if matches!(message, Message::Undo) {
                     self.session.undo()
@@ -906,30 +918,49 @@ impl App {
                     return self.update(message);
                 }
             }
-            Message::CloseContextMenu => self.context_menu = None,
-            Message::ContextPlace(kind) => {
-                if let Some((_, world)) = self.context_menu.take() {
-                    self.handle_place(Some(kind), world);
+            Message::CloseOverlay => self.overlay = None,
+            Message::ContextPlace(placeable) => {
+                if let Some(CanvasOverlay::PlaceMenu { world, .. }) = self.overlay.take() {
+                    match placeable {
+                        Placeable::Node(kind) => self.handle_place(Some(kind), world),
+                        Placeable::Pool => self.handle_place(None, world),
+                    }
                 }
             }
-            Message::ContextPlacePool => {
-                if let Some((_, world)) = self.context_menu.take() {
-                    self.handle_place(None, world);
+            Message::AddBoundaryHere => {
+                if let Some(CanvasOverlay::ElementMenu { world, id, .. }) = self.overlay.take() {
+                    let mut created = None;
+                    self.session.commit(|doc| {
+                        created = doc.create_boundary_event(
+                            &id,
+                            bpmn_core::Point::new(f64::from(world.x), f64::from(world.y)),
+                        );
+                        created.is_some()
+                    });
+                    match created {
+                        Some(boundary) => {
+                            self.selection.clear();
+                            self.selection.insert(boundary);
+                        }
+                        None => self.status("Boundary events attach to activities", true),
+                    }
+                    self.document_changed();
+                }
+            }
+            Message::RenameHere => {
+                if let Some(CanvasOverlay::ElementMenu { at, id, .. }) = self.overlay.take() {
+                    return self.edit_label(id, at);
                 }
             }
             Message::Escape => {
-                if self.context_menu.take().is_some() {
+                if self.overlay.take().is_some() {
                     return Task::none();
                 }
-                if self.tool == Tool::Select {
-                    self.selection.clear();
-                } else {
-                    self.tool = Tool::Select;
-                }
+                self.selection.clear();
             }
             Message::RenameSelection => {
                 if let Some(id) = self.single_selection() {
-                    return self.edit_label(id);
+                    return self.focus_properties_name(id);
                 }
             }
             Message::SelectAll => {
@@ -1248,7 +1279,6 @@ impl App {
                         self.path = file.path;
                     }
                     self.selection.clear();
-                    self.tool = Tool::Select;
                     self.zoom_to_fit();
                     self.document_changed();
                 }
@@ -1309,7 +1339,6 @@ impl App {
 
         layout = layout.push(
             row![
-                self.palette(t),
                 container(
                     self.canvas
                         .view(
@@ -1317,7 +1346,6 @@ impl App {
                             self.session.document(),
                             &self.selection,
                             &self.badges,
-                            self.tool,
                             t.canvas,
                         )
                         .map(Message::Canvas)
@@ -1334,88 +1362,18 @@ impl App {
             .push(self.status_bar(t))
             .into();
 
-        match self.context_menu {
-            Some((at, _)) => self.with_context_menu(base, at, t),
+        match &self.overlay {
+            Some(CanvasOverlay::PlaceMenu { at, .. }) => {
+                self.overlay_at(base, *at, Self::place_menu(t))
+            }
+            Some(CanvasOverlay::ElementMenu { at, id, .. }) => {
+                self.overlay_at(base, *at, self.element_menu(t, id))
+            }
+            Some(CanvasOverlay::LabelEdit { at, id }) => {
+                self.overlay_at(base, *at, self.inline_editor(t, id))
+            }
             None => base,
         }
-    }
-
-    /// Stacks the right-click placement menu over the layout: a transparent
-    /// click-catcher that closes it, then the menu itself at the cursor.
-    fn with_context_menu<'a>(
-        &'a self,
-        base: Element<'a, Message>,
-        at: iced::Point,
-        t: Tokens,
-    ) -> Element<'a, Message> {
-        const MENU_WIDTH: f32 = 190.0;
-        const MENU_HEIGHT: f32 = 420.0;
-
-        let mut list = column![].spacing(2);
-        for (section, entries) in Self::PALETTE {
-            if *section == "Tools" {
-                continue; // only placeables belong in the menu
-            }
-            list = list.push(
-                text(*section)
-                    .font(theme::SANS_MEDIUM)
-                    .size(11)
-                    .color(t.muted),
-            );
-            for (label, target) in *entries {
-                let (glyph, message): (Element<'_, Message>, Message) = match target {
-                    Tool::Place(kind) => (
-                        icons::shape_glyph(icons::ShapeGlyph::Node(*kind), t.canvas),
-                        Message::ContextPlace(*kind),
-                    ),
-                    Tool::PlacePool => (
-                        icons::shape_glyph(icons::ShapeGlyph::Pool, t.canvas),
-                        Message::ContextPlacePool,
-                    ),
-                    _ => continue,
-                };
-                list = list.push(
-                    button(
-                        row![container(glyph).width(26), text(*label).size(12)]
-                            .spacing(4)
-                            .align_y(Center),
-                    )
-                    .style(theme::palette_button(t, false))
-                    .padding([1, 6])
-                    .width(Fill)
-                    .on_press(message),
-                );
-            }
-        }
-
-        let menu = container(scrollable(list).height(iced::Shrink))
-            .style(move |_| theme::context_menu(t))
-            .padding(8)
-            .width(MENU_WIDTH)
-            .max_height(MENU_HEIGHT);
-
-        // Clamp so the menu never runs off the window.
-        let x =
-            at.x.min(self.window_size.width - MENU_WIDTH - 12.0)
-                .max(0.0);
-        let y = at
-            .y
-            .min(self.window_size.height - MENU_HEIGHT.min(self.window_size.height * 0.6) - 40.0)
-            .max(0.0);
-
-        iced::widget::stack![
-            base,
-            iced::widget::mouse_area(space::vertical().width(Fill).height(Fill))
-                .on_press(Message::CloseContextMenu)
-                .on_right_press(Message::CloseContextMenu),
-            container(menu).padding(iced::Padding {
-                top: y,
-                left: x,
-                right: 0.0,
-                bottom: 0.0,
-            }),
-        ]
-        .into()
     }
 
     fn issues_panel(&self, t: Tokens) -> Element<'_, Message> {
@@ -1551,35 +1509,194 @@ impl App {
             .into()
     }
 
-    /// The palette catalog: section headers interleaved with placeable tools.
-    const PALETTE: &'static [(&'static str, &'static [(&'static str, Tool)])] = &[
-        (
-            "Tools",
-            &[("Select", Tool::Select), ("Connect", Tool::Connect)],
-        ),
+    /// Stacks `content` over the layout at a clamped window point, with a
+    /// transparent click-catcher that closes the overlay.
+    fn overlay_at<'a>(
+        &'a self,
+        base: Element<'a, Message>,
+        at: iced::Point,
+        content: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        const WIDTH: f32 = 190.0;
+        const MAX_HEIGHT: f32 = 420.0;
+
+        let x = at.x.min(self.window_size.width - WIDTH - 12.0).max(0.0);
+        let y = at
+            .y
+            .min(self.window_size.height - MAX_HEIGHT.min(self.window_size.height * 0.6) - 40.0)
+            .max(0.0);
+
+        iced::widget::stack![
+            base,
+            iced::widget::mouse_area(space::vertical().width(Fill).height(Fill))
+                .on_press(Message::CloseOverlay)
+                .on_right_press(Message::CloseOverlay),
+            container(content).padding(iced::Padding {
+                top: y,
+                left: x,
+                right: 0.0,
+                bottom: 0.0,
+            }),
+        ]
+        .into()
+    }
+
+    /// One slim overlay-menu entry: a mini glyph (when given) plus a label.
+    fn overlay_entry<'a>(
+        t: Tokens,
+        glyph: Option<Element<'a, Message>>,
+        label: &'a str,
+        message: Message,
+    ) -> Element<'a, Message> {
+        let mut content = row![].spacing(4).align_y(Center);
+        if let Some(glyph) = glyph {
+            content = content.push(container(glyph).width(26));
+        }
+        content = content.push(text(label).size(12));
+        button(content)
+            .style(theme::palette_button(t, false))
+            .padding([1, 6])
+            .width(Fill)
+            .on_press(message)
+            .into()
+    }
+
+    /// The placement catalog shown on empty-space right-click.
+    fn place_menu(t: Tokens) -> Element<'static, Message> {
+        let mut list = column![].spacing(2);
+        for (section, entries) in Self::PALETTE {
+            list = list.push(
+                text(*section)
+                    .font(theme::SANS_MEDIUM)
+                    .size(11)
+                    .color(t.muted),
+            );
+            for (label, placeable) in *entries {
+                let glyph = match placeable {
+                    Placeable::Node(kind) => {
+                        icons::shape_glyph(icons::ShapeGlyph::Node(*kind), t.canvas)
+                    }
+                    Placeable::Pool => icons::shape_glyph(icons::ShapeGlyph::Pool, t.canvas),
+                };
+                list = list.push(Self::overlay_entry(
+                    t,
+                    Some(glyph),
+                    label,
+                    Message::ContextPlace(*placeable),
+                ));
+            }
+        }
+
+        container(scrollable(list).height(iced::Shrink))
+            .style(move |_| theme::context_menu(t))
+            .padding(8)
+            .width(190)
+            .max_height(420)
+            .into()
+    }
+
+    /// The small menu shown on element right-click.
+    fn element_menu(&self, t: Tokens, id: &BpmnId) -> Element<'_, Message> {
+        let mut list = column![].spacing(2);
+        let is_activity = matches!(
+            self.session.document().flow_element_index().get(id),
+            Some(FlowElement::Activity(_))
+        );
+        if is_activity {
+            list = list.push(Self::overlay_entry(
+                t,
+                Some(icons::shape_glyph(
+                    icons::ShapeGlyph::Node(NodeKind::Boundary),
+                    t.canvas,
+                )),
+                "Add boundary event",
+                Message::AddBoundaryHere,
+            ));
+        }
+        list = list.push(Self::overlay_entry(t, None, "Rename", Message::RenameHere));
+        list = list.push(Self::overlay_entry(
+            t,
+            None,
+            "Delete",
+            Message::DeleteSelection,
+        ));
+
+        container(list)
+            .style(move |_| theme::context_menu(t))
+            .padding(8)
+            .width(180)
+            .into()
+    }
+
+    /// The floating name editor opened by a double-click.
+    fn inline_editor(&self, t: Tokens, id: &BpmnId) -> Element<'_, Message> {
+        let name = self
+            .session
+            .document()
+            .flow_element_index()
+            .get(id)
+            .and_then(|element| element.name())
+            .map(str::to_string)
+            .or_else(|| {
+                let document = self.session.document();
+                document
+                    .participant(id)
+                    .and_then(|p| p.name.clone())
+                    .or_else(|| document.lane(id).and_then(|l| l.name.clone()))
+                    .or_else(|| {
+                        document
+                            .message_flows()
+                            .find(|m| m.base.id == *id)
+                            .and_then(|m| m.name.clone())
+                    })
+            })
+            .unwrap_or_default();
+
+        container(
+            text_input("Name", &name)
+                .id(Self::inline_input_id())
+                .on_input(Message::NameEdited)
+                .on_submit(Message::CloseOverlay)
+                .size(13)
+                .width(170),
+        )
+        .style(move |_| theme::context_menu(t))
+        .padding(6)
+        .into()
+    }
+
+    /// The width the side panels occupy, honoring the collapsed state.
+    /// The placement catalog: section headers with placeable elements.
+    /// (Boundary events live in the element menu — they need a host.)
+    const PALETTE: &'static [(&'static str, &'static [(&'static str, Placeable)])] = &[
         (
             "Events",
             &[
-                ("Start", Tool::Place(NodeKind::StartEvent)),
-                ("Catch", Tool::Place(NodeKind::IntermediateCatch)),
-                ("Throw", Tool::Place(NodeKind::IntermediateThrow)),
-                ("Boundary", Tool::Place(NodeKind::Boundary)),
-                ("End", Tool::Place(NodeKind::EndEvent)),
+                ("Start", Placeable::Node(NodeKind::StartEvent)),
+                ("Catch", Placeable::Node(NodeKind::IntermediateCatch)),
+                ("Throw", Placeable::Node(NodeKind::IntermediateThrow)),
+                ("End", Placeable::Node(NodeKind::EndEvent)),
             ],
         ),
         (
             "Tasks",
             &[
-                ("Task", Tool::Place(NodeKind::Task(TaskType::Generic))),
-                ("User", Tool::Place(NodeKind::Task(TaskType::User))),
-                ("Service", Tool::Place(NodeKind::Task(TaskType::Service))),
-                ("Script", Tool::Place(NodeKind::Task(TaskType::Script))),
-                ("Manual", Tool::Place(NodeKind::Task(TaskType::Manual))),
-                ("Send", Tool::Place(NodeKind::Task(TaskType::Send))),
-                ("Receive", Tool::Place(NodeKind::Task(TaskType::Receive))),
+                ("Task", Placeable::Node(NodeKind::Task(TaskType::Generic))),
+                ("User", Placeable::Node(NodeKind::Task(TaskType::User))),
+                (
+                    "Service",
+                    Placeable::Node(NodeKind::Task(TaskType::Service)),
+                ),
+                ("Script", Placeable::Node(NodeKind::Task(TaskType::Script))),
+                ("Manual", Placeable::Node(NodeKind::Task(TaskType::Manual))),
+                ("Send", Placeable::Node(NodeKind::Task(TaskType::Send))),
+                (
+                    "Receive",
+                    Placeable::Node(NodeKind::Task(TaskType::Receive)),
+                ),
                 (
                     "Business rule",
-                    Tool::Place(NodeKind::Task(TaskType::BusinessRule)),
+                    Placeable::Node(NodeKind::Task(TaskType::BusinessRule)),
                 ),
             ],
         ),
@@ -1588,27 +1705,27 @@ impl App {
             &[
                 (
                     "Subprocess",
-                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Embedded)),
+                    Placeable::Node(NodeKind::SubProcess(SubProcessKind::Embedded)),
                 ),
                 (
                     "Event subproc.",
-                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Event)),
+                    Placeable::Node(NodeKind::SubProcess(SubProcessKind::Event)),
                 ),
                 (
                     "Transaction",
-                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Transaction)),
+                    Placeable::Node(NodeKind::SubProcess(SubProcessKind::Transaction)),
                 ),
-                ("Call activity", Tool::Place(NodeKind::CallActivity)),
+                ("Call activity", Placeable::Node(NodeKind::CallActivity)),
             ],
         ),
-        ("Collaboration", &[("Pool", Tool::PlacePool)]),
+        ("Collaboration", &[("Pool", Placeable::Pool)]),
         (
             "Data & artifacts",
             &[
-                ("Data object", Tool::Place(NodeKind::DataObject)),
-                ("Data store", Tool::Place(NodeKind::DataStore)),
-                ("Annotation", Tool::Place(NodeKind::TextAnnotation)),
-                ("Group", Tool::Place(NodeKind::Group)),
+                ("Data object", Placeable::Node(NodeKind::DataObject)),
+                ("Data store", Placeable::Node(NodeKind::DataStore)),
+                ("Annotation", Placeable::Node(NodeKind::TextAnnotation)),
+                ("Group", Placeable::Node(NodeKind::Group)),
             ],
         ),
         (
@@ -1616,81 +1733,23 @@ impl App {
             &[
                 (
                     "Exclusive",
-                    Tool::Place(NodeKind::Gateway(GatewayKind::Exclusive)),
+                    Placeable::Node(NodeKind::Gateway(GatewayKind::Exclusive)),
                 ),
                 (
                     "Parallel",
-                    Tool::Place(NodeKind::Gateway(GatewayKind::Parallel)),
+                    Placeable::Node(NodeKind::Gateway(GatewayKind::Parallel)),
                 ),
                 (
                     "Inclusive",
-                    Tool::Place(NodeKind::Gateway(GatewayKind::Inclusive)),
+                    Placeable::Node(NodeKind::Gateway(GatewayKind::Inclusive)),
                 ),
                 (
                     "Event-based",
-                    Tool::Place(NodeKind::Gateway(GatewayKind::EventBased)),
+                    Placeable::Node(NodeKind::Gateway(GatewayKind::EventBased)),
                 ),
             ],
         ),
     ];
-
-    fn palette(&self, t: Tokens) -> Element<'_, Message> {
-        if !self.palette_open {
-            return Self::collapsed_panel(t, icons::PANEL_LEFT, Message::TogglePalette);
-        }
-
-        let entry = |label: &'static str, target: Tool| {
-            let glyph: Element<'_, Message> = match target {
-                Tool::Place(kind) => icons::shape_glyph(icons::ShapeGlyph::Node(kind), t.canvas),
-                Tool::PlacePool => icons::shape_glyph(icons::ShapeGlyph::Pool, t.canvas),
-                Tool::Select => icons::icon(icons::SELECT).into(),
-                Tool::Connect => icons::icon(icons::CONNECT).into(),
-            };
-            button(
-                row![container(glyph).width(26), text(label).size(13)]
-                    .spacing(4)
-                    .align_y(Center),
-            )
-            .style(theme::palette_button(t, self.tool == target))
-            .padding([2, 6])
-            .width(Fill)
-            .on_press(Message::ToolSelected(target))
-        };
-
-        let mut list = column![].spacing(4);
-        for (section, entries) in Self::PALETTE {
-            if *section != "Tools" {
-                list = list.push(text(*section).font(theme::SANS_MEDIUM).size(14));
-            }
-            for (label, target) in *entries {
-                list = list.push(entry(label, *target));
-            }
-        }
-
-        let header = row![
-            text("Tools").font(theme::SANS_MEDIUM).size(14),
-            space::horizontal(),
-            button(icons::icon(icons::CHEVRON_LEFT))
-                .style(theme::tool_button(t))
-                .padding([2, 6])
-                .on_press(Message::TogglePalette),
-        ]
-        .align_y(Center);
-
-        // Clearance so the traffic lights do not cover the header.
-        let padding = if cfg!(target_os = "macos") {
-            iced::Padding::from(10).top(34)
-        } else {
-            iced::Padding::from(10)
-        };
-
-        container(column![header, scrollable(list)].spacing(8))
-            .style(move |_| theme::panel(t))
-            .padding(padding)
-            .width(170)
-            .height(Fill)
-            .into()
-    }
 
     /// A collapsed side panel: a slim strip holding only the reopen button.
     fn collapsed_panel(t: Tokens, glyph: char, message: Message) -> Element<'static, Message> {
@@ -2002,14 +2061,8 @@ impl App {
     }
 
     fn status_bar(&self, t: Tokens) -> Element<'_, Message> {
-        let hint = match self.tool {
-            Tool::Select => "drag to pan · shift-drag to select · right-click to add elements",
-            Tool::Place(_) => "click to place · Esc to cancel",
-            Tool::PlacePool => "click to place a pool · Esc to cancel",
-            Tool::Connect => {
-                "click source, then target · cross-pool connections become message flows"
-            }
-        };
+        let hint =
+            "right-click to add · double-click to rename · drag to pan · shift-drag to select";
         let info: Element<'_, Message> = match &self.status {
             Some(line) => text(line.text.clone())
                 .size(11)
