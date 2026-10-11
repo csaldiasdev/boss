@@ -9,10 +9,10 @@ use crate::ns;
 use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiElement};
 use bpmn_core::geometry::Bounds;
 use bpmn_core::model::{
-    Activity, ActivityKind, BaseElement, Collaboration, Condition, Definitions, Event,
-    EventDefinition, EventDefinitionBody, EventPosition, FlowElement, FlowNode, Gateway,
-    GatewayKind, Lane, LaneSet, LoopKind, LoopMarker, Process, RootElement, SequenceFlow,
-    SubProcessKind, TaskType,
+    Activity, ActivityKind, Artifact, ArtifactKind, BaseElement, Collaboration, Condition,
+    DataElement, DataKind, Definitions, Event, EventDefinition, EventDefinitionBody, EventPosition,
+    FlowElement, FlowNode, Gateway, GatewayKind, Lane, LaneSet, LoopKind, LoopMarker, Process,
+    RootElement, SequenceFlow, SubProcessKind, TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::escape::escape;
@@ -459,7 +459,76 @@ impl Emitter {
             FlowElement::Activity(activity) => self.activity(activity),
             FlowElement::Gateway(gateway) => self.gateway(gateway),
             FlowElement::SequenceFlow(flow) => self.sequence_flow(flow),
+            FlowElement::Data(data) => self.data_element(data),
+            FlowElement::Artifact(artifact) => self.artifact(artifact),
             FlowElement::Unknown(raw) => self.raw(raw),
+        }
+    }
+
+    fn data_element(&mut self, data: &DataElement) {
+        let mut attrs = Attrs::default();
+        attrs.push_id("id", &data.base.id);
+        attrs.push_opt("name", data.name.as_deref());
+        let local = match &data.kind {
+            DataKind::Object => "dataObject",
+            DataKind::ObjectReference { data_object_ref } => {
+                attrs.push_id_opt("dataObjectRef", data_object_ref.as_ref());
+                "dataObjectReference"
+            }
+            DataKind::StoreReference { data_store_ref } => {
+                attrs.push_id_opt("dataStoreRef", data_store_ref.as_ref());
+                "dataStoreReference"
+            }
+        };
+        attrs.push_unknown(&data.base.unknown_attrs);
+        let tag = self.model_tag(local);
+        self.base_only(&tag, &attrs, &data.base);
+    }
+
+    fn artifact(&mut self, artifact: &Artifact) {
+        let mut attrs = Attrs::default();
+        attrs.push_id("id", &artifact.base.id);
+        match &artifact.kind {
+            ArtifactKind::TextAnnotation { text } => {
+                attrs.push_unknown(&artifact.base.unknown_attrs);
+                let tag = self.model_tag("textAnnotation");
+                let has_children = text.is_some()
+                    || !artifact.base.documentation.is_empty()
+                    || artifact.base.extension_elements.is_some()
+                    || !artifact.base.unknown_children.is_empty();
+                if !has_children {
+                    self.empty(&tag, &attrs);
+                    return;
+                }
+                self.open(&tag, &attrs);
+                self.base_children(&artifact.base);
+                if let Some(text) = text {
+                    let text_tag = self.model_tag("text");
+                    self.text_element(&text_tag, text);
+                }
+                for raw in &artifact.base.unknown_children {
+                    self.raw(raw);
+                }
+                self.close(&tag);
+            }
+            ArtifactKind::Association {
+                source,
+                target,
+                direction,
+            } => {
+                attrs.push_id("sourceRef", source);
+                attrs.push_id("targetRef", target);
+                attrs.push_opt("associationDirection", direction.as_deref());
+                attrs.push_unknown(&artifact.base.unknown_attrs);
+                let tag = self.model_tag("association");
+                self.base_only(&tag, &attrs, &artifact.base);
+            }
+            ArtifactKind::Group { category_value_ref } => {
+                attrs.push_opt("categoryValueRef", category_value_ref.as_deref());
+                attrs.push_unknown(&artifact.base.unknown_attrs);
+                let tag = self.model_tag("group");
+                self.base_only(&tag, &attrs, &artifact.base);
+            }
         }
     }
 

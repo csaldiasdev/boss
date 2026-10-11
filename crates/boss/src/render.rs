@@ -9,8 +9,9 @@ use crate::theme::CanvasTokens;
 use bpmn_core::Document;
 use bpmn_core::di::{BpmnLabel, BpmnShape, DiElement};
 use bpmn_core::model::{
-    Activity, ActivityKind, Event as BpmnEvent, EventDefinitionKind, EventPosition, FlowElement,
-    Gateway, GatewayKind, LoopKind, Process, RootElement, SubProcessKind, TaskType,
+    Activity, ActivityKind, Artifact, ArtifactKind, DataElement, DataKind, Event as BpmnEvent,
+    EventDefinitionKind, EventPosition, FlowElement, Gateway, GatewayKind, LoopKind, Process,
+    RootElement, SubProcessKind, TaskType,
 };
 use iced::alignment::Vertical;
 use iced::widget::canvas::path::Builder;
@@ -191,14 +192,19 @@ fn draw_edges(
                 frame.stroke(&path, dashed);
                 message_flow_caps(frame, &points, stroke, tokens);
                 name = *message_name;
-            } else {
+            } else if let Some(FlowElement::SequenceFlow(flow)) =
+                index.get(&edge.bpmn_element).copied()
+            {
                 frame.stroke(&path, stroke);
                 arrowhead(frame, &points, tokens);
-                if let Some(FlowElement::SequenceFlow(flow)) =
-                    index.get(&edge.bpmn_element).copied()
-                {
-                    name = flow.name.as_deref();
-                }
+                name = flow.name.as_deref();
+            } else {
+                // Associations — and edges we do not model, like the data
+                // input/output associations of foreign files — draw dotted
+                // without an arrowhead.
+                let mut dotted = stroke;
+                dotted.line_dash.segments = &[2.0, 4.0];
+                frame.stroke(&path, dotted);
             }
 
             if let Some(name) = name {
@@ -312,6 +318,12 @@ fn draw_shape(
         Some(FlowElement::Gateway(gateway)) => {
             draw_gateway(frame, gateway, shape, bounds, stroke, stroke_width, tokens);
         }
+        Some(FlowElement::Data(data)) => {
+            draw_data(frame, data, shape, bounds, stroke, tokens);
+        }
+        Some(FlowElement::Artifact(artifact)) => {
+            draw_artifact(frame, artifact, bounds, stroke, tokens);
+        }
         // Sequence flows have edges, not shapes; anything unmodeled
         // renders as an honest dashed placeholder.
         Some(FlowElement::SequenceFlow(_) | FlowElement::Unknown(_)) | None => {
@@ -321,6 +333,124 @@ fn draw_shape(
             dashed.line_dash.segments = &[6.0, 4.0];
             frame.stroke(&path, dashed);
         }
+    }
+}
+
+/// Data shapes: a document with a folded corner for object references, a
+/// cylinder for store references. Labels sit below the shape.
+fn draw_data(
+    frame: &mut Frame,
+    data: &DataElement,
+    shape: &BpmnShape,
+    bounds: Rectangle,
+    stroke: Stroke<'_>,
+    tokens: CanvasTokens,
+) {
+    match data.kind {
+        DataKind::Object | DataKind::ObjectReference { .. } => {
+            let fold = (bounds.width * 0.3).min(14.0);
+            let page = Path::new(|b| {
+                b.move_to(Point::new(bounds.x, bounds.y));
+                b.line_to(Point::new(bounds.x + bounds.width - fold, bounds.y));
+                b.line_to(Point::new(bounds.x + bounds.width, bounds.y + fold));
+                b.line_to(Point::new(
+                    bounds.x + bounds.width,
+                    bounds.y + bounds.height,
+                ));
+                b.line_to(Point::new(bounds.x, bounds.y + bounds.height));
+                b.close();
+            });
+            frame.fill(&page, tokens.fill);
+            frame.stroke(&page, stroke);
+            let corner = Path::new(|b| {
+                b.move_to(Point::new(bounds.x + bounds.width - fold, bounds.y));
+                b.line_to(Point::new(bounds.x + bounds.width - fold, bounds.y + fold));
+                b.line_to(Point::new(bounds.x + bounds.width, bounds.y + fold));
+            });
+            frame.stroke(&corner, stroke);
+        }
+        DataKind::StoreReference { .. } => {
+            let rx = bounds.width / 2.0;
+            let ry = (bounds.height * 0.12).min(10.0);
+            let center_x = bounds.x + rx;
+            let body = Path::new(|b| {
+                b.move_to(Point::new(bounds.x, bounds.y + ry));
+                b.arc_to(
+                    Point::new(center_x, bounds.y - ry * 0.4),
+                    Point::new(bounds.x + bounds.width, bounds.y + ry),
+                    rx,
+                );
+                b.line_to(Point::new(
+                    bounds.x + bounds.width,
+                    bounds.y + bounds.height - ry,
+                ));
+                b.arc_to(
+                    Point::new(center_x, bounds.y + bounds.height + ry * 0.4),
+                    Point::new(bounds.x, bounds.y + bounds.height - ry),
+                    rx,
+                );
+                b.close();
+            });
+            frame.fill(&body, tokens.fill);
+            frame.stroke(&body, stroke);
+            // The lid ellipse, approximated with two arcs worth of curve.
+            for offset in [0.0, 3.0, 6.0] {
+                let lid = Path::new(|b| {
+                    b.move_to(Point::new(bounds.x, bounds.y + ry + offset));
+                    b.quadratic_curve_to(
+                        Point::new(center_x, bounds.y + ry * 2.6 + offset),
+                        Point::new(bounds.x + bounds.width, bounds.y + ry + offset),
+                    );
+                });
+                frame.stroke(&lid, stroke);
+            }
+        }
+    }
+
+    if let Some(name) = &data.name {
+        outside_label(frame, name, shape.label.as_ref(), bounds, tokens);
+    }
+}
+
+/// Artifacts: an open bracket plus text for annotations, a dashed rounded
+/// rectangle for groups (associations are edges and never reach here).
+fn draw_artifact(
+    frame: &mut Frame,
+    artifact: &Artifact,
+    bounds: Rectangle,
+    stroke: Stroke<'_>,
+    tokens: CanvasTokens,
+) {
+    match &artifact.kind {
+        ArtifactKind::TextAnnotation { text } => {
+            let bracket = Path::new(|b| {
+                b.move_to(Point::new(bounds.x + 10.0, bounds.y));
+                b.line_to(Point::new(bounds.x, bounds.y));
+                b.line_to(Point::new(bounds.x, bounds.y + bounds.height));
+                b.line_to(Point::new(bounds.x + 10.0, bounds.y + bounds.height));
+            });
+            frame.stroke(&bracket, stroke);
+            if let Some(text) = text {
+                frame.fill_text(Text {
+                    content: text.clone(),
+                    position: Point::new(bounds.x + 7.0, bounds.y + bounds.height / 2.0),
+                    max_width: bounds.width - 10.0,
+                    color: tokens.label,
+                    size: 11.0.into(),
+                    font: theme::SANS,
+                    align_y: Vertical::Center,
+                    ..Text::default()
+                });
+            }
+        }
+        ArtifactKind::Group { .. } => {
+            let path =
+                Path::rounded_rectangle(bounds.position(), bounds.size(), TASK_RADIUS.into());
+            let mut dashed = stroke;
+            dashed.line_dash.segments = &[8.0, 4.0, 2.0, 4.0];
+            frame.stroke(&path, dashed);
+        }
+        ArtifactKind::Association { .. } => {}
     }
 }
 

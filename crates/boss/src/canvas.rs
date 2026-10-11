@@ -229,6 +229,34 @@ impl View<'_> {
             if hidden.contains(id) {
                 continue;
             }
+            // Groups are transparent: they respond only near their border so
+            // the diagram inside stays clickable.
+            if let Some(bpmn_core::model::FlowElement::Artifact(artifact)) = index.get(id).copied()
+                && matches!(artifact.kind, bpmn_core::model::ArtifactKind::Group { .. })
+            {
+                let b = shape.bounds;
+                let margin = f64::from(6.0 / self.camera.scaling);
+                let outer = bpmn_core::Bounds::new(
+                    b.x - margin,
+                    b.y - margin,
+                    b.width + margin * 2.0,
+                    b.height + margin * 2.0,
+                );
+                let inner = bpmn_core::Bounds::new(
+                    b.x + margin,
+                    b.y + margin,
+                    (b.width - margin * 2.0).max(0.0),
+                    (b.height - margin * 2.0).max(0.0),
+                );
+                if outer.contains(world) && !inner.contains(world) {
+                    // A border hit is thin; let it win like a band would.
+                    let area = b.width * margin * 4.0;
+                    if best.as_ref().is_none_or(|(_, a)| area < *a) {
+                        best = Some((id.clone(), area));
+                    }
+                }
+                continue;
+            }
             let (hit, area) = match index.get(id).copied().and_then(outline_of) {
                 Some(outline) => (
                     outline.contains(shape.bounds, world),

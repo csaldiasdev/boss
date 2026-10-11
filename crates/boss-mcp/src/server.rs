@@ -2,7 +2,8 @@
 
 use crate::bridge::{ApplyOutcome, EditAction, EditorHandle};
 use bpmn_core::model::{
-    ActivityKind, EventPosition, FlowElement, GatewayKind, SubProcessKind, TaskType,
+    ActivityKind, ArtifactKind, DataKind, EventPosition, FlowElement, GatewayKind, SubProcessKind,
+    TaskType,
 };
 use bpmn_core::{BpmnId, Document, NodeKind};
 use rmcp::handler::server::wrapper::Parameters;
@@ -54,6 +55,16 @@ fn kind_label(element: &FlowElement) -> &'static str {
             GatewayKind::Complex => "complex-gateway",
         },
         FlowElement::SequenceFlow(_) => "sequence-flow",
+        FlowElement::Data(data) => match data.kind {
+            DataKind::Object => "data-object-declaration",
+            DataKind::ObjectReference { .. } => "data-object",
+            DataKind::StoreReference { .. } => "data-store",
+        },
+        FlowElement::Artifact(artifact) => match artifact.kind {
+            ArtifactKind::TextAnnotation { .. } => "text-annotation",
+            ArtifactKind::Association { .. } => "association",
+            ArtifactKind::Group { .. } => "group",
+        },
         FlowElement::Unknown(_) => "unknown",
     }
 }
@@ -76,6 +87,10 @@ fn parse_kind(kind: &str) -> Option<NodeKind> {
         "event-subprocess" => NodeKind::SubProcess(SubProcessKind::Event),
         "transaction" => NodeKind::SubProcess(SubProcessKind::Transaction),
         "call-activity" => NodeKind::CallActivity,
+        "data-object" => NodeKind::DataObject,
+        "data-store" => NodeKind::DataStore,
+        "text-annotation" => NodeKind::TextAnnotation,
+        "group" => NodeKind::Group,
         "exclusive-gateway" => NodeKind::Gateway(GatewayKind::Exclusive),
         "parallel-gateway" => NodeKind::Gateway(GatewayKind::Parallel),
         "inclusive-gateway" => NodeKind::Gateway(GatewayKind::Inclusive),
@@ -108,6 +123,13 @@ fn element_info(document: &Document, element: &FlowElement) -> Option<ElementInf
         FlowElement::SequenceFlow(flow) => (
             Some(flow.source.as_str().to_string()),
             Some(flow.target.as_str().to_string()),
+        ),
+        FlowElement::Artifact(bpmn_core::model::Artifact {
+            kind: ArtifactKind::Association { source, target, .. },
+            ..
+        }) => (
+            Some(source.as_str().to_string()),
+            Some(target.as_str().to_string()),
         ),
         _ => (None, None),
     };
@@ -173,8 +195,10 @@ struct CreateNodeParams {
     /// manual-task, send-task, receive-task, business-rule-task, subprocess,
     /// event-subprocess, transaction, call-activity, exclusive-gateway,
     /// parallel-gateway, inclusive-gateway, event-based-gateway,
-    /// complex-gateway. Subprocesses are placed expanded (350x200); a node
-    /// created inside their area becomes part of the subprocess.
+    /// complex-gateway, data-object, data-store, text-annotation, group.
+    /// Subprocesses are placed expanded (350x200); a node created inside
+    /// their area becomes part of the subprocess. Connecting an annotation or
+    /// data element to a node makes a dotted association.
     kind: String,
     /// Diagram x of the element center (typical diagrams span 150..1200).
     x: f64,

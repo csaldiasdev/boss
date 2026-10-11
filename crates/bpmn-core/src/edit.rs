@@ -10,10 +10,11 @@ use crate::document::Document;
 use crate::geometry::{Bounds, Point, Size};
 use crate::ids::BpmnId;
 use crate::model::{
-    Activity, ActivityKind, BOSS_TARGET_NAMESPACE, BaseElement, CallActivity, Collaboration,
-    Condition, Definitions, Event, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind,
-    Lane, LaneSet, LoopKind, LoopMarker, MessageFlow, Participant, Process, RootElement,
-    SequenceFlow, SubProcess, SubProcessKind, TaskType,
+    Activity, ActivityKind, Artifact, ArtifactKind, BOSS_TARGET_NAMESPACE, BaseElement,
+    CallActivity, Collaboration, Condition, DataElement, DataKind, Definitions, Event,
+    EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, Lane, LaneSet, LoopKind,
+    LoopMarker, MessageFlow, Participant, Process, RootElement, SequenceFlow, SubProcess,
+    SubProcessKind, TaskType,
 };
 use std::collections::HashSet;
 
@@ -38,6 +39,14 @@ pub enum NodeKind {
     SubProcess(SubProcessKind),
     /// A call activity.
     CallActivity,
+    /// A data object reference (also creates its backing `dataObject`).
+    DataObject,
+    /// A data store reference.
+    DataStore,
+    /// A text annotation.
+    TextAnnotation,
+    /// A group.
+    Group,
 }
 
 impl NodeKind {
@@ -50,8 +59,11 @@ impl NodeKind {
             | NodeKind::IntermediateThrow
             | NodeKind::Boundary => Size::new(36.0, 36.0),
             NodeKind::Task(_) | NodeKind::CallActivity => Size::new(100.0, 80.0),
-            NodeKind::Gateway(_) => Size::new(50.0, 50.0),
+            NodeKind::Gateway(_) | NodeKind::DataStore => Size::new(50.0, 50.0),
             NodeKind::SubProcess(_) => Size::new(350.0, 200.0),
+            NodeKind::DataObject => Size::new(36.0, 50.0),
+            NodeKind::TextAnnotation => Size::new(120.0, 40.0),
+            NodeKind::Group => Size::new(300.0, 200.0),
         }
     }
 
@@ -64,6 +76,10 @@ impl NodeKind {
             | NodeKind::Boundary => "Event",
             NodeKind::Task(_) | NodeKind::SubProcess(_) | NodeKind::CallActivity => "Activity",
             NodeKind::Gateway(_) => "Gateway",
+            NodeKind::DataObject => "DataObjectReference",
+            NodeKind::DataStore => "DataStoreReference",
+            NodeKind::TextAnnotation => "TextAnnotation",
+            NodeKind::Group => "Group",
         }
     }
 }
@@ -133,12 +149,16 @@ impl Outline {
     }
 }
 
-/// The outline of a modeled flow node.
+/// The outline of a modeled flow node, data element, or boxy artifact.
 pub fn outline_of(element: &FlowElement) -> Option<Outline> {
     match element {
         FlowElement::Event(_) => Some(Outline::Circle),
-        FlowElement::Activity(_) => Some(Outline::Rect),
+        FlowElement::Activity(_) | FlowElement::Data(_) => Some(Outline::Rect),
         FlowElement::Gateway(_) => Some(Outline::Diamond),
+        FlowElement::Artifact(artifact) => match artifact.kind {
+            ArtifactKind::TextAnnotation { .. } | ArtifactKind::Group { .. } => Some(Outline::Rect),
+            ArtifactKind::Association { .. } => None,
+        },
         FlowElement::SequenceFlow(_) | FlowElement::Unknown(_) => None,
     }
 }
@@ -398,19 +418,52 @@ impl Document {
         })
     }
 
-    /// Creates a flow node of `kind` centered at `center`; returns its id.
-    /// The node lands in the expanded subprocess under `center`, if any.
-    pub fn create_node(&mut self, kind: NodeKind, center: Point) -> Option<BpmnId> {
-        let id = self.fresh_id(kind.id_prefix());
-        let shape_id = BpmnId::new(format!("{id}_di").as_str());
-        let size = kind.default_size();
-        let container = self.container_at(center, &HashSet::new())?;
-
+    /// Builds the semantic element for a palette kind, plus an optional
+    /// backing element (a `dataObject` behind a new object reference).
+    /// Boundary events return `None`: they need a host.
+    fn build_node_element(
+        &self,
+        kind: NodeKind,
+        id: &BpmnId,
+    ) -> Option<(FlowElement, Option<FlowElement>)> {
         let node = FlowNode {
             base: BaseElement::new(id.clone()),
             ..FlowNode::default()
         };
+        let mut backing = None;
         let element = match kind {
+            NodeKind::DataObject => {
+                let object_id = self.fresh_id("DataObject");
+                backing = Some(FlowElement::Data(DataElement {
+                    base: BaseElement::new(object_id.clone()),
+                    name: None,
+                    kind: DataKind::Object,
+                }));
+                FlowElement::Data(DataElement {
+                    base: BaseElement::new(id.clone()),
+                    name: None,
+                    kind: DataKind::ObjectReference {
+                        data_object_ref: Some(object_id),
+                    },
+                })
+            }
+            NodeKind::DataStore => FlowElement::Data(DataElement {
+                base: BaseElement::new(id.clone()),
+                name: None,
+                kind: DataKind::StoreReference {
+                    data_store_ref: None,
+                },
+            }),
+            NodeKind::TextAnnotation => FlowElement::Artifact(Artifact {
+                base: BaseElement::new(id.clone()),
+                kind: ArtifactKind::TextAnnotation { text: None },
+            }),
+            NodeKind::Group => FlowElement::Artifact(Artifact {
+                base: BaseElement::new(id.clone()),
+                kind: ArtifactKind::Group {
+                    category_value_ref: None,
+                },
+            }),
             NodeKind::StartEvent => FlowElement::Event(Event {
                 node,
                 position: EventPosition::Start {
@@ -460,8 +513,24 @@ impl Document {
                 instantiate: None,
             }),
         };
+        Some((element, backing))
+    }
 
-        self.elements_of_mut(&container)?.push(element);
+    /// Creates a flow node of `kind` centered at `center`; returns its id.
+    /// The node lands in the expanded subprocess under `center`, if any.
+    pub fn create_node(&mut self, kind: NodeKind, center: Point) -> Option<BpmnId> {
+        let id = self.fresh_id(kind.id_prefix());
+        let shape_id = BpmnId::new(format!("{id}_di").as_str());
+        let size = kind.default_size();
+        let container = self.container_at(center, &HashSet::new())?;
+
+        let (element, backing) = self.build_node_element(kind, &id)?;
+
+        let elements = self.elements_of_mut(&container)?;
+        if let Some(backing) = backing {
+            elements.push(backing);
+        }
+        elements.push(element);
         self.plane_mut()?.elements.push(DiElement::Shape(BpmnShape {
             id: Some(shape_id),
             bpmn_element: id.clone(),
@@ -485,16 +554,64 @@ impl Document {
 
     /// Connects two elements: nodes in the same container get a sequence
     /// flow; endpoints in different pools (nodes or the pools themselves) get
-    /// a message flow. Refuses self-connections, unknown endpoints, and nodes
-    /// in different containers of the same process.
+    /// a message flow; anything touching an annotation, group, or data
+    /// element gets a dotted association. Refuses self-connections, unknown
+    /// endpoints, and nodes in different containers of the same process.
     pub fn connect(&mut self, source: &BpmnId, target: &BpmnId) -> Option<BpmnId> {
         if source == target {
             return None;
+        }
+        let artifact_end = |id: &BpmnId| {
+            matches!(
+                self.flow_element_index().get(id),
+                Some(
+                    FlowElement::Data(_)
+                        | FlowElement::Artifact(Artifact {
+                            kind: ArtifactKind::TextAnnotation { .. } | ArtifactKind::Group { .. },
+                            ..
+                        })
+                )
+            )
+        };
+        if artifact_end(source) || artifact_end(target) {
+            return self.connect_association(source, target);
         }
         match (self.container_of(source), self.container_of(target)) {
             (Some(sc), Some(tc)) if sc == tc => self.connect_sequence(source, target, &sc),
             _ => self.connect_message(source, target),
         }
+    }
+
+    /// Creates an `association` between two elements; it lives in the
+    /// source's container (or the target's, when the source sits elsewhere).
+    fn connect_association(&mut self, source: &BpmnId, target: &BpmnId) -> Option<BpmnId> {
+        let container = self
+            .container_of(source)
+            .or_else(|| self.container_of(target))?;
+        let (source_outline, source_bounds) = self.node_outline(source)?;
+        let (target_outline, target_bounds) = self.node_outline(target)?;
+
+        let id = self.fresh_id("Association");
+        let edge_id = BpmnId::new(format!("{id}_di").as_str());
+        let from = source_outline.anchor(source_bounds, target_bounds.center());
+        let to = target_outline.anchor(target_bounds, source_bounds.center());
+
+        self.elements_of_mut(&container)?
+            .push(FlowElement::Artifact(Artifact {
+                base: BaseElement::new(id.clone()),
+                kind: ArtifactKind::Association {
+                    source: source.clone(),
+                    target: target.clone(),
+                    direction: None,
+                },
+            }));
+        self.plane_mut()?.elements.push(DiElement::Edge(BpmnEdge {
+            id: Some(edge_id),
+            bpmn_element: id.clone(),
+            waypoints: vec![from, to],
+            ..BpmnEdge::default()
+        }));
+        Some(id)
     }
 
     fn connect_sequence(
@@ -712,6 +829,10 @@ impl Document {
                 FlowElement::SequenceFlow(flow) => {
                     Some((&flow.base.id, &flow.source, &flow.target))
                 }
+                FlowElement::Artifact(Artifact {
+                    base,
+                    kind: ArtifactKind::Association { source, target, .. },
+                }) => Some((&base.id, source, target)),
                 _ => None,
             })
             .chain(
@@ -781,7 +902,12 @@ impl Document {
                 Some(FlowElement::Event(event)) => {
                     !matches!(event.position, EventPosition::Boundary { .. })
                 }
-                Some(FlowElement::Activity(_) | FlowElement::Gateway(_)) => true,
+                Some(FlowElement::Activity(_) | FlowElement::Gateway(_) | FlowElement::Data(_)) => {
+                    true
+                }
+                Some(FlowElement::Artifact(artifact)) => {
+                    !matches!(artifact.kind, ArtifactKind::Association { .. })
+                }
                 _ => false,
             };
             if !movable {
@@ -824,6 +950,53 @@ impl Document {
         }
         for (id, to) in flow_moves {
             self.relocate(&id, &to);
+        }
+    }
+
+    /// Copies the DI of every mapped element from `source`, reminted and
+    /// offset by `(dx, dy)`.
+    fn paste_di(
+        &mut self,
+        source: &Document,
+        mapping: &std::collections::HashMap<BpmnId, BpmnId>,
+        dx: f64,
+        dy: f64,
+    ) {
+        let remap = |id: &BpmnId| mapping.get(id).cloned().unwrap_or_else(|| id.clone());
+        let mut di = Vec::new();
+        if let Some(plane) = source.diagram().and_then(|d| d.plane.as_ref()) {
+            for element in &plane.elements {
+                match element {
+                    DiElement::Shape(shape) if mapping.contains_key(&shape.bpmn_element) => {
+                        let mut shape = shape.clone();
+                        shape.bpmn_element = remap(&shape.bpmn_element);
+                        shape.id = Some(BpmnId::new(format!("{}_di", shape.bpmn_element).as_str()));
+                        shape.bounds.x += dx;
+                        shape.bounds.y += dy;
+                        if let Some(label) = &mut shape.label {
+                            shape_label_offset(label, dx, dy);
+                        }
+                        di.push(DiElement::Shape(shape));
+                    }
+                    DiElement::Edge(edge) if mapping.contains_key(&edge.bpmn_element) => {
+                        let mut edge = edge.clone();
+                        edge.bpmn_element = remap(&edge.bpmn_element);
+                        edge.id = Some(BpmnId::new(format!("{}_di", edge.bpmn_element).as_str()));
+                        for point in &mut edge.waypoints {
+                            point.x += dx;
+                            point.y += dy;
+                        }
+                        if let Some(label) = &mut edge.label {
+                            shape_label_offset(label, dx, dy);
+                        }
+                        di.push(DiElement::Edge(edge));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(plane) = self.plane_mut() {
+            plane.elements.extend(di);
         }
     }
 
@@ -1363,10 +1536,19 @@ impl Document {
             doomed.extend(self.pool_members(id));
         }
         for element in self.flow_elements() {
-            if let FlowElement::SequenceFlow(flow) = element
-                && (doomed.contains(&flow.source) || doomed.contains(&flow.target))
-            {
-                doomed.insert(flow.base.id.clone());
+            match element {
+                FlowElement::SequenceFlow(flow)
+                    if doomed.contains(&flow.source) || doomed.contains(&flow.target) =>
+                {
+                    doomed.insert(flow.base.id.clone());
+                }
+                FlowElement::Artifact(Artifact {
+                    base,
+                    kind: ArtifactKind::Association { source, target, .. },
+                }) if doomed.contains(source) || doomed.contains(target) => {
+                    doomed.insert(base.id.clone());
+                }
+                _ => {}
             }
         }
         let message_doomed: Vec<BpmnId> = self
@@ -1485,6 +1667,12 @@ impl Document {
             Some(FlowElement::Activity(a)) => return set(&mut a.node.name, name),
             Some(FlowElement::Gateway(g)) => return set(&mut g.node.name, name),
             Some(FlowElement::SequenceFlow(f)) => return set(&mut f.name, name),
+            Some(FlowElement::Data(d)) => return set(&mut d.name, name),
+            // An annotation's editable "name" is its text.
+            Some(FlowElement::Artifact(Artifact {
+                kind: ArtifactKind::TextAnnotation { text },
+                ..
+            })) => return set(text, name),
             _ => {}
         }
         if let Some(participant) = self.participant_mut(id) {
@@ -1565,6 +1753,10 @@ impl Document {
         }
         let (source, target) = match self.flow_element_index().get(flow_id) {
             Some(FlowElement::SequenceFlow(flow)) => (flow.source.clone(), flow.target.clone()),
+            Some(FlowElement::Artifact(Artifact {
+                kind: ArtifactKind::Association { source, target, .. },
+                ..
+            })) => ((*source).clone(), (*target).clone()),
             _ => match self.message_flows().find(|m| m.base.id == *flow_id) {
                 Some(flow) => (flow.source.clone(), flow.target.clone()),
                 None => return false,
@@ -1596,15 +1788,36 @@ impl Document {
     pub fn extract(&self, selection: &HashSet<BpmnId>) -> Document {
         let mut out = Document::new();
 
-        let keep: HashSet<BpmnId> = self
+        let mut keep: HashSet<BpmnId> = self
             .flow_elements()
             .filter_map(|element| match element {
                 FlowElement::SequenceFlow(flow) => (selection.contains(&flow.source)
                     && selection.contains(&flow.target))
                 .then(|| flow.base.id.clone()),
+                FlowElement::Artifact(Artifact {
+                    base,
+                    kind: ArtifactKind::Association { source, target, .. },
+                }) => (selection.contains(source) && selection.contains(target))
+                    .then(|| base.id.clone()),
                 other => other.id().filter(|id| selection.contains(id)).cloned(),
             })
             .collect();
+        // Backing data objects travel with their kept references.
+        let backing: Vec<BpmnId> = self
+            .flow_elements()
+            .filter_map(|element| match element {
+                FlowElement::Data(DataElement {
+                    base,
+                    kind:
+                        DataKind::ObjectReference {
+                            data_object_ref: Some(object),
+                        },
+                    ..
+                }) if keep.contains(&base.id) => Some(object.clone()),
+                _ => None,
+            })
+            .collect();
+        keep.extend(backing);
 
         // Anything nested inside a kept subprocess travels with its
         // container's clone; only the roots are copied top-level.
@@ -1689,6 +1902,16 @@ impl Document {
                 FlowElement::Activity(_) => "Activity",
                 FlowElement::Gateway(_) => "Gateway",
                 FlowElement::SequenceFlow(_) => "Flow",
+                FlowElement::Data(data) => match data.kind {
+                    DataKind::Object => "DataObject",
+                    DataKind::ObjectReference { .. } => "DataObjectReference",
+                    DataKind::StoreReference { .. } => "DataStoreReference",
+                },
+                FlowElement::Artifact(artifact) => match artifact.kind {
+                    ArtifactKind::TextAnnotation { .. } => "TextAnnotation",
+                    ArtifactKind::Association { .. } => "Association",
+                    ArtifactKind::Group { .. } => "Group",
+                },
                 FlowElement::Unknown(_) => continue,
             };
             mapping.insert(old.clone(), fresh(prefix));
@@ -1701,18 +1924,36 @@ impl Document {
         for process in source.processes() {
             for element in &process.flow_elements {
                 let Some(old) = element.id() else { continue };
-                if let FlowElement::SequenceFlow(flow) = element {
-                    // A flow whose endpoints were not pasted makes no sense.
-                    if !mapping.contains_key(&flow.source) || !mapping.contains_key(&flow.target) {
+                // An edge whose endpoints were not pasted makes no sense.
+                match element {
+                    FlowElement::SequenceFlow(flow)
+                        if !mapping.contains_key(&flow.source)
+                            || !mapping.contains_key(&flow.target) =>
+                    {
                         continue;
                     }
+                    FlowElement::Artifact(Artifact {
+                        kind: ArtifactKind::Association { source, target, .. },
+                        ..
+                    }) if !mapping.contains_key(source) || !mapping.contains_key(target) => {
+                        continue;
+                    }
+                    _ => {}
                 }
                 let Some(new) = mapping.get(old) else {
                     continue;
                 };
                 let mut element = element.clone();
                 remap_element(&mut element, &mapping);
-                if !matches!(element, FlowElement::SequenceFlow(_)) {
+                let is_edge = matches!(
+                    &element,
+                    FlowElement::SequenceFlow(_)
+                        | FlowElement::Artifact(Artifact {
+                            kind: ArtifactKind::Association { .. },
+                            ..
+                        })
+                );
+                if !is_edge {
                     new_nodes.push(new.clone());
                 }
                 elements.push(element);
@@ -1722,44 +1963,7 @@ impl Document {
             process.flow_elements.extend(elements);
         }
 
-        let remap = |id: &BpmnId, mapping: &HashMap<BpmnId, BpmnId>| {
-            mapping.get(id).cloned().unwrap_or_else(|| id.clone())
-        };
-        let mut di = Vec::new();
-        if let Some(plane) = source.diagram().and_then(|d| d.plane.as_ref()) {
-            for element in &plane.elements {
-                match element {
-                    DiElement::Shape(shape) if mapping.contains_key(&shape.bpmn_element) => {
-                        let mut shape = shape.clone();
-                        shape.bpmn_element = remap(&shape.bpmn_element, &mapping);
-                        shape.id = Some(BpmnId::new(format!("{}_di", shape.bpmn_element).as_str()));
-                        shape.bounds.x += dx;
-                        shape.bounds.y += dy;
-                        if let Some(label) = &mut shape.label {
-                            shape_label_offset(label, dx, dy);
-                        }
-                        di.push(DiElement::Shape(shape));
-                    }
-                    DiElement::Edge(edge) if mapping.contains_key(&edge.bpmn_element) => {
-                        let mut edge = edge.clone();
-                        edge.bpmn_element = remap(&edge.bpmn_element, &mapping);
-                        edge.id = Some(BpmnId::new(format!("{}_di", edge.bpmn_element).as_str()));
-                        for point in &mut edge.waypoints {
-                            point.x += dx;
-                            point.y += dy;
-                        }
-                        if let Some(label) = &mut edge.label {
-                            shape_label_offset(label, dx, dy);
-                        }
-                        di.push(DiElement::Edge(edge));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if let Some(plane) = self.plane_mut() {
-            plane.elements.extend(di);
-        }
+        self.paste_di(source, &mapping, dx, dy);
 
         // Pasted geometry decides containment and lane membership, exactly
         // like a drop would.
@@ -1834,7 +2038,10 @@ fn flow_node_mut(element: &mut FlowElement) -> Option<&mut FlowNode> {
         FlowElement::Event(event) => Some(&mut event.node),
         FlowElement::Activity(activity) => Some(&mut activity.node),
         FlowElement::Gateway(gateway) => Some(&mut gateway.node),
-        FlowElement::SequenceFlow(_) | FlowElement::Unknown(_) => None,
+        FlowElement::SequenceFlow(_)
+        | FlowElement::Data(_)
+        | FlowElement::Artifact(_)
+        | FlowElement::Unknown(_) => None,
     }
 }
 
@@ -1854,6 +2061,25 @@ fn remap_element(element: &mut FlowElement, mapping: &std::collections::HashMap<
             remap(&mut flow.base.id);
             remap(&mut flow.source);
             remap(&mut flow.target);
+        }
+        FlowElement::Data(data) => {
+            remap(&mut data.base.id);
+            match &mut data.kind {
+                DataKind::ObjectReference {
+                    data_object_ref: Some(object),
+                } => remap(object),
+                DataKind::StoreReference {
+                    data_store_ref: Some(store),
+                } => remap(store),
+                _ => {}
+            }
+        }
+        FlowElement::Artifact(artifact) => {
+            remap(&mut artifact.base.id);
+            if let ArtifactKind::Association { source, target, .. } = &mut artifact.kind {
+                remap(source);
+                remap(target);
+            }
         }
         FlowElement::Unknown(_) => {}
         other => {
@@ -2407,6 +2633,52 @@ mod m3_tests {
         doc.move_shapes(&moved, 0.0, dy);
         assert_eq!(doc.lane(&top).unwrap().flow_node_refs, Vec::new());
         assert_eq!(doc.lane(&bottom).unwrap().flow_node_refs, vec![task]);
+    }
+
+    #[test]
+    fn data_and_annotations_connect_with_associations() {
+        let mut doc = Document::new();
+        let task = doc
+            .create_node(NodeKind::Task(TaskType::User), Point::new(0.0, 0.0))
+            .unwrap();
+        let data = doc
+            .create_node(NodeKind::DataObject, Point::new(0.0, -200.0))
+            .unwrap();
+        let note = doc
+            .create_node(NodeKind::TextAnnotation, Point::new(200.0, -200.0))
+            .unwrap();
+
+        // The reference got a backing dataObject declaration.
+        assert_eq!(data.as_str(), "DataObjectReference_1");
+        let index = doc.flow_element_index();
+        assert!(matches!(
+            index[&BpmnId::from("DataObject_1")],
+            FlowElement::Data(DataElement {
+                kind: DataKind::Object,
+                ..
+            })
+        ));
+        drop(index);
+
+        // Connecting to data or annotations yields associations, not flows.
+        let a1 = doc.connect(&task, &data).unwrap();
+        let a2 = doc.connect(&note, &task).unwrap();
+        assert!(a1.as_str().starts_with("Association"));
+        assert!(a2.as_str().starts_with("Association"));
+
+        // Annotation text edits through set_name.
+        assert!(doc.set_name(&note, Some(String::from("check this"))));
+        assert_eq!(doc.flow_element_index()[&note].name(), Some("check this"));
+
+        // Deleting the task takes its associations along; the data and the
+        // annotation stay.
+        let doomed: HashSet<BpmnId> = [task].into_iter().collect();
+        doc.delete_elements(&doomed);
+        let index = doc.flow_element_index();
+        assert!(!index.contains_key(&a1));
+        assert!(!index.contains_key(&a2));
+        assert!(index.contains_key(&data));
+        assert!(index.contains_key(&note));
     }
 
     #[test]

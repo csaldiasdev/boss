@@ -61,7 +61,11 @@ pub enum FlowElement {
     Gateway(Gateway),
     /// A sequence flow connecting two flow nodes.
     SequenceFlow(SequenceFlow),
-    /// Anything not modeled yet (subprocesses, data objects, lanes, ...).
+    /// A data element (object, object reference, store reference).
+    Data(DataElement),
+    /// An artifact (text annotation, association, group).
+    Artifact(Artifact),
+    /// Anything not modeled yet (ad-hoc subprocesses, ...).
     Unknown(RawXml),
 }
 
@@ -73,20 +77,90 @@ impl FlowElement {
             FlowElement::Activity(a) => Some(&a.node.base.id),
             FlowElement::Gateway(g) => Some(&g.node.base.id),
             FlowElement::SequenceFlow(f) => Some(&f.base.id),
+            FlowElement::Data(d) => Some(&d.base.id),
+            FlowElement::Artifact(a) => Some(&a.base.id),
             FlowElement::Unknown(_) => None,
         }
     }
 
-    /// The element's display name, when it has one.
+    /// The element's display name, when it has one (an annotation's "name"
+    /// is its text).
     pub fn name(&self) -> Option<&str> {
         match self {
             FlowElement::Event(e) => e.node.name.as_deref(),
             FlowElement::Activity(a) => a.node.name.as_deref(),
             FlowElement::Gateway(g) => g.node.name.as_deref(),
             FlowElement::SequenceFlow(f) => f.name.as_deref(),
+            FlowElement::Data(d) => d.name.as_deref(),
+            FlowElement::Artifact(a) => match &a.kind {
+                ArtifactKind::TextAnnotation { text } => text.as_deref(),
+                _ => None,
+            },
             FlowElement::Unknown(_) => None,
         }
     }
+}
+
+/// A data element of a process.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataElement {
+    /// Common element data.
+    pub base: BaseElement,
+    /// The `name` attribute (the label on the diagram).
+    pub name: Option<String>,
+    /// Which data element this is.
+    pub kind: DataKind,
+}
+
+/// The data element kinds, by XML tag.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataKind {
+    /// `dataObject` — the declaration; usually invisible, referenced by
+    /// object references.
+    Object,
+    /// `dataObjectReference` (the document shape on the diagram).
+    ObjectReference {
+        /// The `dataObjectRef` attribute.
+        data_object_ref: Option<BpmnId>,
+    },
+    /// `dataStoreReference` (the cylinder shape on the diagram).
+    StoreReference {
+        /// The `dataStoreRef` attribute.
+        data_store_ref: Option<BpmnId>,
+    },
+}
+
+/// An artifact: documentation-level diagram content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Artifact {
+    /// Common element data.
+    pub base: BaseElement,
+    /// Which artifact this is.
+    pub kind: ArtifactKind,
+}
+
+/// The artifact kinds, by XML tag.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArtifactKind {
+    /// `textAnnotation`, with its `text` child.
+    TextAnnotation {
+        /// The annotation text.
+        text: Option<String>,
+    },
+    /// `association`: a dotted link between an artifact and anything else.
+    Association {
+        /// The `sourceRef` attribute.
+        source: BpmnId,
+        /// The `targetRef` attribute.
+        target: BpmnId,
+        /// The `associationDirection` attribute, as written.
+        direction: Option<String>,
+    },
+    /// `group`, with its `categoryValueRef` attribute.
+    Group {
+        /// The `categoryValueRef` attribute, as written.
+        category_value_ref: Option<String>,
+    },
 }
 
 /// An event. Two orthogonal axes: where it sits ([`EventPosition`]) and what

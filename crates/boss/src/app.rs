@@ -1230,6 +1230,11 @@ impl App {
                 entry("Call activity", Tool::Place(NodeKind::CallActivity)),
                 section("Collaboration"),
                 entry("Pool", Tool::PlacePool),
+                section("Data & artifacts"),
+                entry("Data object", Tool::Place(NodeKind::DataObject)),
+                entry("Data store", Tool::Place(NodeKind::DataStore)),
+                entry("Annotation", Tool::Place(NodeKind::TextAnnotation)),
+                entry("Group", Tool::Place(NodeKind::Group)),
                 section("Gateways"),
                 entry(
                     "Exclusive",
@@ -1305,6 +1310,7 @@ impl App {
             FlowElement::Activity(activity) => {
                 form = Self::activity_form(form, t, document, id, activity);
             }
+
             FlowElement::Gateway(gateway) => {
                 let mut options = vec![String::from(NO_DEFAULT)];
                 options.extend(
@@ -1356,7 +1362,9 @@ impl App {
                     .width(Fill),
                 );
             }
-            FlowElement::Unknown(_) => {}
+            // Data elements and artifacts only expose their name (an
+            // annotation's name is its text); unknown elements nothing.
+            FlowElement::Data(_) | FlowElement::Artifact(_) | FlowElement::Unknown(_) => {}
         }
 
         form.into()

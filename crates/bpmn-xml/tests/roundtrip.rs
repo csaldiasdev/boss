@@ -10,12 +10,14 @@ const MINIMAL: &str = include_str!("../../../tests-fixtures/minimal.bpmn");
 const ORDER: &str = include_str!("../../../tests-fixtures/order-fulfillment.bpmn");
 const EXTENSIONS: &str = include_str!("../../../tests-fixtures/with-extensions.bpmn");
 const PIZZA: &str = include_str!("../../../tests-fixtures/pizza-collaboration.bpmn");
+const DATA: &str = include_str!("../../../tests-fixtures/data-artifacts.bpmn");
 
-const FIXTURES: [(&str, &str); 4] = [
+const FIXTURES: [(&str, &str); 5] = [
     ("minimal", MINIMAL),
     ("order-fulfillment", ORDER),
     ("with-extensions", EXTENSIONS),
     ("pizza-collaboration", PIZZA),
+    ("data-artifacts", DATA),
 ];
 
 #[test]
@@ -40,6 +42,7 @@ fn parses_the_order_fixture_structurally() {
             FlowElement::Activity(_) => tasks += 1,
             FlowElement::Gateway(_) => gateways += 1,
             FlowElement::SequenceFlow(_) => flows += 1,
+            FlowElement::Data(_) | FlowElement::Artifact(_) => {}
             FlowElement::Unknown(raw) => panic!("unexpected unknown element: {}", raw.as_str()),
         }
     }
@@ -192,6 +195,142 @@ fn parses_the_collaboration_fixture() {
         "isHorizontal=\"true\"",
     ] {
         assert!(out.contains(needle), "output keeps {needle:?}\n---\n{out}");
+    }
+}
+
+#[test]
+fn parses_the_data_and_artifacts_fixture() {
+    use bpmn_core::model::{ArtifactKind, DataKind};
+
+    let doc = parse(DATA).expect("data fixture parses");
+    let index = doc.flow_element_index();
+
+    let FlowElement::Data(reference) = index[&BpmnId::from("DataObjectReference_Invoice")] else {
+        panic!("data object reference expected");
+    };
+    assert_eq!(reference.name.as_deref(), Some("Invoice"));
+    assert_eq!(
+        reference.kind,
+        DataKind::ObjectReference {
+            data_object_ref: Some("DataObject_Invoice".into()),
+        }
+    );
+    assert!(matches!(
+        index[&BpmnId::from("DataStoreReference_Ledger")],
+        FlowElement::Data(data) if matches!(
+            &data.kind,
+            DataKind::StoreReference { data_store_ref: Some(store) } if store.as_str() == "DataStore_Ledger"
+        )
+    ));
+
+    let FlowElement::Artifact(annotation) = index[&BpmnId::from("TextAnnotation_1")] else {
+        panic!("annotation expected");
+    };
+    assert!(matches!(
+        &annotation.kind,
+        ArtifactKind::TextAnnotation { text: Some(text) }
+            if text == "Four-eyes principle applies & audit trail required"
+    ));
+    assert!(matches!(
+        index[&BpmnId::from("Association_1")],
+        FlowElement::Artifact(a) if matches!(
+            &a.kind,
+            ArtifactKind::Association { source, target, direction: Some(d) }
+                if source.as_str() == "Task_Review"
+                    && target.as_str() == "TextAnnotation_1"
+                    && d == "None"
+        )
+    ));
+    assert!(matches!(
+        index[&BpmnId::from("Group_Billing")],
+        FlowElement::Artifact(a) if matches!(
+            &a.kind,
+            ArtifactKind::Group { category_value_ref: Some(c) } if c == "CategoryValue_Billing"
+        )
+    ));
+
+    // Execution-level data plumbing stays verbatim inside the task, and the
+    // category/dataStore roots survive untouched.
+    let out = write(&doc);
+    for needle in [
+        "<bpmn:ioSpecification id=\"IoSpec_1\">",
+        "<bpmn:dataInputAssociation id=\"DataInputAssociation_1\">",
+        "<bpmn:sourceRef>DataObjectReference_Invoice</bpmn:sourceRef>",
+        "<bpmn:categoryValue id=\"CategoryValue_Billing\" value=\"Billing\" />",
+        "<bpmn:dataStore id=\"DataStore_Ledger\" name=\"Ledger\" />",
+        "<flow:assignment group=\"accounting\" />",
+    ] {
+        assert!(out.contains(needle), "output keeps {needle:?}\n---\n{out}");
+    }
+}
+
+/// The M8 exit criterion: vendor and execution content survives a whole edit
+/// session — open, edit unrelated things through the Document API, save.
+#[test]
+fn vendor_content_survives_an_edit_session() {
+    use bpmn_core::NodeKind;
+    use bpmn_core::geometry::Point;
+    use std::collections::HashSet;
+
+    let cases: [(&str, &str, &[&str]); 3] = [
+        (
+            "order-fulfillment",
+            ORDER,
+            &[
+                "acme:assignee=\"demo\"",
+                "<acme:formField id=\"approved\" label=\"Approve?\" type=\"boolean\" />",
+                "xmlns:acme=\"https://example.com/schema/acme/bpmn\"",
+            ],
+        ),
+        (
+            "with-extensions",
+            EXTENSIONS,
+            &[
+                "<flow:taskDefinition type=\"charge-card\" retries=\"3\" />",
+                "meta:executionPlatform=\"Example Cloud\"",
+                "PT5M",
+            ],
+        ),
+        (
+            "data-artifacts",
+            DATA,
+            &[
+                "<bpmn:dataInputAssociation id=\"DataInputAssociation_1\">",
+                "<flow:assignment group=\"accounting\" />",
+                "<bpmn:categoryValue id=\"CategoryValue_Billing\" value=\"Billing\" />",
+            ],
+        ),
+    ];
+
+    for (name, input, needles) in cases {
+        let mut doc = parse(input).unwrap_or_else(|e| panic!("{name} parses: {e}"));
+
+        // A realistic session: add, rename, connect, move, undo-by-delete.
+        let a = doc
+            .create_node(
+                NodeKind::Task(bpmn_core::model::TaskType::User),
+                Point::new(900.0, 400.0),
+            )
+            .expect("create");
+        let b = doc
+            .create_node(NodeKind::EndEvent, Point::new(1100.0, 400.0))
+            .expect("create");
+        doc.set_name(&a, Some(String::from("Session task")));
+        doc.connect(&a, &b).expect("connect");
+        let moved: HashSet<_> = [a.clone()].into_iter().collect();
+        doc.move_shapes(&moved, 15.0, -10.0);
+        let doomed: HashSet<_> = [b].into_iter().collect();
+        doc.delete_elements(&doomed);
+
+        let out = write(&doc);
+        for needle in needles {
+            assert!(
+                out.contains(needle),
+                "{name}: vendor content lost after editing: {needle:?}"
+            );
+        }
+        // And the edited document still parses as sound BPMN.
+        parse(&out).unwrap_or_else(|e| panic!("{name} reparses after editing: {e}"));
     }
 }
 

@@ -11,10 +11,11 @@ use crate::ns;
 use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiElement};
 use bpmn_core::geometry::{Bounds, Point};
 use bpmn_core::model::{
-    Activity, ActivityKind, BaseElement, CallActivity, Collaboration, Condition, Definitions,
-    Event as BpmnEvent, EventDefinition, EventDefinitionBody, EventDefinitionKind, EventPosition,
-    FlowElement, FlowNode, Gateway, GatewayKind, Lane, LaneSet, LoopKind, LoopMarker, MessageFlow,
-    Participant, Process, RootElement, SequenceFlow, SubProcess, SubProcessKind, TaskType,
+    Activity, ActivityKind, Artifact, ArtifactKind, BaseElement, CallActivity, Collaboration,
+    Condition, DataElement, DataKind, Definitions, Event as BpmnEvent, EventDefinition,
+    EventDefinitionBody, EventDefinitionKind, EventPosition, FlowElement, FlowNode, Gateway,
+    GatewayKind, Lane, LaneSet, LoopKind, LoopMarker, MessageFlow, Participant, Process,
+    RootElement, SequenceFlow, SubProcess, SubProcessKind, TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::events::{BytesStart, Event};
@@ -612,6 +613,12 @@ fn parse_flow_element(
         // verbatim capture like any other unknown element.
         "subProcess" | "transaction" => parse_sub_process(cx, e, is_empty)?,
         "callActivity" => parse_call_activity(cx, e, is_empty)?,
+        "dataObject" | "dataObjectReference" | "dataStoreReference" => {
+            parse_data_element(cx, e, is_empty)?
+        }
+        "textAnnotation" => parse_text_annotation(cx, e, is_empty)?,
+        "association" => parse_association(cx, e, is_empty)?,
+        "group" => parse_group(cx, e, is_empty)?,
         "exclusiveGateway" => parse_gateway(cx, e, is_empty, GatewayKind::Exclusive)?,
         "parallelGateway" => parse_gateway(cx, e, is_empty, GatewayKind::Parallel)?,
         "inclusiveGateway" => parse_gateway(cx, e, is_empty, GatewayKind::Inclusive)?,
@@ -931,6 +938,123 @@ fn parse_call_activity(
     }
 
     Ok(FlowElement::Activity(activity))
+}
+
+fn parse_data_element(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<FlowElement, ParseError> {
+    let tag = local(start).to_string();
+    let mut set = attr_set(start)?;
+    let kind = match tag.as_str() {
+        "dataObjectReference" => DataKind::ObjectReference {
+            data_object_ref: set.take_id("dataObjectRef"),
+        },
+        "dataStoreReference" => DataKind::StoreReference {
+            data_store_ref: set.take_id("dataStoreRef"),
+        },
+        _ => DataKind::Object,
+    };
+    let mut data = DataElement {
+        base: BaseElement::new(set.take_id("id").unwrap_or_default()),
+        name: set.take("name"),
+        kind,
+    };
+    data.base.unknown_attrs = set.rest();
+    if !empty {
+        parse_base_only(cx, &mut data.base, &tag)?;
+    }
+    Ok(FlowElement::Data(data))
+}
+
+fn parse_text_annotation(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<FlowElement, ParseError> {
+    let mut set = attr_set(start)?;
+    let mut artifact = Artifact {
+        base: BaseElement::new(set.take_id("id").unwrap_or_default()),
+        kind: ArtifactKind::TextAnnotation { text: None },
+    };
+    artifact.base.unknown_attrs = set.rest();
+
+    if !empty {
+        loop {
+            let pos = cx.pos();
+            let (nsk, event) = cx.read()?;
+            let (e, is_empty) = match event {
+                Event::Start(e) => (e, false),
+                Event::Empty(e) => (e, true),
+                Event::Comment(_) => {
+                    artifact.base.unknown_children.push(cx.capture_span(pos));
+                    continue;
+                }
+                Event::End(_) => break,
+                Event::Eof => return Err(structure("unexpected end of file in textAnnotation")),
+                _ => continue,
+            };
+
+            if base_child(cx, &mut artifact.base, pos, nsk, &e, is_empty)? {
+                continue;
+            }
+            if nsk == Ns::Model && local(&e) == "text" {
+                let text = if is_empty {
+                    String::new()
+                } else {
+                    cx.text(&e)?
+                };
+                artifact.kind = ArtifactKind::TextAnnotation { text: Some(text) };
+            } else {
+                artifact
+                    .base
+                    .unknown_children
+                    .push(cx.capture_any(pos, &e, is_empty)?);
+            }
+        }
+    }
+    Ok(FlowElement::Artifact(artifact))
+}
+
+fn parse_association(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<FlowElement, ParseError> {
+    let mut set = attr_set(start)?;
+    let mut artifact = Artifact {
+        base: BaseElement::new(set.take_id("id").unwrap_or_default()),
+        kind: ArtifactKind::Association {
+            source: set.take_id("sourceRef").unwrap_or_default(),
+            target: set.take_id("targetRef").unwrap_or_default(),
+            direction: set.take("associationDirection"),
+        },
+    };
+    artifact.base.unknown_attrs = set.rest();
+    if !empty {
+        parse_base_only(cx, &mut artifact.base, "association")?;
+    }
+    Ok(FlowElement::Artifact(artifact))
+}
+
+fn parse_group(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<FlowElement, ParseError> {
+    let mut set = attr_set(start)?;
+    let mut artifact = Artifact {
+        base: BaseElement::new(set.take_id("id").unwrap_or_default()),
+        kind: ArtifactKind::Group {
+            category_value_ref: set.take("categoryValueRef"),
+        },
+    };
+    artifact.base.unknown_attrs = set.rest();
+    if !empty {
+        parse_base_only(cx, &mut artifact.base, "group")?;
+    }
+    Ok(FlowElement::Artifact(artifact))
 }
 
 fn parse_gateway(
