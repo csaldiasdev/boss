@@ -364,10 +364,73 @@ pub struct Process {
     pub name: Option<String>,
     /// The `isExecutable` attribute, as written (absent stays absent).
     pub is_executable: Option<bool>,
-    /// Flow elements in document order. Unmodeled children (lane sets,
-    /// artifacts, data objects, ...) are interleaved as
-    /// [`FlowElement::Unknown`] so order survives the round-trip.
+    /// `laneSet` children (usually one), written before the flow elements.
+    pub lane_sets: Vec<LaneSet>,
+    /// Flow elements in document order. Unmodeled children (artifacts, data
+    /// objects, ...) are interleaved as [`FlowElement::Unknown`] so order
+    /// survives the round-trip.
     pub flow_elements: Vec<FlowElement>,
+}
+
+/// A `laneSet`: the lanes partitioning a process (or a lane, when nested).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LaneSet {
+    /// The `id` attribute.
+    pub id: Option<BpmnId>,
+    /// The lanes, in document order.
+    pub lanes: Vec<Lane>,
+    /// Attributes the model does not understand, as written.
+    pub unknown_attrs: Vec<(String, String)>,
+}
+
+/// A `lane`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Lane {
+    /// Common element data.
+    pub base: BaseElement,
+    /// The `name` attribute (the lane's label).
+    pub name: Option<String>,
+    /// `flowNodeRef` children: the ids of the nodes living in this lane.
+    pub flow_node_refs: Vec<BpmnId>,
+    /// A `childLaneSet`, when the lane is subdivided further.
+    pub child_lane_set: Option<LaneSet>,
+}
+
+/// A `collaboration` root element: pools and the message flows between them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Collaboration {
+    /// Common element data.
+    pub base: BaseElement,
+    /// The `name` attribute.
+    pub name: Option<String>,
+    /// The pools.
+    pub participants: Vec<Participant>,
+    /// The message flows between pools.
+    pub message_flows: Vec<MessageFlow>,
+}
+
+/// A `participant`: one pool, usually backed by a process.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Participant {
+    /// Common element data.
+    pub base: BaseElement,
+    /// The `name` attribute (the pool's label).
+    pub name: Option<String>,
+    /// The `processRef` attribute. A pool without one is a black box.
+    pub process_ref: Option<BpmnId>,
+}
+
+/// A `messageFlow` connecting two pools (or flow nodes in different pools).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageFlow {
+    /// Common element data.
+    pub base: BaseElement,
+    /// The `name` attribute (the label on the diagram).
+    pub name: Option<String>,
+    /// The `sourceRef` attribute: a flow node or participant id.
+    pub source: BpmnId,
+    /// The `targetRef` attribute: a flow node or participant id.
+    pub target: BpmnId,
 }
 
 /// A direct child of `definitions`.
@@ -375,7 +438,9 @@ pub struct Process {
 pub enum RootElement {
     /// A `process`.
     Process(Process),
-    /// Anything else (collaborations, messages, signals, ...), verbatim.
+    /// A `collaboration`.
+    Collaboration(Collaboration),
+    /// Anything else (messages, signals, error definitions, ...), verbatim.
     Unknown(RawXml),
 }
 

@@ -29,7 +29,10 @@ pub enum Tool {
     Select,
     /// Place a new node on click.
     Place(NodeKind),
-    /// Connect two nodes with a sequence flow.
+    /// Place a new pool on click.
+    PlacePool,
+    /// Connect two nodes: a sequence flow inside a container, a message flow
+    /// across pools.
     Connect,
 }
 
@@ -62,6 +65,8 @@ pub enum CanvasMessage {
     },
     /// Place a new node of this kind at this (snapped) world position.
     Place(NodeKind, Point),
+    /// Place a new pool centered at this (snapped) world position.
+    PlacePool(Point),
     /// Place a boundary event on this host activity, toward this point.
     PlaceBoundary(BpmnId, Point),
     /// Connect source to target with a sequence flow.
@@ -205,8 +210,11 @@ fn world_rect(a: Point, b: Point) -> Rectangle {
 impl View<'_> {
     /// The node under a world-space point, shape-accurate. When shapes nest
     /// (subprocess children), the smallest hit wins so children stay
-    /// selectable inside their container.
+    /// selectable inside their container. Pools and lanes only respond on
+    /// their 30px name band, keeping their body free for the nodes inside.
     fn hit_node(&self, world: Point) -> Option<BpmnId> {
+        const HEADER: f64 = 30.0;
+
         let plane = self.document.diagram()?.plane.as_ref()?;
         let index = self.document.flow_element_index();
         let hidden = self.document.hidden_by_collapse();
@@ -217,34 +225,57 @@ impl View<'_> {
             let DiElement::Shape(shape) = element else {
                 continue;
             };
-            if hidden.contains(&shape.bpmn_element) {
+            let id = &shape.bpmn_element;
+            if hidden.contains(id) {
                 continue;
             }
-            let Some(outline) = index.get(&shape.bpmn_element).copied().and_then(outline_of) else {
-                continue;
-            };
-            if outline.contains(shape.bounds, world) {
-                let area = shape.bounds.width * shape.bounds.height;
-                if best.as_ref().is_none_or(|(_, a)| area < *a) {
-                    best = Some((shape.bpmn_element.clone(), area));
+            let (hit, area) = match index.get(id).copied().and_then(outline_of) {
+                Some(outline) => (
+                    outline.contains(shape.bounds, world),
+                    shape.bounds.width * shape.bounds.height,
+                ),
+                None if self.document.participant(id).is_some()
+                    || self.document.lane(id).is_some() =>
+                {
+                    let band = bpmn_core::Bounds::new(
+                        shape.bounds.x,
+                        shape.bounds.y,
+                        HEADER,
+                        shape.bounds.height,
+                    );
+                    // The band is small, so a band hit should not lose to a
+                    // node by area; treat it as its own footprint.
+                    (band.contains(world), band.width * band.height)
                 }
+                None => continue,
+            };
+            if hit && best.as_ref().is_none_or(|(_, a)| area < *a) {
+                best = Some((id.clone(), area));
             }
         }
         best.map(|(id, _)| id)
     }
 
-    /// Topmost edge whose polyline passes near a world-space point.
+    /// Topmost edge (sequence or message flow) whose polyline passes near a
+    /// world-space point.
     fn hit_edge(&self, world: Point) -> Option<BpmnId> {
         let plane = self.document.diagram()?.plane.as_ref()?;
         let index = self.document.flow_element_index();
         let hidden = self.document.hidden_by_collapse();
+        let message_flows: std::collections::HashSet<&BpmnId> = self
+            .document
+            .message_flows()
+            .map(|flow| &flow.base.id)
+            .collect();
         let tolerance = 6.0 / self.camera.scaling;
 
         for element in plane.elements.iter().rev() {
             let DiElement::Edge(edge) = element else {
                 continue;
             };
-            if !index.contains_key(&edge.bpmn_element) || hidden.contains(&edge.bpmn_element) {
+            let known = index.contains_key(&edge.bpmn_element)
+                || message_flows.contains(&edge.bpmn_element);
+            if !known || hidden.contains(&edge.bpmn_element) {
                 continue;
             }
             let points: Vec<Point> = edge
@@ -275,18 +306,19 @@ impl View<'_> {
         })
     }
 
-    /// The selected edge, when the selection is exactly one sequence flow.
+    /// The selected edge, when the selection is exactly one sequence flow or
+    /// message flow.
     fn single_selected_edge(&self) -> Option<BpmnId> {
         if self.selection.len() != 1 {
             return None;
         }
         let id = self.selection.iter().next()?;
         let index = self.document.flow_element_index();
-        matches!(
+        let is_edge = matches!(
             index.get(id),
             Some(bpmn_core::model::FlowElement::SequenceFlow(_))
-        )
-        .then(|| id.clone())
+        ) || self.document.message_flows().any(|m| m.base.id == *id);
+        is_edge.then(|| id.clone())
     }
 
     /// When the press lands on a waypoint or midpoint handle of the selected
@@ -434,6 +466,10 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                 }
                 Tool::Place(kind) => Some(
                     canvas::Action::publish(CanvasMessage::Place(kind, snap_point(world)))
+                        .and_capture(),
+                ),
+                Tool::PlacePool => Some(
+                    canvas::Action::publish(CanvasMessage::PlacePool(snap_point(world)))
                         .and_capture(),
                 ),
                 Tool::Connect => {
@@ -636,7 +672,7 @@ impl canvas::Program<CanvasMessage> for View<'_> {
         match (&state.interaction, self.tool) {
             (Interaction::Panning { .. }, _) => mouse::Interaction::Grabbing,
             (Interaction::Moving { .. }, _) => mouse::Interaction::Move,
-            (_, Tool::Place(_) | Tool::Connect) if cursor.is_over(bounds) => {
+            (_, Tool::Place(_) | Tool::PlacePool | Tool::Connect) if cursor.is_over(bounds) => {
                 mouse::Interaction::Crosshair
             }
             _ => mouse::Interaction::default(),
@@ -857,12 +893,18 @@ impl View<'_> {
         }
 
         // Placement ghost.
-        if let Tool::Place(kind) = self.tool
+        let ghost_size = match self.tool {
+            Tool::Place(kind) => {
+                let size = kind.default_size();
+                Some((size.width as f32, size.height as f32))
+            }
+            Tool::PlacePool => Some((600.0, 250.0)),
+            _ => None,
+        };
+        if let Some((w, h)) = ghost_size
             && let Some(position) = cursor.position_in(bounds)
         {
             let world = snap_point(self.camera.project(position, bounds.size()));
-            let size = kind.default_size();
-            let (w, h) = (size.width as f32, size.height as f32);
             frame.stroke(
                 &Path::rectangle(
                     Point::new(world.x - w / 2.0, world.y - h / 2.0),

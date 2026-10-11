@@ -3,7 +3,10 @@
 use crate::di::{BpmnDiagram, DiElement};
 use crate::geometry::Bounds;
 use crate::ids::BpmnId;
-use crate::model::{ActivityKind, Definitions, FlowElement, Process, RootElement};
+use crate::model::{
+    ActivityKind, Collaboration, Definitions, FlowElement, Lane, LaneSet, MessageFlow, Participant,
+    Process, RootElement,
+};
 use std::collections::{HashMap, HashSet};
 
 /// A loaded `.bpmn` document.
@@ -24,8 +27,69 @@ impl Document {
             .iter()
             .filter_map(|root| match root {
                 RootElement::Process(process) => Some(process),
-                RootElement::Unknown(_) => None,
+                _ => None,
             })
+    }
+
+    /// The collaboration, when the document has pools.
+    pub fn collaboration(&self) -> Option<&Collaboration> {
+        self.definitions
+            .root_elements
+            .iter()
+            .find_map(|root| match root {
+                RootElement::Collaboration(collaboration) => Some(collaboration),
+                _ => None,
+            })
+    }
+
+    /// The participant (pool) with this id.
+    pub fn participant(&self, id: &BpmnId) -> Option<&Participant> {
+        self.collaboration()?
+            .participants
+            .iter()
+            .find(|p| p.base.id == *id)
+    }
+
+    /// All message flows, in document order.
+    pub fn message_flows(&self) -> impl Iterator<Item = &MessageFlow> {
+        self.collaboration()
+            .into_iter()
+            .flat_map(|c| c.message_flows.iter())
+    }
+
+    /// The lane with this id, searching nested lane sets too.
+    pub fn lane(&self, id: &BpmnId) -> Option<&Lane> {
+        fn scan<'a>(sets: &'a [LaneSet], id: &BpmnId) -> Option<&'a Lane> {
+            for set in sets {
+                for lane in &set.lanes {
+                    if lane.base.id == *id {
+                        return Some(lane);
+                    }
+                    if let Some(child) = &lane.child_lane_set
+                        && let Some(found) = scan(std::slice::from_ref(child), id)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        self.processes().find_map(|p| scan(&p.lane_sets, id))
+    }
+
+    /// The id of the process whose body (at any nesting depth) holds `id`.
+    pub fn process_of(&self, id: &BpmnId) -> Option<BpmnId> {
+        fn contains(elements: &[FlowElement], id: &BpmnId) -> bool {
+            elements.iter().any(|element| {
+                element.id() == Some(id)
+                    || matches!(element, FlowElement::Activity(activity)
+                        if matches!(&activity.kind, ActivityKind::SubProcess(sub)
+                            if contains(&sub.flow_elements, id)))
+            })
+        }
+        self.processes()
+            .find(|process| contains(&process.flow_elements, id))
+            .map(|process| process.base.id.clone())
     }
 
     /// All flow elements across all processes, in document order, descending

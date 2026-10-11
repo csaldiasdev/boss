@@ -9,11 +9,13 @@ use bpmn_xml::{ParseError, parse, write};
 const MINIMAL: &str = include_str!("../../../tests-fixtures/minimal.bpmn");
 const ORDER: &str = include_str!("../../../tests-fixtures/order-fulfillment.bpmn");
 const EXTENSIONS: &str = include_str!("../../../tests-fixtures/with-extensions.bpmn");
+const PIZZA: &str = include_str!("../../../tests-fixtures/pizza-collaboration.bpmn");
 
-const FIXTURES: [(&str, &str); 3] = [
+const FIXTURES: [(&str, &str); 4] = [
     ("minimal", MINIMAL),
     ("order-fulfillment", ORDER),
     ("with-extensions", EXTENSIONS),
+    ("pizza-collaboration", PIZZA),
 ];
 
 #[test]
@@ -136,6 +138,61 @@ fn parses_extension_fixture_event_details() {
     assert!(doc.definitions.root_elements.iter().any(|root| {
         matches!(root, RootElement::Unknown(raw) if raw.as_str().contains("Message_Order"))
     }));
+}
+
+#[test]
+fn parses_the_collaboration_fixture() {
+    let doc = parse(PIZZA).expect("pizza fixture parses");
+
+    let collaboration = doc.collaboration().expect("collaboration");
+    assert_eq!(collaboration.participants.len(), 2);
+    assert_eq!(collaboration.message_flows.len(), 2);
+    assert_eq!(
+        doc.participant(&BpmnId::from("Participant_Shop"))
+            .and_then(|p| p.process_ref.clone()),
+        Some(BpmnId::from("Process_Shop"))
+    );
+
+    let shop = doc
+        .processes()
+        .find(|p| p.base.id.as_str() == "Process_Shop")
+        .expect("shop process");
+    assert_eq!(shop.lane_sets.len(), 1);
+    let lanes = &shop.lane_sets[0].lanes;
+    assert_eq!(lanes.len(), 2);
+    assert_eq!(lanes[0].name.as_deref(), Some("Kitchen"));
+    assert_eq!(
+        lanes[0].flow_node_refs,
+        vec![
+            BpmnId::from("Start_OrderReceived"),
+            BpmnId::from("Task_Bake")
+        ]
+    );
+    // The nested child lane set survives, as does the lane lookup through it.
+    assert!(lanes[0].child_lane_set.is_some());
+    assert_eq!(
+        doc.lane(&BpmnId::from("Lane_Oven"))
+            .and_then(|l| l.name.as_deref()),
+        Some("Oven")
+    );
+
+    // Message flow endpoints resolve across pools.
+    assert_eq!(
+        doc.process_of(&BpmnId::from("Task_PlaceOrder")),
+        Some(BpmnId::from("Process_Customer"))
+    );
+
+    // The writer keeps the vendor attribute and the lane structure.
+    let out = write(&doc);
+    for needle in [
+        "acme:station=\"oven-2\"",
+        "<bpmn:childLaneSet id=\"LaneSet_KitchenSplit\">",
+        "<bpmn:flowNodeRef>Task_Deliver</bpmn:flowNodeRef>",
+        "<bpmn:messageFlow id=\"MessageFlow_Order\" name=\"order\" sourceRef=\"Task_PlaceOrder\" targetRef=\"Start_OrderReceived\" />",
+        "isHorizontal=\"true\"",
+    ] {
+        assert!(out.contains(needle), "output keeps {needle:?}\n---\n{out}");
+    }
 }
 
 #[test]

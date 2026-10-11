@@ -92,9 +92,12 @@ pub fn draw(
         .with_width(stroke_width)
         .with_color(tokens.stroke);
 
-    // Expanded subprocess bodies go under everything, outermost first, so
-    // edges and child shapes draw on top of their container's fill.
+    // Stacking order: pools, then lanes (outer before nested), then expanded
+    // subprocess bodies (outermost first), then edges, then node shapes — so
+    // everything draws on top of its container's fill.
     let depth_of = depths(document);
+    let mut pools: Vec<&BpmnShape> = Vec::new();
+    let mut lanes: Vec<&BpmnShape> = Vec::new();
     let mut containers: Vec<(&BpmnShape, usize)> = Vec::new();
     let mut nodes: Vec<&BpmnShape> = Vec::new();
     for element in &plane.elements {
@@ -102,30 +105,68 @@ pub fn draw(
             if hidden.contains(&shape.bpmn_element) || !rect(shape.bounds).intersects(&visible) {
                 continue;
             }
-            let is_container = matches!(
-                index.get(&shape.bpmn_element).copied(),
+            match index.get(&shape.bpmn_element).copied() {
                 Some(FlowElement::Activity(Activity {
                     kind: ActivityKind::SubProcess(_),
                     ..
-                }))
-            ) && shape.is_expanded == Some(true);
-            if is_container {
-                containers.push((
+                })) if shape.is_expanded == Some(true) => containers.push((
                     shape,
                     depth_of.get(&shape.bpmn_element).copied().unwrap_or(0),
-                ));
-            } else {
-                nodes.push(shape);
+                )),
+                None if document.participant(&shape.bpmn_element).is_some() => pools.push(shape),
+                None if document.lane(&shape.bpmn_element).is_some() => lanes.push(shape),
+                _ => nodes.push(shape),
             }
         }
     }
     containers.sort_by_key(|(_, depth)| *depth);
+    lanes.sort_by(|a, b| {
+        let area = |s: &BpmnShape| s.bounds.width * s.bounds.height;
+        area(b).total_cmp(&area(a))
+    });
 
+    for shape in &pools {
+        let name = document
+            .participant(&shape.bpmn_element)
+            .and_then(|p| p.name.as_deref());
+        draw_band(frame, rect(shape.bounds), name, stroke, tokens, true);
+    }
+    for shape in &lanes {
+        let name = document
+            .lane(&shape.bpmn_element)
+            .and_then(|l| l.name.as_deref());
+        draw_band(frame, rect(shape.bounds), name, stroke, tokens, false);
+    }
     for (shape, _) in &containers {
         draw_shape(frame, &index, badges, shape, stroke, stroke_width, tokens);
     }
 
-    // Edges under node shapes, labels on top.
+    draw_edges(frame, document, &index, &hidden, stroke, tokens, visible);
+
+    for shape in &nodes {
+        draw_shape(frame, &index, badges, shape, stroke, stroke_width, tokens);
+    }
+}
+
+/// Sequence flows (solid, filled arrowhead) and message flows (dashed, circle
+/// at the source, hollow arrowhead), drawn under node shapes.
+fn draw_edges(
+    frame: &mut Frame,
+    document: &Document,
+    index: &std::collections::HashMap<&bpmn_core::BpmnId, &FlowElement>,
+    hidden: &std::collections::HashSet<bpmn_core::BpmnId>,
+    stroke: Stroke<'_>,
+    tokens: CanvasTokens,
+    visible: Rectangle,
+) {
+    let Some(plane) = document.diagram().and_then(|d| d.plane.as_ref()) else {
+        return;
+    };
+    let message_flows: std::collections::HashMap<&bpmn_core::BpmnId, Option<&str>> = document
+        .message_flows()
+        .map(|flow| (&flow.base.id, flow.name.as_deref()))
+        .collect();
+
     for element in &plane.elements {
         if let DiElement::Edge(edge) = element {
             if edge.waypoints.len() < 2 || hidden.contains(&edge.bpmn_element) {
@@ -142,12 +183,25 @@ pub fn draw(
                     builder.line_to(*point);
                 }
             });
-            frame.stroke(&path, stroke);
-            arrowhead(frame, &points, tokens);
 
-            if let Some(FlowElement::SequenceFlow(flow)) = index.get(&edge.bpmn_element).copied()
-                && let Some(name) = &flow.name
-            {
+            let mut name = None;
+            if let Some(message_name) = message_flows.get(&edge.bpmn_element) {
+                let mut dashed = stroke;
+                dashed.line_dash.segments = &[6.0, 4.0];
+                frame.stroke(&path, dashed);
+                message_flow_caps(frame, &points, stroke, tokens);
+                name = *message_name;
+            } else {
+                frame.stroke(&path, stroke);
+                arrowhead(frame, &points, tokens);
+                if let Some(FlowElement::SequenceFlow(flow)) =
+                    index.get(&edge.bpmn_element).copied()
+                {
+                    name = flow.name.as_deref();
+                }
+            }
+
+            if let Some(name) = name {
                 let position = edge
                     .label
                     .as_ref()
@@ -157,10 +211,72 @@ pub fn draw(
             }
         }
     }
+}
 
-    for shape in &nodes {
-        draw_shape(frame, &index, badges, shape, stroke, stroke_width, tokens);
+/// A pool or lane: a rectangle with a rotated name band on its left edge.
+/// Pools get a filled band and a full border; lanes stay lighter.
+fn draw_band(
+    frame: &mut Frame,
+    bounds: Rectangle,
+    name: Option<&str>,
+    stroke: Stroke<'_>,
+    tokens: CanvasTokens,
+    is_pool: bool,
+) {
+    const HEADER: f32 = 30.0;
+
+    if is_pool {
+        frame.fill(
+            &Path::rectangle(bounds.position(), bounds.size()),
+            tokens.fill,
+        );
     }
+    frame.stroke(&Path::rectangle(bounds.position(), bounds.size()), stroke);
+    let band = Path::line(
+        Point::new(bounds.x + HEADER, bounds.y),
+        Point::new(bounds.x + HEADER, bounds.y + bounds.height),
+    );
+    frame.stroke(&band, stroke);
+
+    if let Some(name) = name {
+        frame.with_save(|frame| {
+            frame.translate(Vector::new(
+                bounds.x + HEADER / 2.0,
+                bounds.y + bounds.height / 2.0,
+            ));
+            frame.rotate(-std::f32::consts::FRAC_PI_2);
+            label(frame, name, Point::ORIGIN, 12.0, tokens.label);
+        });
+    }
+}
+
+/// Message flow decorations: a small hollow circle at the source and a hollow
+/// arrowhead at the target (the BPMN notation for messages).
+fn message_flow_caps(
+    frame: &mut Frame,
+    points: &[Point],
+    stroke: Stroke<'_>,
+    tokens: CanvasTokens,
+) {
+    let start = points[0];
+    frame.fill(&Path::circle(start, 4.0), tokens.bg);
+    frame.stroke(&Path::circle(start, 4.0), stroke);
+
+    let tip = points[points.len() - 1];
+    let from = points[points.len() - 2];
+    let (dx, dy) = (tip.x - from.x, tip.y - from.y);
+    let len = (dx * dx + dy * dy).sqrt().max(0.001);
+    let dir = Vector::new(dx / len, dy / len);
+    let perp = Vector::new(-dir.y, dir.x);
+    let base = Point::new(tip.x - dir.x * 10.0, tip.y - dir.y * 10.0);
+    let head = Path::new(|builder| {
+        builder.move_to(tip);
+        builder.line_to(Point::new(base.x + perp.x * 4.5, base.y + perp.y * 4.5));
+        builder.line_to(Point::new(base.x - perp.x * 4.5, base.y - perp.y * 4.5));
+        builder.close();
+    });
+    frame.fill(&head, tokens.bg);
+    frame.stroke(&head, stroke);
 }
 
 fn draw_shape(

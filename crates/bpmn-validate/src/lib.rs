@@ -107,6 +107,7 @@ impl Validator {
                 Box::new(EventBasedTargets),
                 Box::new(CrossContainerFlow),
                 Box::new(SubprocessContents),
+                Box::new(MessageFlowEndpoints),
             ],
         }
     }
@@ -458,7 +459,7 @@ impl Rule for CrossContainerFlow {
                     severity: Severity::Error,
                     element: Some(flow.base.id.clone()),
                     message: format!(
-                        "Flow {} crosses a subprocess boundary (connect through boundary events or the subprocess itself)",
+                        "Flow {} crosses a container boundary (use a message flow between pools, or connect through the subprocess itself)",
                         flow.base.id
                     ),
                 });
@@ -534,6 +535,58 @@ impl Rule for SubprocessContents {
                     element: Some(id.clone()),
                     message: format!("Subprocess {} has no start event", label(element, id)),
                 });
+            }
+        }
+    }
+}
+
+struct MessageFlowEndpoints;
+
+impl Rule for MessageFlowEndpoints {
+    fn id(&self) -> &'static str {
+        "message-flow-endpoints"
+    }
+
+    fn check(&self, graph: &Graph<'_>, out: &mut Vec<Issue>) {
+        let document = graph.document;
+        // A message flow endpoint resolves to the pool it belongs to: the
+        // backing process for nodes and participants, the participant itself
+        // for black-box pools.
+        let pool_of = |id: &BpmnId| -> Option<BpmnId> {
+            if let Some(participant) = document.participant(id) {
+                return Some(
+                    participant
+                        .process_ref
+                        .clone()
+                        .unwrap_or_else(|| participant.base.id.clone()),
+                );
+            }
+            graph
+                .index
+                .contains_key(id)
+                .then(|| document.process_of(id))?
+        };
+
+        for flow in document.message_flows() {
+            let id = &flow.base.id;
+            let source = pool_of(&flow.source);
+            let target = pool_of(&flow.target);
+            match (source, target) {
+                (None, _) | (_, None) => out.push(Issue {
+                    rule: self.id(),
+                    severity: Severity::Error,
+                    element: Some(id.clone()),
+                    message: format!("Message flow {id} points at a missing element"),
+                }),
+                (Some(source), Some(target)) if source == target => out.push(Issue {
+                    rule: self.id(),
+                    severity: Severity::Error,
+                    element: Some(id.clone()),
+                    message: format!(
+                        "Message flow {id} connects elements of the same pool (use a sequence flow)"
+                    ),
+                }),
+                _ => {}
             }
         }
     }
@@ -715,6 +768,50 @@ mod tests {
                 .any(|i| i.rule == "disconnected" && i.element.as_ref() == Some(&sub)),
             "the event subprocess itself is never wired by flows"
         );
+    }
+
+    #[test]
+    fn message_flows_must_cross_pools() {
+        use bpmn_core::geometry::Point;
+        use bpmn_core::model::RootElement;
+
+        let mut doc = Document::new();
+        let a = doc
+            .create_node(NodeKind::StartEvent, Point::new(0.0, 0.0))
+            .unwrap();
+        let b = doc
+            .create_node(
+                NodeKind::Task(bpmn_core::model::TaskType::Receive),
+                Point::new(200.0, 0.0),
+            )
+            .unwrap();
+        doc.create_pool(None, Point::new(0.0, 0.0)).unwrap();
+        let pool_b = doc.create_pool(None, Point::new(0.0, 600.0)).unwrap();
+        let c = doc
+            .create_node(
+                NodeKind::Task(bpmn_core::model::TaskType::Send),
+                Point::new(0.0, 600.0),
+            )
+            .unwrap();
+
+        // A proper cross-pool message flow is quiet.
+        let message = doc.connect(&c, &b).unwrap();
+        assert!(!rules(&validate(&doc)).contains(&"message-flow-endpoints"));
+
+        // Deleting the target leaves... nothing; the flow dies with it. Force
+        // a same-pool message flow instead by rewiring the model directly.
+        let _ = message;
+        if let Some(RootElement::Collaboration(collaboration)) = doc
+            .definitions
+            .root_elements
+            .iter_mut()
+            .find(|r| matches!(r, RootElement::Collaboration(_)))
+        {
+            collaboration.message_flows[0].source = a.clone();
+        }
+        assert!(rules(&validate(&doc)).contains(&"message-flow-endpoints"));
+
+        let _ = pool_b;
     }
 
     #[test]

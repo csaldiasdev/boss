@@ -11,10 +11,10 @@ use crate::ns;
 use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiElement};
 use bpmn_core::geometry::{Bounds, Point};
 use bpmn_core::model::{
-    Activity, ActivityKind, BaseElement, CallActivity, Condition, Definitions, Event as BpmnEvent,
-    EventDefinition, EventDefinitionBody, EventDefinitionKind, EventPosition, FlowElement,
-    FlowNode, Gateway, GatewayKind, LoopKind, LoopMarker, Process, RootElement, SequenceFlow,
-    SubProcess, SubProcessKind, TaskType,
+    Activity, ActivityKind, BaseElement, CallActivity, Collaboration, Condition, Definitions,
+    Event as BpmnEvent, EventDefinition, EventDefinitionBody, EventDefinitionKind, EventPosition,
+    FlowElement, FlowNode, Gateway, GatewayKind, Lane, LaneSet, LoopKind, LoopMarker, MessageFlow,
+    Participant, Process, RootElement, SequenceFlow, SubProcess, SubProcessKind, TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::events::{BytesStart, Event};
@@ -254,6 +254,12 @@ fn parse_definitions(cx: &mut Cx<'_>, start: &BytesStart<'_>) -> Result<Definiti
             (Ns::Model, "process") => def
                 .root_elements
                 .push(RootElement::Process(parse_process(cx, &e, empty)?)),
+            (Ns::Model, "collaboration") => {
+                def.root_elements
+                    .push(RootElement::Collaboration(parse_collaboration(
+                        cx, &e, empty,
+                    )?));
+            }
             (Ns::BpmnDi, "BPMNDiagram") => def.diagrams.push(parse_diagram(cx, &e, empty)?),
             _ => def
                 .root_elements
@@ -345,7 +351,7 @@ fn parse_process(
         base: BaseElement::new(set.take_id("id").unwrap_or_default()),
         name: set.take("name"),
         is_executable: set.take_bool("isExecutable"),
-        flow_elements: Vec::new(),
+        ..Process::default()
     };
     process.base.unknown_attrs = set.rest();
 
@@ -371,12 +377,209 @@ fn parse_process(
         if base_child(cx, &mut process.base, pos, nsk, &e, is_empty)? {
             continue;
         }
+        if nsk == Ns::Model && local(&e) == "laneSet" {
+            process.lane_sets.push(parse_lane_set(cx, &e, is_empty)?);
+            continue;
+        }
 
         let element = match parse_flow_element(cx, nsk, &e, is_empty)? {
             Some(element) => element,
             None => FlowElement::Unknown(cx.capture_any(pos, &e, is_empty)?),
         };
         process.flow_elements.push(element);
+    }
+}
+
+fn parse_lane_set(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<LaneSet, ParseError> {
+    let mut set = attr_set(start)?;
+    let mut lane_set = LaneSet {
+        id: set.take_id("id"),
+        ..LaneSet::default()
+    };
+    lane_set.unknown_attrs = set.rest();
+
+    if empty {
+        return Ok(lane_set);
+    }
+
+    loop {
+        let pos = cx.pos();
+        let (nsk, event) = cx.read()?;
+        let (e, is_empty) = match event {
+            Event::Start(e) => (e, false),
+            Event::Empty(e) => (e, true),
+            Event::End(_) => return Ok(lane_set),
+            Event::Eof => return Err(structure("unexpected end of file in laneSet")),
+            _ => continue,
+        };
+
+        if nsk == Ns::Model && local(&e) == "lane" {
+            lane_set.lanes.push(parse_lane(cx, &e, is_empty)?);
+        } else {
+            // A lane set holds only lanes; anything else is consumed into the
+            // span so the parse keeps its position (nothing known writes it).
+            let _ = cx.capture_any(pos, &e, is_empty)?;
+        }
+    }
+}
+
+fn parse_lane(cx: &mut Cx<'_>, start: &BytesStart<'_>, empty: bool) -> Result<Lane, ParseError> {
+    let mut set = attr_set(start)?;
+    let mut lane = Lane {
+        base: BaseElement::new(set.take_id("id").unwrap_or_default()),
+        name: set.take("name"),
+        ..Lane::default()
+    };
+    lane.base.unknown_attrs = set.rest();
+
+    if empty {
+        return Ok(lane);
+    }
+
+    loop {
+        let pos = cx.pos();
+        let (nsk, event) = cx.read()?;
+        let (e, is_empty) = match event {
+            Event::Start(e) => (e, false),
+            Event::Empty(e) => (e, true),
+            Event::Comment(_) => {
+                lane.base.unknown_children.push(cx.capture_span(pos));
+                continue;
+            }
+            Event::End(_) => return Ok(lane),
+            Event::Eof => return Err(structure("unexpected end of file in lane")),
+            _ => continue,
+        };
+
+        if base_child(cx, &mut lane.base, pos, nsk, &e, is_empty)? {
+            continue;
+        }
+        match (nsk, local(&e)) {
+            (Ns::Model, "flowNodeRef") => {
+                if !is_empty {
+                    lane.flow_node_refs.push(BpmnId::new(cx.text(&e)?.trim()));
+                }
+            }
+            (Ns::Model, "childLaneSet") => {
+                lane.child_lane_set = Some(parse_lane_set(cx, &e, is_empty)?);
+            }
+            _ => lane
+                .base
+                .unknown_children
+                .push(cx.capture_any(pos, &e, is_empty)?),
+        }
+    }
+}
+
+fn parse_collaboration(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<Collaboration, ParseError> {
+    let mut set = attr_set(start)?;
+    let mut collaboration = Collaboration {
+        base: BaseElement::new(set.take_id("id").unwrap_or_default()),
+        name: set.take("name"),
+        ..Collaboration::default()
+    };
+    collaboration.base.unknown_attrs = set.rest();
+
+    if empty {
+        return Ok(collaboration);
+    }
+
+    loop {
+        let pos = cx.pos();
+        let (nsk, event) = cx.read()?;
+        let (e, is_empty) = match event {
+            Event::Start(e) => (e, false),
+            Event::Empty(e) => (e, true),
+            Event::Comment(_) => {
+                collaboration
+                    .base
+                    .unknown_children
+                    .push(cx.capture_span(pos));
+                continue;
+            }
+            Event::End(_) => return Ok(collaboration),
+            Event::Eof => return Err(structure("unexpected end of file in collaboration")),
+            _ => continue,
+        };
+
+        if base_child(cx, &mut collaboration.base, pos, nsk, &e, is_empty)? {
+            continue;
+        }
+        match (nsk, local(&e)) {
+            (Ns::Model, "participant") => {
+                collaboration
+                    .participants
+                    .push(parse_participant(cx, &e, is_empty)?);
+            }
+            (Ns::Model, "messageFlow") => {
+                let mut set = attr_set(&e)?;
+                let mut flow = MessageFlow {
+                    base: BaseElement::new(set.take_id("id").unwrap_or_default()),
+                    name: set.take("name"),
+                    source: set.take_id("sourceRef").unwrap_or_default(),
+                    target: set.take_id("targetRef").unwrap_or_default(),
+                };
+                flow.base.unknown_attrs = set.rest();
+                if !is_empty {
+                    parse_base_only(cx, &mut flow.base, "messageFlow")?;
+                }
+                collaboration.message_flows.push(flow);
+            }
+            _ => collaboration
+                .base
+                .unknown_children
+                .push(cx.capture_any(pos, &e, is_empty)?),
+        }
+    }
+}
+
+fn parse_participant(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<Participant, ParseError> {
+    let mut set = attr_set(start)?;
+    let mut participant = Participant {
+        base: BaseElement::new(set.take_id("id").unwrap_or_default()),
+        name: set.take("name"),
+        process_ref: set.take_id("processRef"),
+    };
+    participant.base.unknown_attrs = set.rest();
+    if !empty {
+        parse_base_only(cx, &mut participant.base, "participant")?;
+    }
+    Ok(participant)
+}
+
+/// Consumes an element whose only modeled children are the base ones
+/// (`documentation`, `extensionElements`); the rest is preserved verbatim.
+fn parse_base_only(cx: &mut Cx<'_>, base: &mut BaseElement, what: &str) -> Result<(), ParseError> {
+    loop {
+        let pos = cx.pos();
+        let (nsk, event) = cx.read()?;
+        let (e, is_empty) = match event {
+            Event::Start(e) => (e, false),
+            Event::Empty(e) => (e, true),
+            Event::Comment(_) => {
+                base.unknown_children.push(cx.capture_span(pos));
+                continue;
+            }
+            Event::End(_) => return Ok(()),
+            Event::Eof => return Err(structure(format!("unexpected end of file in {what}"))),
+            _ => continue,
+        };
+        if !base_child(cx, base, pos, nsk, &e, is_empty)? {
+            base.unknown_children
+                .push(cx.capture_any(pos, &e, is_empty)?);
+        }
     }
 }
 

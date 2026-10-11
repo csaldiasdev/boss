@@ -122,6 +122,41 @@ fn element_info(document: &Document, element: &FlowElement) -> Option<ElementInf
     })
 }
 
+/// Pools, lanes, and message flows — collaboration elements outside the
+/// flow-element index.
+fn collaboration_infos(document: &Document) -> Vec<ElementInfo> {
+    let mut out = Vec::new();
+    let Some(collaboration) = document.collaboration() else {
+        return out;
+    };
+    for participant in &collaboration.participants {
+        let center = document
+            .node_outline(&participant.base.id)
+            .map(|(_, b)| b.center());
+        out.push(ElementInfo {
+            id: participant.base.id.as_str().to_string(),
+            kind: "pool",
+            name: participant.name.clone(),
+            x: center.map(|c| c.x),
+            y: center.map(|c| c.y),
+            source: None,
+            target: None,
+        });
+    }
+    for flow in &collaboration.message_flows {
+        out.push(ElementInfo {
+            id: flow.base.id.as_str().to_string(),
+            kind: "message-flow",
+            name: flow.name.clone(),
+            x: None,
+            y: None,
+            source: Some(flow.source.as_str().to_string()),
+            target: Some(flow.target.as_str().to_string()),
+        });
+    }
+    out
+}
+
 fn to_json<T: serde::Serialize>(value: &T) -> Result<String, ErrorData> {
     serde_json::to_string_pretty(value)
         .map_err(|e| ErrorData::internal_error(format!("serialization failed: {e}"), None))
@@ -157,6 +192,25 @@ struct CreateBoundaryParams {
     x: f64,
     /// Diagram y the boundary event should sit toward.
     y: f64,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct CreatePoolParams {
+    /// Optional pool label (the organization or role it represents).
+    name: Option<String>,
+    /// Diagram x of the pool center. Pools are 600x250; stack them
+    /// vertically ~300 units apart.
+    x: f64,
+    /// Diagram y of the pool center.
+    y: f64,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AddLaneParams {
+    /// Id of the pool (participant) to extend.
+    pool: String,
+    /// Optional lane label (a role within the pool).
+    name: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -277,14 +331,16 @@ impl BossMcp {
     }
 
     #[tool(
-        description = "List every element: id, kind, name, center position, and flow endpoints."
+        description = "List every element (pools, message flows, and flow nodes): id, kind, name, center position, and flow endpoints."
     )]
     async fn list_elements(&self) -> Result<String, ErrorData> {
         let document = self.snapshot().await?;
-        let elements: Vec<ElementInfo> = document
-            .flow_elements()
-            .filter_map(|element| element_info(&document, element))
-            .collect();
+        let mut elements = collaboration_infos(&document);
+        elements.extend(
+            document
+                .flow_elements()
+                .filter_map(|element| element_info(&document, element)),
+        );
         to_json(&elements)
     }
 
@@ -300,6 +356,35 @@ impl BossMcp {
                 kind,
                 x: p.x,
                 y: p.y,
+                name: p.name,
+            })
+            .await?;
+        Ok(outcome_text(&outcome))
+    }
+
+    #[tool(
+        description = "Create a pool (participant) at a diagram position; returns its id. The first pool wraps the existing process; later pools get their own empty process. Nodes created inside a pool's area join its process."
+    )]
+    async fn create_pool(&self, params: Parameters<CreatePoolParams>) -> Result<String, ErrorData> {
+        let p = params.0;
+        let outcome = self
+            .apply(EditAction::CreatePool {
+                name: p.name,
+                x: p.x,
+                y: p.y,
+            })
+            .await?;
+        Ok(outcome_text(&outcome))
+    }
+
+    #[tool(
+        description = "Append a lane to a pool; returns the lane id. The first lane covers the pool; later lanes grow it downward. Nodes belong to the lane under their center."
+    )]
+    async fn add_lane(&self, params: Parameters<AddLaneParams>) -> Result<String, ErrorData> {
+        let p = params.0;
+        let outcome = self
+            .apply(EditAction::AddLane {
+                pool: BpmnId::new(p.pool.as_str()),
                 name: p.name,
             })
             .await?;
@@ -323,7 +408,7 @@ impl BossMcp {
     }
 
     #[tool(
-        description = "Connect two nodes with a sequence flow; returns the flow id. Both nodes must live in the same container (the process, or one subprocess)."
+        description = "Connect two elements; returns the flow id. Nodes in the same container get a sequence flow; endpoints in different pools (nodes or the pools themselves) get a message flow. Nodes in different containers of one process cannot connect."
     )]
     async fn connect(&self, params: Parameters<ConnectParams>) -> Result<String, ErrorData> {
         let p = params.0;

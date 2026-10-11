@@ -10,9 +10,10 @@ use crate::document::Document;
 use crate::geometry::{Bounds, Point, Size};
 use crate::ids::BpmnId;
 use crate::model::{
-    Activity, ActivityKind, BOSS_TARGET_NAMESPACE, BaseElement, CallActivity, Condition,
-    Definitions, Event, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, LoopKind,
-    LoopMarker, Process, RootElement, SequenceFlow, SubProcess, SubProcessKind, TaskType,
+    Activity, ActivityKind, BOSS_TARGET_NAMESPACE, BaseElement, CallActivity, Collaboration,
+    Condition, Definitions, Event, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind,
+    Lane, LaneSet, LoopKind, LoopMarker, MessageFlow, Participant, Process, RootElement,
+    SequenceFlow, SubProcess, SubProcessKind, TaskType,
 };
 use std::collections::HashSet;
 
@@ -148,9 +149,8 @@ impl Document {
         let process_id = BpmnId::new("Process_1");
         let process = Process {
             base: BaseElement::new(process_id.clone()),
-            name: None,
             is_executable: Some(false),
-            flow_elements: Vec::new(),
+            ..Process::default()
         };
 
         let definitions = Definitions {
@@ -178,6 +178,18 @@ impl Document {
 
     /// Every id used anywhere in the document.
     fn used_ids(&self) -> HashSet<String> {
+        fn push_lanes(sets: &[LaneSet], push: &mut impl FnMut(Option<&BpmnId>)) {
+            for set in sets {
+                push(set.id.as_ref());
+                for lane in &set.lanes {
+                    push(Some(&lane.base.id));
+                    if let Some(child) = &lane.child_lane_set {
+                        push_lanes(std::slice::from_ref(child), push);
+                    }
+                }
+            }
+        }
+
         let mut ids = HashSet::new();
         let mut push = |id: Option<&BpmnId>| {
             if let Some(id) = id {
@@ -187,8 +199,21 @@ impl Document {
 
         push(self.definitions.id.as_ref());
         for root in &self.definitions.root_elements {
-            if let RootElement::Process(process) = root {
-                push(Some(&process.base.id));
+            match root {
+                RootElement::Process(process) => {
+                    push(Some(&process.base.id));
+                    push_lanes(&process.lane_sets, &mut push);
+                }
+                RootElement::Collaboration(collaboration) => {
+                    push(Some(&collaboration.base.id));
+                    for participant in &collaboration.participants {
+                        push(Some(&participant.base.id));
+                    }
+                    for flow in &collaboration.message_flows {
+                        push(Some(&flow.base.id));
+                    }
+                }
+                RootElement::Unknown(_) => {}
             }
         }
         for element in self.flow_elements() {
@@ -229,8 +254,58 @@ impl Document {
             .iter_mut()
             .find_map(|root| match root {
                 RootElement::Process(process) => Some(process),
-                RootElement::Unknown(_) => None,
+                _ => None,
             })
+    }
+
+    fn collaboration_mut(&mut self) -> Option<&mut Collaboration> {
+        self.definitions
+            .root_elements
+            .iter_mut()
+            .find_map(|root| match root {
+                RootElement::Collaboration(collaboration) => Some(collaboration),
+                _ => None,
+            })
+    }
+
+    fn participant_mut(&mut self, id: &BpmnId) -> Option<&mut Participant> {
+        self.collaboration_mut()?
+            .participants
+            .iter_mut()
+            .find(|p| p.base.id == *id)
+    }
+
+    fn message_flow_mut(&mut self, id: &BpmnId) -> Option<&mut MessageFlow> {
+        self.collaboration_mut()?
+            .message_flows
+            .iter_mut()
+            .find(|m| m.base.id == *id)
+    }
+
+    fn lane_mut(&mut self, id: &BpmnId) -> Option<&mut Lane> {
+        fn scan<'a>(sets: &'a mut [LaneSet], id: &BpmnId) -> Option<&'a mut Lane> {
+            for set in sets {
+                for lane in &mut set.lanes {
+                    if lane.base.id == *id {
+                        return Some(lane);
+                    }
+                    if let Some(child) = &mut lane.child_lane_set
+                        && let Some(found) = scan(std::slice::from_mut(child), id)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        self.definitions
+            .root_elements
+            .iter_mut()
+            .filter_map(|root| match root {
+                RootElement::Process(process) => Some(process),
+                _ => None,
+            })
+            .find_map(|process| scan(&mut process.lane_sets, id))
     }
 
     fn plane_mut(&mut self) -> Option<&mut BpmnPlane> {
@@ -275,10 +350,12 @@ impl Document {
         None
     }
 
-    /// The deepest *expanded* subprocess whose shape contains `point`, falling
-    /// back to the first process: where a node dropped at `point` belongs.
-    /// `except` (a node plus its descendants) never counts as a container, so
-    /// a subprocess cannot be dropped into itself.
+    /// The deepest container whose shape contains `point`: an expanded
+    /// subprocess, or the process behind a pool. Without a collaboration the
+    /// first process is the fallback canvas; with one, a point outside every
+    /// pool belongs nowhere (`None`). `except` (a node plus its descendants)
+    /// never counts as a container, so a subprocess cannot be dropped into
+    /// itself.
     fn container_at(&self, point: Point, except: &HashSet<BpmnId>) -> Option<BpmnId> {
         let index = self.flow_element_index();
         let plane = self.diagram()?.plane.as_ref()?;
@@ -290,25 +367,35 @@ impl Document {
                 continue;
             };
             let id = &shape.bpmn_element;
-            if except.contains(id) || hidden.contains(id) || shape.is_expanded != Some(true) {
+            if except.contains(id) || hidden.contains(id) || !shape.bounds.contains(point) {
                 continue;
             }
-            let Some(FlowElement::Activity(activity)) = index.get(id).copied() else {
-                continue;
+            // A container resolves to the collection that adopts the node:
+            // the subprocess itself, or a pool's backing process.
+            let container = match index.get(id).copied() {
+                Some(FlowElement::Activity(activity))
+                    if matches!(activity.kind, ActivityKind::SubProcess(_))
+                        && shape.is_expanded == Some(true) =>
+                {
+                    id.clone()
+                }
+                _ => match self.participant(id).and_then(|p| p.process_ref.clone()) {
+                    Some(process) => process,
+                    None => continue,
+                },
             };
-            if !matches!(activity.kind, ActivityKind::SubProcess(_))
-                || !shape.bounds.contains(point)
-            {
-                continue;
-            }
             let area = shape.bounds.width * shape.bounds.height;
             if best.as_ref().is_none_or(|(_, a)| area < *a) {
-                best = Some((id.clone(), area));
+                best = Some((container, area));
             }
         }
 
-        best.map(|(id, _)| id)
-            .or_else(|| self.processes().next().map(|p| p.base.id.clone()))
+        best.map(|(id, _)| id).or_else(|| {
+            // In a collaboration everything lives in some pool.
+            (self.collaboration().is_none())
+                .then(|| self.processes().next().map(|p| p.base.id.clone()))
+                .flatten()
+        })
     }
 
     /// Creates a flow node of `kind` centered at `center`; returns its id.
@@ -391,21 +478,31 @@ impl Document {
             is_expanded: matches!(kind, NodeKind::SubProcess(_)).then_some(true),
             ..BpmnShape::default()
         }));
+        self.assign_lanes();
 
         Some(id)
     }
 
-    /// Connects two flow nodes with a sequence flow; returns the flow's id.
-    /// Refuses self-connections, unknown endpoints, and endpoints living in
-    /// different containers (the spec keeps sequence flows inside one).
+    /// Connects two elements: nodes in the same container get a sequence
+    /// flow; endpoints in different pools (nodes or the pools themselves) get
+    /// a message flow. Refuses self-connections, unknown endpoints, and nodes
+    /// in different containers of the same process.
     pub fn connect(&mut self, source: &BpmnId, target: &BpmnId) -> Option<BpmnId> {
         if source == target {
             return None;
         }
-        let container = self.container_of(source)?;
-        if self.container_of(target)? != container {
-            return None;
+        match (self.container_of(source), self.container_of(target)) {
+            (Some(sc), Some(tc)) if sc == tc => self.connect_sequence(source, target, &sc),
+            _ => self.connect_message(source, target),
         }
+    }
+
+    fn connect_sequence(
+        &mut self,
+        source: &BpmnId,
+        target: &BpmnId,
+        container: &BpmnId,
+    ) -> Option<BpmnId> {
         let (source_outline, source_bounds) = self.node_outline(source)?;
         let (target_outline, target_bounds) = self.node_outline(target)?;
 
@@ -415,7 +512,7 @@ impl Document {
         let from = source_outline.anchor(source_bounds, target_bounds.center());
         let to = target_outline.anchor(target_bounds, source_bounds.center());
 
-        self.elements_of_mut(&container)?
+        self.elements_of_mut(container)?
             .push(FlowElement::SequenceFlow(SequenceFlow {
                 base: BaseElement::new(id.clone()),
                 name: None,
@@ -438,6 +535,50 @@ impl Document {
             ..BpmnEdge::default()
         }));
 
+        Some(id)
+    }
+
+    /// The pool identity of a message-flow endpoint: the backing process for
+    /// nodes and process-backed participants, the participant itself for
+    /// black-box pools. Endpoints with the same key cannot exchange messages.
+    fn endpoint_pool(&self, id: &BpmnId) -> Option<BpmnId> {
+        if let Some(participant) = self.participant(id) {
+            return Some(
+                participant
+                    .process_ref
+                    .clone()
+                    .unwrap_or_else(|| participant.base.id.clone()),
+            );
+        }
+        self.process_of(id)
+    }
+
+    fn connect_message(&mut self, source: &BpmnId, target: &BpmnId) -> Option<BpmnId> {
+        // Message flows need a collaboration and endpoints in different pools.
+        self.collaboration()?;
+        if self.endpoint_pool(source)? == self.endpoint_pool(target)? {
+            return None;
+        }
+        let (source_outline, source_bounds) = self.node_outline(source)?;
+        let (target_outline, target_bounds) = self.node_outline(target)?;
+
+        let id = self.fresh_id("MessageFlow");
+        let edge_id = BpmnId::new(format!("{id}_di").as_str());
+        let from = source_outline.anchor(source_bounds, target_bounds.center());
+        let to = target_outline.anchor(target_bounds, source_bounds.center());
+
+        self.collaboration_mut()?.message_flows.push(MessageFlow {
+            base: BaseElement::new(id.clone()),
+            name: None,
+            source: source.clone(),
+            target: target.clone(),
+        });
+        self.plane_mut()?.elements.push(DiElement::Edge(BpmnEdge {
+            id: Some(edge_id),
+            bpmn_element: id.clone(),
+            waypoints: vec![from, to],
+            ..BpmnEdge::default()
+        }));
         Some(id)
     }
 
@@ -531,10 +672,14 @@ impl Document {
             .collect()
     }
 
-    /// The outline and DI bounds of a flow node.
+    /// The outline and DI bounds of a flow node or pool.
     pub fn node_outline(&self, id: &BpmnId) -> Option<(Outline, Bounds)> {
         let index = self.flow_element_index();
-        let outline = outline_of(index.get(id).copied()?)?;
+        let outline = match index.get(id).copied() {
+            Some(element) => outline_of(element)?,
+            // Pools anchor message flows on their rectangle.
+            None => self.participant(id).map(|_| Outline::Rect)?,
+        };
         let plane = self.diagram()?.plane.as_ref()?;
         let bounds = plane.elements.iter().find_map(|element| match element {
             DiElement::Shape(shape) if shape.bpmn_element == *id => Some(shape.bounds),
@@ -552,26 +697,36 @@ impl Document {
         let mut moving: HashSet<BpmnId> = ids.clone();
         for id in ids {
             moving.extend(self.descendants_of(id));
+            moving.extend(self.pool_members(id));
         }
         moving.extend(self.attached_boundaries(&moving));
 
         // Edges fully inside the moving set travel rigidly (all waypoints);
-        // edges with one end inside get their endpoints re-anchored.
+        // edges with one end inside get their endpoints re-anchored. Message
+        // flows behave the same, with pools counting as endpoints.
         let mut rigid: HashSet<BpmnId> = HashSet::new();
         let mut touched: Vec<(BpmnId, BpmnId, BpmnId)> = Vec::new();
-        for element in self.flow_elements() {
-            if let FlowElement::SequenceFlow(flow) = element {
-                match (moving.contains(&flow.source), moving.contains(&flow.target)) {
-                    (true, true) => {
-                        rigid.insert(flow.base.id.clone());
-                    }
-                    (true, false) | (false, true) => touched.push((
-                        flow.base.id.clone(),
-                        flow.source.clone(),
-                        flow.target.clone(),
-                    )),
-                    (false, false) => {}
+        let flow_ends = self
+            .flow_elements()
+            .filter_map(|element| match element {
+                FlowElement::SequenceFlow(flow) => {
+                    Some((&flow.base.id, &flow.source, &flow.target))
                 }
+                _ => None,
+            })
+            .chain(
+                self.message_flows()
+                    .map(|flow| (&flow.base.id, &flow.source, &flow.target)),
+            );
+        for (id, source, target) in flow_ends {
+            match (moving.contains(source), moving.contains(target)) {
+                (true, true) => {
+                    rigid.insert(id.clone());
+                }
+                (true, false) | (false, true) => {
+                    touched.push((id.clone(), source.clone(), target.clone()));
+                }
+                (false, false) => {}
             }
         }
 
@@ -612,6 +767,7 @@ impl Document {
             self.reanchor_flow(&flow_id, &source, &target);
         }
         self.reparent_moved(ids);
+        self.assign_lanes();
     }
 
     /// Reparents explicitly moved nodes whose center now sits in a different
@@ -840,6 +996,315 @@ impl Document {
         changed
     }
 
+    /// Creates a pool (participant) centered at `at`; returns its id. The
+    /// first pool adopts the existing default process (wrapping its content);
+    /// later pools each get a fresh, empty process. Creating the first pool
+    /// also creates the collaboration and points the plane at it.
+    pub fn create_pool(&mut self, name: Option<String>, at: Point) -> Option<BpmnId> {
+        const POOL_HEADER: f64 = 30.0;
+        const PADDING: f64 = 40.0;
+        const DEFAULT_SIZE: Size = Size {
+            width: 600.0,
+            height: 250.0,
+        };
+
+        let id = self.fresh_id("Participant");
+        let shape_id = BpmnId::new(format!("{id}_di").as_str());
+
+        if self.collaboration().is_none() {
+            let collaboration_id = self.fresh_id("Collaboration");
+            self.definitions.root_elements.insert(
+                0,
+                RootElement::Collaboration(Collaboration {
+                    base: BaseElement::new(collaboration_id.clone()),
+                    ..Collaboration::default()
+                }),
+            );
+            if let Some(plane) = self.plane_mut() {
+                plane.bpmn_element = Some(collaboration_id);
+            }
+        }
+
+        // Adopt the first process no pool references yet, else make a new one.
+        let referenced: HashSet<BpmnId> = self
+            .collaboration()
+            .into_iter()
+            .flat_map(|c| &c.participants)
+            .filter_map(|p| p.process_ref.clone())
+            .collect();
+        let adopted = self
+            .processes()
+            .map(|p| p.base.id.clone())
+            .find(|id| !referenced.contains(id));
+        let process_ref = adopted.clone().unwrap_or_else(|| {
+            let process_id = self.fresh_id("Process");
+            self.definitions
+                .root_elements
+                .push(RootElement::Process(Process {
+                    base: BaseElement::new(process_id.clone()),
+                    is_executable: Some(false),
+                    ..Process::default()
+                }));
+            process_id
+        });
+
+        // Wrap existing content when adopting a non-empty process; otherwise
+        // place an empty pool at the requested point.
+        let content = adopted.and_then(|process_id| {
+            let members: HashSet<BpmnId> = self.pool_ids_of_process(&process_id);
+            let plane = self.diagram()?.plane.as_ref()?;
+            let mut bbox: Option<Bounds> = None;
+            for element in &plane.elements {
+                if let DiElement::Shape(shape) = element
+                    && members.contains(&shape.bpmn_element)
+                {
+                    bbox = Some(bbox.map_or(shape.bounds, |b| b.union(shape.bounds)));
+                }
+            }
+            bbox
+        });
+        let bounds = content.map_or_else(
+            || {
+                Bounds::new(
+                    at.x - DEFAULT_SIZE.width / 2.0,
+                    at.y - DEFAULT_SIZE.height / 2.0,
+                    DEFAULT_SIZE.width,
+                    DEFAULT_SIZE.height,
+                )
+            },
+            |b| {
+                Bounds::new(
+                    b.x - PADDING - POOL_HEADER,
+                    b.y - PADDING,
+                    b.width + PADDING * 2.0 + POOL_HEADER,
+                    b.height + PADDING * 2.0,
+                )
+            },
+        );
+
+        self.collaboration_mut()?.participants.push(Participant {
+            base: BaseElement::new(id.clone()),
+            name,
+            process_ref: Some(process_ref),
+        });
+        self.plane_mut()?.elements.push(DiElement::Shape(BpmnShape {
+            id: Some(shape_id),
+            bpmn_element: id.clone(),
+            bounds,
+            is_horizontal: Some(true),
+            ..BpmnShape::default()
+        }));
+        Some(id)
+    }
+
+    /// Appends a lane to a pool; returns the lane's id. The first lane covers
+    /// the pool's body; each further lane grows the pool downward.
+    pub fn add_lane(&mut self, pool: &BpmnId, name: Option<String>) -> Option<BpmnId> {
+        const POOL_HEADER: f64 = 30.0;
+        const LANE_HEIGHT: f64 = 120.0;
+
+        let process_id = self.participant(pool)?.process_ref.clone()?;
+        let (_, pool_bounds) = self.node_outline(pool)?;
+        let existing = self
+            .processes()
+            .find(|p| p.base.id == process_id)
+            .map_or(0, |p| p.lane_sets.iter().map(|s| s.lanes.len()).sum());
+
+        let id = self.fresh_id("Lane");
+        let shape_id = BpmnId::new(format!("{id}_di").as_str());
+        let bounds = if existing == 0 {
+            Bounds::new(
+                pool_bounds.x + POOL_HEADER,
+                pool_bounds.y,
+                pool_bounds.width - POOL_HEADER,
+                pool_bounds.height,
+            )
+        } else {
+            Bounds::new(
+                pool_bounds.x + POOL_HEADER,
+                pool_bounds.y + pool_bounds.height,
+                pool_bounds.width - POOL_HEADER,
+                LANE_HEIGHT,
+            )
+        };
+
+        let lane_set_id = self.fresh_id("LaneSet");
+        let process = self
+            .definitions
+            .root_elements
+            .iter_mut()
+            .find_map(|root| match root {
+                RootElement::Process(process) if process.base.id == process_id => Some(process),
+                _ => None,
+            })?;
+        if process.lane_sets.is_empty() {
+            process.lane_sets.push(LaneSet {
+                id: Some(lane_set_id),
+                ..LaneSet::default()
+            });
+        }
+        process.lane_sets[0].lanes.push(Lane {
+            base: BaseElement::new(id.clone()),
+            name,
+            ..Lane::default()
+        });
+
+        if existing > 0 {
+            // Grow the pool to make room for the new lane.
+            if let Some(plane) = self.plane_mut() {
+                for element in &mut plane.elements {
+                    if let DiElement::Shape(shape) = element
+                        && shape.bpmn_element == *pool
+                    {
+                        shape.bounds.height += LANE_HEIGHT;
+                    }
+                }
+            }
+        }
+        self.plane_mut()?.elements.push(DiElement::Shape(BpmnShape {
+            id: Some(shape_id),
+            bpmn_element: id.clone(),
+            bounds,
+            is_horizontal: Some(true),
+            ..BpmnShape::default()
+        }));
+        self.assign_lanes();
+        Some(id)
+    }
+
+    /// Every element id belonging to the pool `id` (its process's contents,
+    /// at any depth, plus its lanes). Empty when `id` is not a pool.
+    fn pool_members(&self, id: &BpmnId) -> Vec<BpmnId> {
+        let Some(process_id) = self.participant(id).and_then(|p| p.process_ref.clone()) else {
+            return Vec::new();
+        };
+        self.pool_ids_of_process(&process_id).into_iter().collect()
+    }
+
+    /// The element and lane ids of one process (contents at any depth).
+    fn pool_ids_of_process(&self, process_id: &BpmnId) -> HashSet<BpmnId> {
+        fn collect(elements: &[FlowElement], out: &mut HashSet<BpmnId>) {
+            for element in elements {
+                if let Some(id) = element.id() {
+                    out.insert(id.clone());
+                }
+                if let FlowElement::Activity(activity) = element
+                    && let ActivityKind::SubProcess(sub) = &activity.kind
+                {
+                    collect(&sub.flow_elements, out);
+                }
+            }
+        }
+        fn collect_lanes(sets: &[LaneSet], out: &mut HashSet<BpmnId>) {
+            for set in sets {
+                for lane in &set.lanes {
+                    out.insert(lane.base.id.clone());
+                    if let Some(child) = &lane.child_lane_set {
+                        collect_lanes(std::slice::from_ref(child), out);
+                    }
+                }
+            }
+        }
+        let mut out = HashSet::new();
+        if let Some(process) = self.processes().find(|p| p.base.id == *process_id) {
+            collect(&process.flow_elements, &mut out);
+            collect_lanes(&process.lane_sets, &mut out);
+        }
+        out
+    }
+
+    /// Rebuilds `flowNodeRef` lists from geometry: each top-level node of a
+    /// process belongs to the smallest DI-backed lane containing its center.
+    /// Lanes without DI bounds keep their references as loaded.
+    fn assign_lanes(&mut self) {
+        use std::collections::HashMap;
+
+        // Writes the refs back into every DI-backed lane.
+        fn apply(
+            sets: &mut [LaneSet],
+            assignments: &HashMap<BpmnId, Vec<BpmnId>>,
+            backed: &HashMap<BpmnId, Bounds>,
+        ) {
+            for set in sets {
+                for lane in &mut set.lanes {
+                    if backed.contains_key(&lane.base.id) {
+                        lane.flow_node_refs =
+                            assignments.get(&lane.base.id).cloned().unwrap_or_default();
+                    }
+                    if let Some(child) = &mut lane.child_lane_set {
+                        apply(std::slice::from_mut(child), assignments, backed);
+                    }
+                }
+            }
+        }
+
+        // Lane bounds from DI.
+        let mut lane_bounds: HashMap<BpmnId, Bounds> = HashMap::new();
+        if let Some(plane) = self.diagram().and_then(|d| d.plane.as_ref()) {
+            for element in &plane.elements {
+                if let DiElement::Shape(shape) = element
+                    && self.lane(&shape.bpmn_element).is_some()
+                {
+                    lane_bounds.insert(shape.bpmn_element.clone(), shape.bounds);
+                }
+            }
+        }
+        if lane_bounds.is_empty() {
+            return;
+        }
+
+        // For each process: node centers → smallest containing lane.
+        let mut assignments: HashMap<BpmnId, Vec<BpmnId>> = HashMap::new();
+        let process_ids: Vec<BpmnId> = self.processes().map(|p| p.base.id.clone()).collect();
+        for process_id in &process_ids {
+            let lane_ids: Vec<BpmnId> = self
+                .pool_ids_of_process(process_id)
+                .into_iter()
+                .filter(|id| lane_bounds.contains_key(id))
+                .collect();
+            if lane_ids.is_empty() {
+                continue;
+            }
+            let process = self.processes().find(|p| p.base.id == *process_id);
+            let Some(process) = process else { continue };
+            for element in &process.flow_elements {
+                let is_node = matches!(
+                    element,
+                    FlowElement::Event(_) | FlowElement::Activity(_) | FlowElement::Gateway(_)
+                );
+                let Some(id) = element.id().filter(|_| is_node) else {
+                    continue;
+                };
+                let Some((_, bounds)) = self.node_outline(id) else {
+                    continue;
+                };
+                let center = bounds.center();
+                let mut best: Option<(&BpmnId, f64)> = None;
+                for lane_id in &lane_ids {
+                    let lb = lane_bounds[lane_id];
+                    if lb.contains(center) {
+                        let area = lb.width * lb.height;
+                        if best.is_none_or(|(_, a)| area < a) {
+                            best = Some((lane_id, area));
+                        }
+                    }
+                }
+                if let Some((lane_id, _)) = best {
+                    assignments
+                        .entry(lane_id.clone())
+                        .or_default()
+                        .push(id.clone());
+                }
+            }
+        }
+
+        for root in &mut self.definitions.root_elements {
+            if let RootElement::Process(process) = root {
+                apply(&mut process.lane_sets, &assignments, &lane_bounds);
+            }
+        }
+    }
+
     /// Sets a call activity's `calledElement`; empty/`None` clears it.
     pub fn set_called_element(&mut self, id: &BpmnId, called: Option<String>) -> bool {
         let Some(FlowElement::Activity(activity)) = self.flow_element_mut(id) else {
@@ -885,15 +1350,17 @@ impl Document {
         }
     }
 
-    /// Deletes elements (plus the contents of deleted subprocesses and every
-    /// sequence flow touching a deleted node) and their DI, and strips
-    /// dangling references from surviving nodes.
+    /// Deletes elements (plus the contents of deleted subprocesses and pools,
+    /// and every flow touching a deleted element) and their DI, and strips
+    /// dangling references from the survivors. Deleting the last pool
+    /// dissolves the collaboration back into a plain process diagram.
     pub fn delete_elements(&mut self, ids: &HashSet<BpmnId>) {
-        // Expand the set with subprocess contents, then with flows that touch
-        // deleted nodes.
+        // Expand the set with subprocess and pool contents, then with flows
+        // that touch deleted elements.
         let mut doomed: HashSet<BpmnId> = ids.clone();
         for id in ids {
             doomed.extend(self.descendants_of(id));
+            doomed.extend(self.pool_members(id));
         }
         for element in self.flow_elements() {
             if let FlowElement::SequenceFlow(flow) = element
@@ -902,10 +1369,43 @@ impl Document {
                 doomed.insert(flow.base.id.clone());
             }
         }
+        let message_doomed: Vec<BpmnId> = self
+            .message_flows()
+            .filter(|flow| {
+                doomed.contains(&flow.base.id)
+                    || doomed.contains(&flow.source)
+                    || doomed.contains(&flow.target)
+            })
+            .map(|flow| flow.base.id.clone())
+            .collect();
+        doomed.extend(message_doomed);
+
+        // Processes backing deleted pools die with them.
+        let dead_processes: HashSet<BpmnId> = self
+            .collaboration()
+            .into_iter()
+            .flat_map(|c| &c.participants)
+            .filter(|p| doomed.contains(&p.base.id))
+            .filter_map(|p| p.process_ref.clone())
+            .collect();
+
+        if let Some(collaboration) = self.collaboration_mut() {
+            collaboration
+                .participants
+                .retain(|p| !doomed.contains(&p.base.id));
+            collaboration
+                .message_flows
+                .retain(|m| !doomed.contains(&m.base.id));
+        }
+        self.definitions.root_elements.retain(|root| match root {
+            RootElement::Process(process) => !dead_processes.contains(&process.base.id),
+            _ => true,
+        });
 
         for root in &mut self.definitions.root_elements {
             if let RootElement::Process(process) = root {
                 prune_deleted(&mut process.flow_elements, &doomed);
+                prune_lanes(&mut process.lane_sets, &doomed);
             }
         }
 
@@ -915,6 +1415,31 @@ impl Document {
                 DiElement::Edge(edge) => !doomed.contains(&edge.bpmn_element),
                 DiElement::Unknown(_) => true,
             });
+        }
+
+        // A collaboration without pools dissolves; the canvas shows a plain
+        // process again (a fresh one if the last pool took every process).
+        if self
+            .collaboration()
+            .is_some_and(|c| c.participants.is_empty())
+        {
+            self.definitions
+                .root_elements
+                .retain(|root| !matches!(root, RootElement::Collaboration(_)));
+            if self.processes().next().is_none() {
+                let process_id = self.fresh_id("Process");
+                self.definitions
+                    .root_elements
+                    .push(RootElement::Process(Process {
+                        base: BaseElement::new(process_id),
+                        is_executable: Some(false),
+                        ..Process::default()
+                    }));
+            }
+            let first = self.processes().next().map(|p| p.base.id.clone());
+            if let Some(plane) = self.plane_mut() {
+                plane.bpmn_element = first;
+            }
         }
     }
 }
@@ -941,22 +1466,37 @@ impl Document {
             .iter_mut()
             .filter_map(|root| match root {
                 RootElement::Process(process) => Some(process),
-                RootElement::Unknown(_) => None,
+                _ => None,
             })
             .find_map(|process| scan(&mut process.flow_elements, id))
     }
 
-    /// Renames a flow element (`None` removes the name).
+    /// Renames a flow element, pool, lane, or message flow (`None` removes
+    /// the name).
     pub fn set_name(&mut self, id: &BpmnId, name: Option<String>) -> bool {
+        fn set(slot: &mut Option<String>, name: Option<String>) -> bool {
+            *slot = name;
+            true
+        }
+
         let name = name.filter(|n| !n.is_empty());
         match self.flow_element_mut(id) {
-            Some(FlowElement::Event(e)) => e.node.name = name,
-            Some(FlowElement::Activity(a)) => a.node.name = name,
-            Some(FlowElement::Gateway(g)) => g.node.name = name,
-            Some(FlowElement::SequenceFlow(f)) => f.name = name,
-            _ => return false,
+            Some(FlowElement::Event(e)) => return set(&mut e.node.name, name),
+            Some(FlowElement::Activity(a)) => return set(&mut a.node.name, name),
+            Some(FlowElement::Gateway(g)) => return set(&mut g.node.name, name),
+            Some(FlowElement::SequenceFlow(f)) => return set(&mut f.name, name),
+            _ => {}
         }
-        true
+        if let Some(participant) = self.participant_mut(id) {
+            return set(&mut participant.name, name);
+        }
+        if let Some(lane) = self.lane_mut(id) {
+            return set(&mut lane.name, name);
+        }
+        if let Some(flow) = self.message_flow_mut(id) {
+            return set(&mut flow.name, name);
+        }
+        false
     }
 
     /// Changes a task's type (its XML tag). Subprocesses and call activities
@@ -1025,7 +1565,10 @@ impl Document {
         }
         let (source, target) = match self.flow_element_index().get(flow_id) {
             Some(FlowElement::SequenceFlow(flow)) => (flow.source.clone(), flow.target.clone()),
-            _ => return false,
+            _ => match self.message_flows().find(|m| m.base.id == *flow_id) {
+                Some(flow) => (flow.source.clone(), flow.target.clone()),
+                None => return false,
+            },
         };
 
         let Some(plane) = self.plane_mut() else {
@@ -1218,6 +1761,12 @@ impl Document {
             plane.elements.extend(di);
         }
 
+        // Pasted geometry decides containment and lane membership, exactly
+        // like a drop would.
+        let pasted: HashSet<BpmnId> = new_nodes.iter().cloned().collect();
+        self.reparent_moved(&pasted);
+        self.assign_lanes();
+
         new_nodes
     }
 }
@@ -1233,6 +1782,23 @@ impl Default for Document {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Removes doomed lanes (descending into child lane sets) and strips doomed
+/// node references from the lanes that remain. Emptied lane sets disappear.
+fn prune_lanes(sets: &mut Vec<LaneSet>, doomed: &HashSet<BpmnId>) {
+    for set in sets.iter_mut() {
+        set.lanes.retain(|lane| !doomed.contains(&lane.base.id));
+        for lane in &mut set.lanes {
+            lane.flow_node_refs.retain(|id| !doomed.contains(id));
+            if let Some(child) = &mut lane.child_lane_set {
+                let mut child_sets = vec![std::mem::take(child)];
+                prune_lanes(&mut child_sets, doomed);
+                lane.child_lane_set = child_sets.pop().filter(|s| !s.lanes.is_empty());
+            }
+        }
+    }
+    sets.retain(|set| !set.lanes.is_empty());
 }
 
 /// Removes doomed elements from a flow-element collection (descending into
@@ -1710,6 +2276,137 @@ mod m3_tests {
         };
         assert_ne!(flow.source, a);
         assert_eq!(doc.container_of(&flow.source).as_ref(), Some(&pasted[0]));
+    }
+
+    #[test]
+    fn pools_wrap_adopt_and_message_flows_connect_them() {
+        let mut doc = Document::new();
+        let start = doc
+            .create_node(NodeKind::StartEvent, Point::new(0.0, 0.0))
+            .unwrap();
+        let task = doc
+            .create_node(NodeKind::Task(TaskType::User), Point::new(200.0, 0.0))
+            .unwrap();
+        doc.connect(&start, &task).unwrap();
+
+        // The first pool adopts Process_1 and wraps its content.
+        let pool_a = doc
+            .create_pool(Some(String::from("Shop")), Point::new(0.0, 0.0))
+            .unwrap();
+        assert!(doc.collaboration().is_some());
+        assert_eq!(
+            doc.participant(&pool_a).unwrap().process_ref,
+            Some(BpmnId::from("Process_1"))
+        );
+        let (_, bounds_a) = doc.node_outline(&pool_a).unwrap();
+        let (_, task_bounds) = doc.node_outline(&task).unwrap();
+        assert!(
+            bounds_a.contains(task_bounds.center()),
+            "pool wraps content"
+        );
+        // The plane now shows the collaboration.
+        let plane_ref = doc.diagram().unwrap().plane.as_ref().unwrap();
+        assert_eq!(
+            plane_ref.bpmn_element,
+            Some(doc.collaboration().unwrap().base.id.clone())
+        );
+
+        // A second pool gets its own fresh process.
+        let pool_b = doc
+            .create_pool(Some(String::from("Customer")), Point::new(0.0, 500.0))
+            .unwrap();
+        let process_b = doc
+            .participant(&pool_b)
+            .unwrap()
+            .process_ref
+            .clone()
+            .unwrap();
+        assert_ne!(process_b.as_str(), "Process_1");
+
+        // A node placed inside pool B joins process B.
+        let order = doc
+            .create_node(NodeKind::StartEvent, Point::new(0.0, 500.0))
+            .unwrap();
+        assert_eq!(doc.container_of(&order), Some(process_b));
+        // A node placed outside every pool is refused.
+        assert!(
+            doc.create_node(NodeKind::EndEvent, Point::new(2000.0, 2000.0))
+                .is_none()
+        );
+
+        // Cross-pool connect produces a message flow; same-pool a sequence.
+        let message = doc.connect(&task, &order).unwrap();
+        assert!(message.as_str().starts_with("MessageFlow"));
+        assert_eq!(doc.message_flows().count(), 1);
+        // Pool-to-pool works too; pool-to-own-content does not.
+        assert!(doc.connect(&pool_b, &task).is_some());
+        assert!(doc.connect(&pool_a, &task).is_none(), "same pool");
+
+        // Moving pool B carries its content and the message flow endpoint.
+        let moved: HashSet<BpmnId> = [pool_b.clone()].into_iter().collect();
+        let before = doc.node_outline(&order).unwrap().1;
+        doc.move_shapes(&moved, 50.0, 100.0);
+        let after = doc.node_outline(&order).unwrap().1;
+        assert_eq!((after.x - before.x, after.y - before.y), (50.0, 100.0));
+
+        // Deleting pool B removes its process, content, and message flows.
+        doc.delete_elements(&moved);
+        assert!(doc.participant(&pool_b).is_none());
+        assert_eq!(doc.message_flows().count(), 0);
+        assert_eq!(doc.processes().count(), 1);
+
+        // Deleting the last pool takes its contents, dissolves the
+        // collaboration, and leaves a fresh empty process on the plane.
+        let doomed: HashSet<BpmnId> = [pool_a].into_iter().collect();
+        doc.delete_elements(&doomed);
+        assert!(doc.collaboration().is_none());
+        assert_eq!(doc.flow_elements().count(), 0);
+        let process = doc.processes().next().unwrap();
+        let plane_ref = doc.diagram().unwrap().plane.as_ref().unwrap();
+        assert_eq!(plane_ref.bpmn_element, Some(process.base.id.clone()));
+    }
+
+    #[test]
+    fn lanes_grow_the_pool_and_track_membership() {
+        let mut doc = Document::new();
+        let pool = doc.create_pool(None, Point::new(0.0, 0.0)).unwrap();
+        let (_, before) = doc.node_outline(&pool).unwrap();
+
+        let top = doc.add_lane(&pool, Some(String::from("Sales"))).unwrap();
+        let bottom = doc.add_lane(&pool, Some(String::from("Support"))).unwrap();
+        let (_, after) = doc.node_outline(&pool).unwrap();
+        assert!(after.height > before.height, "second lane grew the pool");
+
+        // A node placed in the top lane is referenced by it.
+        let task = doc
+            .create_node(NodeKind::Task(TaskType::User), Point::new(0.0, 0.0))
+            .unwrap();
+        assert_eq!(doc.lane(&top).unwrap().flow_node_refs, vec![task.clone()]);
+        assert_eq!(doc.lane(&bottom).unwrap().flow_node_refs, Vec::new());
+
+        // Moving it into the bottom lane moves the reference. (Lanes have no
+        // outline — they are not connectable — so read their DI directly.)
+        let shape_bounds = |doc: &Document, id: &BpmnId| {
+            doc.diagram()
+                .unwrap()
+                .plane
+                .as_ref()
+                .unwrap()
+                .elements
+                .iter()
+                .find_map(|e| match e {
+                    DiElement::Shape(shape) if shape.bpmn_element == *id => Some(shape.bounds),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let moved: HashSet<BpmnId> = [task.clone()].into_iter().collect();
+        let bottom_bounds = shape_bounds(&doc, &bottom);
+        let (_, task_bounds) = doc.node_outline(&task).unwrap();
+        let dy = bottom_bounds.center().y - task_bounds.center().y;
+        doc.move_shapes(&moved, 0.0, dy);
+        assert_eq!(doc.lane(&top).unwrap().flow_node_refs, Vec::new());
+        assert_eq!(doc.lane(&bottom).unwrap().flow_node_refs, vec![task]);
     }
 
     #[test]

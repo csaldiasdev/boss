@@ -9,9 +9,10 @@ use crate::ns;
 use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiElement};
 use bpmn_core::geometry::Bounds;
 use bpmn_core::model::{
-    Activity, ActivityKind, BaseElement, Condition, Definitions, Event, EventDefinition,
-    EventDefinitionBody, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, LoopKind,
-    LoopMarker, Process, RootElement, SequenceFlow, SubProcessKind, TaskType,
+    Activity, ActivityKind, BaseElement, Collaboration, Condition, Definitions, Event,
+    EventDefinition, EventDefinitionBody, EventPosition, FlowElement, FlowNode, Gateway,
+    GatewayKind, Lane, LaneSet, LoopKind, LoopMarker, Process, RootElement, SequenceFlow,
+    SubProcessKind, TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::escape::escape;
@@ -260,6 +261,7 @@ impl Emitter {
         for root in &def.root_elements {
             match root {
                 RootElement::Process(process) => self.process(process),
+                RootElement::Collaboration(collaboration) => self.collaboration(collaboration),
                 RootElement::Unknown(raw) => self.raw(raw),
             }
         }
@@ -318,6 +320,7 @@ impl Emitter {
         let has_children = !process.base.documentation.is_empty()
             || process.base.extension_elements.is_some()
             || !process.base.unknown_children.is_empty()
+            || !process.lane_sets.is_empty()
             || !process.flow_elements.is_empty();
 
         let name = self.model_tag("process");
@@ -328,6 +331,9 @@ impl Emitter {
 
         self.open(&name, &attrs);
         self.base_children(&process.base);
+        for lane_set in &process.lane_sets {
+            self.lane_set(lane_set, "laneSet");
+        }
         for element in &process.flow_elements {
             self.flow_element(element);
         }
@@ -335,6 +341,116 @@ impl Emitter {
             self.raw(raw);
         }
         self.close(&name);
+    }
+
+    fn lane_set(&mut self, lane_set: &LaneSet, local: &str) {
+        let mut attrs = Attrs::default();
+        attrs.push_id_opt("id", lane_set.id.as_ref());
+        attrs.push_unknown(&lane_set.unknown_attrs);
+
+        let name = self.model_tag(local);
+        if lane_set.lanes.is_empty() {
+            self.empty(&name, &attrs);
+            return;
+        }
+        self.open(&name, &attrs);
+        for lane in &lane_set.lanes {
+            self.lane(lane);
+        }
+        self.close(&name);
+    }
+
+    fn lane(&mut self, lane: &Lane) {
+        let mut attrs = Attrs::default();
+        attrs.push_id("id", &lane.base.id);
+        attrs.push_opt("name", lane.name.as_deref());
+        attrs.push_unknown(&lane.base.unknown_attrs);
+
+        let has_children = !lane.base.documentation.is_empty()
+            || lane.base.extension_elements.is_some()
+            || !lane.base.unknown_children.is_empty()
+            || !lane.flow_node_refs.is_empty()
+            || lane.child_lane_set.is_some();
+
+        let name = self.model_tag("lane");
+        if !has_children {
+            self.empty(&name, &attrs);
+            return;
+        }
+        self.open(&name, &attrs);
+        self.base_children(&lane.base);
+        let ref_tag = self.model_tag("flowNodeRef");
+        for id in &lane.flow_node_refs {
+            self.text_element(&ref_tag, id.as_str());
+        }
+        if let Some(child) = &lane.child_lane_set {
+            self.lane_set(child, "childLaneSet");
+        }
+        for raw in &lane.base.unknown_children {
+            self.raw(raw);
+        }
+        self.close(&name);
+    }
+
+    fn collaboration(&mut self, collaboration: &Collaboration) {
+        let mut attrs = Attrs::default();
+        attrs.push_id("id", &collaboration.base.id);
+        attrs.push_opt("name", collaboration.name.as_deref());
+        attrs.push_unknown(&collaboration.base.unknown_attrs);
+
+        let has_children = !collaboration.base.documentation.is_empty()
+            || collaboration.base.extension_elements.is_some()
+            || !collaboration.base.unknown_children.is_empty()
+            || !collaboration.participants.is_empty()
+            || !collaboration.message_flows.is_empty();
+
+        let name = self.model_tag("collaboration");
+        if !has_children {
+            self.empty(&name, &attrs);
+            return;
+        }
+        self.open(&name, &attrs);
+        self.base_children(&collaboration.base);
+        for participant in &collaboration.participants {
+            let mut attrs = Attrs::default();
+            attrs.push_id("id", &participant.base.id);
+            attrs.push_opt("name", participant.name.as_deref());
+            attrs.push_id_opt("processRef", participant.process_ref.as_ref());
+            attrs.push_unknown(&participant.base.unknown_attrs);
+            let tag = self.model_tag("participant");
+            self.base_only(&tag, &attrs, &participant.base);
+        }
+        for flow in &collaboration.message_flows {
+            let mut attrs = Attrs::default();
+            attrs.push_id("id", &flow.base.id);
+            attrs.push_opt("name", flow.name.as_deref());
+            attrs.push_id("sourceRef", &flow.source);
+            attrs.push_id("targetRef", &flow.target);
+            attrs.push_unknown(&flow.base.unknown_attrs);
+            let tag = self.model_tag("messageFlow");
+            self.base_only(&tag, &attrs, &flow.base);
+        }
+        for raw in &collaboration.base.unknown_children {
+            self.raw(raw);
+        }
+        self.close(&name);
+    }
+
+    /// An element whose only children are the base ones.
+    fn base_only(&mut self, name: &str, attrs: &Attrs, base: &BaseElement) {
+        let has_children = !base.documentation.is_empty()
+            || base.extension_elements.is_some()
+            || !base.unknown_children.is_empty();
+        if !has_children {
+            self.empty(name, attrs);
+            return;
+        }
+        self.open(name, attrs);
+        self.base_children(base);
+        for raw in &base.unknown_children {
+            self.raw(raw);
+        }
+        self.close(name);
     }
 
     fn flow_element(&mut self, element: &FlowElement) {

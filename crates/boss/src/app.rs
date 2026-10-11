@@ -262,6 +262,8 @@ pub enum Message {
     LoopChanged(LoopChoice),
     /// Collapse or expand the selected subprocess.
     ToggleExpanded,
+    /// Append a lane to the selected pool.
+    AddLane,
     /// The called element of the selected call activity changed.
     CalledElementEdited(String),
     /// An issue row was clicked: select and center its element.
@@ -481,22 +483,8 @@ impl App {
                 });
                 self.document_changed();
             }
-            CanvasMessage::Place(kind, at) => {
-                let mut created = None;
-                self.session.commit(|doc| {
-                    created = doc.create_node(
-                        kind,
-                        bpmn_core::Point::new(f64::from(at.x), f64::from(at.y)),
-                    );
-                    created.is_some()
-                });
-                if let Some(id) = created {
-                    self.selection.clear();
-                    self.selection.insert(id);
-                }
-                self.tool = Tool::Select;
-                self.document_changed();
-            }
+            CanvasMessage::Place(kind, at) => self.handle_place(Some(kind), at),
+            CanvasMessage::PlacePool(at) => self.handle_place(None, at),
             CanvasMessage::Connect(source, target) => {
                 let mut connected = false;
                 self.session.commit(|doc| {
@@ -539,6 +527,28 @@ impl App {
             }
             CanvasMessage::CancelTool => self.tool = Tool::Select,
         }
+    }
+
+    /// Places a node (`Some(kind)`) or a pool (`None`) at a canvas position.
+    fn handle_place(&mut self, kind: Option<NodeKind>, at: iced::Point) {
+        let center = bpmn_core::Point::new(f64::from(at.x), f64::from(at.y));
+        let mut created = None;
+        self.session.commit(|doc| {
+            created = match kind {
+                Some(kind) => doc.create_node(kind, center),
+                None => doc.create_pool(None, center),
+            };
+            created.is_some()
+        });
+        match created {
+            Some(id) => {
+                self.selection.clear();
+                self.selection.insert(id);
+            }
+            None => self.status("In a collaboration, nodes go inside a pool", true),
+        }
+        self.tool = Tool::Select;
+        self.document_changed();
     }
 
     fn handle_selection(&mut self, message: CanvasMessage) {
@@ -631,6 +641,9 @@ impl App {
                     doc.set_called_element(&id, called)
                 });
             }
+            Message::AddLane => {
+                self.session.commit(|doc| doc.add_lane(&id, None).is_some());
+            }
             _ => {}
         }
         self.document_changed();
@@ -714,6 +727,7 @@ impl App {
             | Message::TriggerChanged(_)
             | Message::LoopChanged(_)
             | Message::ToggleExpanded
+            | Message::AddLane
             | Message::CalledElementEdited(_)) => self.handle_property(message),
             Message::IssueClicked(Some(id)) => {
                 if let Some((_, bounds)) = self.session.document().node_outline(&id) {
@@ -782,6 +796,40 @@ impl App {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    /// The collaboration half of the MCP actions (pools and lanes).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_mcp_pool_action(
+        &mut self,
+        action: boss_mcp::EditAction,
+    ) -> Result<boss_mcp::ApplyOutcome, String> {
+        use boss_mcp::{ApplyOutcome, EditAction};
+
+        match action {
+            EditAction::CreatePool { name, x, y } => {
+                let mut created = None;
+                self.session.commit(|doc| {
+                    created = doc.create_pool(name.clone(), bpmn_core::Point::new(x, y));
+                    created.is_some()
+                });
+                created
+                    .map(ApplyOutcome::Created)
+                    .ok_or_else(|| String::from("could not create a pool"))
+            }
+            EditAction::AddLane { pool, name } => {
+                let mut created = None;
+                self.session.commit(|doc| {
+                    created = doc.add_lane(&pool, name.clone());
+                    created.is_some()
+                });
+                created
+                    .map(ApplyOutcome::Created)
+                    .ok_or_else(|| format!("{pool} is not a pool backed by a process"))
+            }
+            _ => Ok(ApplyOutcome::Nothing),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn apply_mcp_action(
         &mut self,
         action: boss_mcp::EditAction,
@@ -801,6 +849,9 @@ impl App {
                 created
                     .map(ApplyOutcome::Created)
                     .ok_or_else(|| String::from("could not create that element"))
+            }
+            action @ (EditAction::CreatePool { .. } | EditAction::AddLane { .. }) => {
+                self.apply_mcp_pool_action(action)
             }
             EditAction::CreateBoundary { host, x, y } => {
                 let mut created = None;
@@ -870,16 +921,12 @@ impl App {
                 self.zoom_to_fit();
                 Ok(ApplyOutcome::Changed)
             }
-            EditAction::Undo => {
-                if self.session.undo() {
-                    self.selection.clear();
-                    Ok(ApplyOutcome::Changed)
-                } else {
-                    Ok(ApplyOutcome::Nothing)
-                }
-            }
-            EditAction::Redo => {
-                if self.session.redo() {
+            action @ (EditAction::Undo | EditAction::Redo) => {
+                let stepped = match action {
+                    EditAction::Undo => self.session.undo(),
+                    _ => self.session.redo(),
+                };
+                if stepped {
                     self.selection.clear();
                     Ok(ApplyOutcome::Changed)
                 } else {
@@ -1181,6 +1228,8 @@ impl App {
                     Tool::Place(NodeKind::SubProcess(SubProcessKind::Transaction))
                 ),
                 entry("Call activity", Tool::Place(NodeKind::CallActivity)),
+                section("Collaboration"),
+                entry("Pool", Tool::PlacePool),
                 section("Gateways"),
                 entry(
                     "Exclusive",
@@ -1214,7 +1263,8 @@ impl App {
             let index = document.flow_element_index();
             match index.get(&id) {
                 Some(element) => Self::element_form(t, document, &id, element),
-                None => text("No selection").size(13).color(t.muted).into(),
+                None => Self::collaboration_form(t, document, &id)
+                    .unwrap_or_else(|| text("No selection").size(13).color(t.muted).into()),
             }
         } else if self.selection.len() > 1 {
             text(format!("{} elements selected", self.selection.len()))
@@ -1312,6 +1362,47 @@ impl App {
         form.into()
     }
 
+    /// The properties form for collaboration elements (pools, lanes, message
+    /// flows), which live outside the flow-element index.
+    fn collaboration_form<'a>(
+        t: Tokens,
+        document: &Document,
+        id: &BpmnId,
+    ) -> Option<Element<'a, Message>> {
+        let caption = |label: &'static str| text(label).size(11).color(t.muted);
+        let (kind, name): (&str, Option<&str>) = if let Some(participant) = document.participant(id)
+        {
+            ("Pool", participant.name.as_deref())
+        } else if let Some(lane) = document.lane(id) {
+            ("Lane", lane.name.as_deref())
+        } else {
+            let flow = document.message_flows().find(|m| m.base.id == *id)?;
+            ("Message flow", flow.name.as_deref())
+        };
+
+        let mut form = column![
+            caption("Kind"),
+            text(kind).size(13),
+            caption("Id"),
+            text(id.as_str().to_string()).font(theme::MONO).size(12),
+            caption("Name"),
+            text_input("Unnamed", name.unwrap_or(""))
+                .on_input(Message::NameEdited)
+                .size(13),
+        ]
+        .spacing(6);
+
+        if kind == "Pool" {
+            form = form.push(
+                button(text("Add lane").size(13))
+                    .style(theme::tool_button(t))
+                    .padding([4, 10])
+                    .on_press(Message::AddLane),
+            );
+        }
+        Some(form.into())
+    }
+
     /// The kind-specific rows of the properties form for an activity.
     fn activity_form<'a>(
         mut form: iced::widget::Column<'a, Message>,
@@ -1381,7 +1472,10 @@ impl App {
         let hint = match self.tool {
             Tool::Select => "click to select · shift-click to add · drag empty space to marquee",
             Tool::Place(_) => "click to place · Esc to cancel",
-            Tool::Connect => "click source, then target · Esc to cancel",
+            Tool::PlacePool => "click to place a pool · Esc to cancel",
+            Tool::Connect => {
+                "click source, then target · cross-pool connections become message flows"
+            }
         };
         let info: Element<'_, Message> = match &self.status {
             Some(line) => text(line.text.clone())

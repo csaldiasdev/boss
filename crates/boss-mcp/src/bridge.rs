@@ -31,7 +31,24 @@ pub enum EditAction {
         /// World/DI y the event should face.
         y: f64,
     },
-    /// Connect two nodes with a sequence flow.
+    /// Create a pool (participant) centered at `(x, y)`.
+    CreatePool {
+        /// Optional pool label.
+        name: Option<String>,
+        /// World/DI x of the center.
+        x: f64,
+        /// World/DI y of the center.
+        y: f64,
+    },
+    /// Append a lane to a pool.
+    AddLane {
+        /// The pool (participant id).
+        pool: BpmnId,
+        /// Optional lane label.
+        name: Option<String>,
+    },
+    /// Connect two elements: a sequence flow inside a container, a message
+    /// flow across pools.
     Connect {
         /// Source node id.
         source: BpmnId,
