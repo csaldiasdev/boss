@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "boss"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "boss-mcp",
  "bpmn-core",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "boss-mcp"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "axum",
  "bpmn-core",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "bpmn-core"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "indexmap",
  "smol_str 0.3.2",
@@ -443,14 +443,14 @@ dependencies = [
 
 [[package]]
 name = "bpmn-validate"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "bpmn-core",
 ]
 
 [[package]]
 name = "bpmn-xml"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "bpmn-core",
  "quick-xml 0.42.0",

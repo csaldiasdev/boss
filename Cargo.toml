@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-beta"
 # Not on crates.io yet; internal path deps carry no version requirement.
 publish = false
 edition = "2024"
