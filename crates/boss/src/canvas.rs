@@ -82,6 +82,9 @@ pub enum CanvasMessage {
     EditLabel(BpmnId),
     /// The cursor moved to this diagram position (status-bar readout).
     CursorAt(i32, i32),
+    /// Drag the window (macOS: press in the strip under the hidden
+    /// titlebar, where the canvas reaches the top of the window).
+    DragWindow,
     /// Abort the armed tool (clicked empty space while connecting).
     CancelTool,
 }
@@ -486,6 +489,11 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                     start: cursor_position,
                 };
                 Some(canvas::Action::request_redraw().and_capture())
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if cfg!(target_os = "macos") && cursor.position().is_some_and(|p| p.y < 28.0) =>
+            {
+                Some(canvas::Action::publish(CanvasMessage::DragWindow).and_capture())
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => match self.tool {
                 Tool::Place(NodeKind::Boundary) => {

@@ -197,6 +197,8 @@ pub struct App {
     issues_open: bool,
     /// The cursor position in diagram units, for the status bar.
     cursor_world: Option<(i32, i32)>,
+    /// The main window, for chrome actions like dragging.
+    window_id: Option<iced::window::Id>,
     session: EditSession,
     file_name: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -224,6 +226,7 @@ impl Default for App {
             properties_open: true,
             issues_open: true,
             cursor_world: None,
+            window_id: None,
             session: EditSession::new(Document::new()),
             file_name: String::from("untitled.bpmn"),
             #[cfg(not(target_arch = "wasm32"))]
@@ -584,6 +587,11 @@ impl App {
         match message {
             CanvasMessage::EditLabel(id) => return self.edit_label(id),
             CanvasMessage::CursorAt(x, y) => self.cursor_world = Some((x, y)),
+            CanvasMessage::DragWindow => {
+                if let Some(id) = self.window_id {
+                    return iced::window::drag(id);
+                }
+            }
             CanvasMessage::Panned(translation) => {
                 self.camera.translation = translation;
                 self.canvas.invalidate();
@@ -801,6 +809,7 @@ impl App {
                 return iced::system::theme().map(Message::SystemTheme);
             }
             Message::WindowOpened(id) => {
+                self.window_id = Some(id);
                 // The native menu attaches once the app is fully launched:
                 // earlier, winit's own default macOS menu would replace it.
                 #[cfg(target_os = "macos")]
@@ -1263,8 +1272,16 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let t = self.tokens();
 
-        column![
-            self.toolbar(t),
+        // On macOS there is no bar at all: the canvas reaches the top of the
+        // window, the traffic lights float over it, and the strip under them
+        // drags the window (see `CanvasMessage::DragWindow`). Commands live
+        // in the native menu bar.
+        let mut layout = column![];
+        if !cfg!(target_os = "macos") {
+            layout = layout.push(self.toolbar(t));
+        }
+
+        layout = layout.push(
             row![
                 self.palette(t),
                 container(
@@ -1285,10 +1302,11 @@ impl App {
             ]
             .width(Fill)
             .height(Fill),
-            self.issues_panel(t),
-            self.status_bar(t),
-        ]
-        .into()
+        );
+        layout
+            .push(self.issues_panel(t))
+            .push(self.status_bar(t))
+            .into()
     }
 
     fn issues_panel(&self, t: Tokens) -> Element<'_, Message> {
@@ -1417,17 +1435,9 @@ impl App {
                 true,
             ));
 
-        // On macOS the title bar is transparent and the content extends under
-        // it, so the toolbar leaves room for the traffic lights and acts as
-        // the draggable strip.
-        let padding = if cfg!(target_os = "macos") {
-            iced::Padding::from(8).left(78)
-        } else {
-            iced::Padding::from(8)
-        };
         container(bar)
             .style(move |_| theme::panel(t))
-            .padding(padding)
+            .padding(8)
             .width(Fill)
             .into()
     }
@@ -1558,9 +1568,16 @@ impl App {
         ]
         .align_y(Center);
 
+        // Clearance so the traffic lights do not cover the header.
+        let padding = if cfg!(target_os = "macos") {
+            iced::Padding::from(10).top(34)
+        } else {
+            iced::Padding::from(10)
+        };
+
         container(column![header, scrollable(list)].spacing(8))
             .style(move |_| theme::panel(t))
-            .padding(10)
+            .padding(padding)
             .width(170)
             .height(Fill)
             .into()
@@ -1568,6 +1585,11 @@ impl App {
 
     /// A collapsed side panel: a slim strip holding only the reopen button.
     fn collapsed_panel(t: Tokens, glyph: char, message: Message) -> Element<'static, Message> {
+        let padding = if cfg!(target_os = "macos") {
+            iced::Padding::from(4).top(34)
+        } else {
+            iced::Padding::from(4)
+        };
         container(
             button(icons::icon(glyph))
                 .style(theme::tool_button(t))
@@ -1575,7 +1597,7 @@ impl App {
                 .on_press(message),
         )
         .style(move |_| theme::panel(t))
-        .padding(4)
+        .padding(padding)
         .width(36)
         .height(Fill)
         .into()
