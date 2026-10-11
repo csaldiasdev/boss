@@ -72,6 +72,19 @@ impl Bounds {
             && point.y <= self.y + self.height
     }
 
+    /// The smallest rectangle containing both this one and `other`.
+    #[must_use]
+    pub fn union(&self, other: Bounds) -> Bounds {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        Bounds::new(
+            x,
+            y,
+            (self.x + self.width).max(other.x + other.width) - x,
+            (self.y + self.height).max(other.y + other.height) - y,
+        )
+    }
+
     /// Whether this rectangle and `other` overlap at all.
     pub fn intersects(&self, other: &Bounds) -> bool {
         self.x < other.x + other.width

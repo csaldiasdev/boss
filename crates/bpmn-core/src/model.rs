@@ -55,7 +55,7 @@ pub struct FlowNode {
 pub enum FlowElement {
     /// An event (start, end, intermediate, boundary).
     Event(Event),
-    /// An activity (tasks in M1; subprocesses and call activities later).
+    /// An activity (a task, subprocess, or call activity).
     Activity(Activity),
     /// A gateway.
     Gateway(Gateway),
@@ -234,11 +234,44 @@ pub enum LoopKind {
     MultiInstanceSequential,
 }
 
-/// The kinds of activity (M1: tasks only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The kinds of activity.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ActivityKind {
     /// One of the eight task types.
     Task(TaskType),
+    /// An embedded subprocess, event subprocess, or transaction.
+    SubProcess(SubProcess),
+    /// A `callActivity` invoking another process.
+    CallActivity(CallActivity),
+}
+
+/// A subprocess: an activity that owns its own flow elements.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SubProcess {
+    /// Which container flavor this is (it decides the XML tag and border).
+    pub kind: SubProcessKind,
+    /// Nested flow elements in document order, like a process body.
+    pub flow_elements: Vec<FlowElement>,
+}
+
+/// The subprocess flavors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubProcessKind {
+    /// `subProcess`.
+    #[default]
+    Embedded,
+    /// `subProcess triggeredByEvent="true"` — started by its own events,
+    /// never by sequence flow.
+    Event,
+    /// `transaction`.
+    Transaction,
+}
+
+/// A `callActivity`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CallActivity {
+    /// The `calledElement` attribute (the id of the invoked process).
+    pub called_element: Option<String>,
 }
 
 /// BPMN task types, by XML tag.

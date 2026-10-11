@@ -11,10 +11,10 @@ use crate::ns;
 use bpmn_core::di::{BpmnDiagram, BpmnEdge, BpmnLabel, BpmnPlane, BpmnShape, DiElement};
 use bpmn_core::geometry::{Bounds, Point};
 use bpmn_core::model::{
-    Activity, ActivityKind, BaseElement, Condition, Definitions, Event as BpmnEvent,
+    Activity, ActivityKind, BaseElement, CallActivity, Condition, Definitions, Event as BpmnEvent,
     EventDefinition, EventDefinitionBody, EventDefinitionKind, EventPosition, FlowElement,
     FlowNode, Gateway, GatewayKind, LoopKind, LoopMarker, Process, RootElement, SequenceFlow,
-    TaskType,
+    SubProcess, SubProcessKind, TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::events::{BytesStart, Event};
@@ -372,47 +372,51 @@ fn parse_process(
             continue;
         }
 
-        let element = if nsk == Ns::Model {
-            match local(&e) {
-                "startEvent"
-                | "endEvent"
-                | "intermediateCatchEvent"
-                | "intermediateThrowEvent"
-                | "boundaryEvent" => Some(FlowElement::Event(parse_event(cx, &e, is_empty)?)),
-                "task" => Some(parse_task(cx, &e, is_empty, TaskType::Generic)?),
-                "userTask" => Some(parse_task(cx, &e, is_empty, TaskType::User)?),
-                "serviceTask" => Some(parse_task(cx, &e, is_empty, TaskType::Service)?),
-                "scriptTask" => Some(parse_task(cx, &e, is_empty, TaskType::Script)?),
-                "manualTask" => Some(parse_task(cx, &e, is_empty, TaskType::Manual)?),
-                "sendTask" => Some(parse_task(cx, &e, is_empty, TaskType::Send)?),
-                "receiveTask" => Some(parse_task(cx, &e, is_empty, TaskType::Receive)?),
-                "businessRuleTask" => Some(parse_task(cx, &e, is_empty, TaskType::BusinessRule)?),
-                "exclusiveGateway" => {
-                    Some(parse_gateway(cx, &e, is_empty, GatewayKind::Exclusive)?)
-                }
-                "parallelGateway" => Some(parse_gateway(cx, &e, is_empty, GatewayKind::Parallel)?),
-                "inclusiveGateway" => {
-                    Some(parse_gateway(cx, &e, is_empty, GatewayKind::Inclusive)?)
-                }
-                "eventBasedGateway" => {
-                    Some(parse_gateway(cx, &e, is_empty, GatewayKind::EventBased)?)
-                }
-                "complexGateway" => Some(parse_gateway(cx, &e, is_empty, GatewayKind::Complex)?),
-                "sequenceFlow" => Some(FlowElement::SequenceFlow(parse_sequence_flow(
-                    cx, &e, is_empty,
-                )?)),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let element = match element {
+        let element = match parse_flow_element(cx, nsk, &e, is_empty)? {
             Some(element) => element,
             None => FlowElement::Unknown(cx.capture_any(pos, &e, is_empty)?),
         };
         process.flow_elements.push(element);
     }
+}
+
+/// Parses one flow element when the tag is modeled; `None` asks the caller to
+/// capture the element verbatim. Shared by processes and subprocesses.
+fn parse_flow_element(
+    cx: &mut Cx<'_>,
+    nsk: Ns,
+    e: &BytesStart<'_>,
+    is_empty: bool,
+) -> Result<Option<FlowElement>, ParseError> {
+    if nsk != Ns::Model {
+        return Ok(None);
+    }
+    Ok(Some(match local(e) {
+        "startEvent"
+        | "endEvent"
+        | "intermediateCatchEvent"
+        | "intermediateThrowEvent"
+        | "boundaryEvent" => FlowElement::Event(parse_event(cx, e, is_empty)?),
+        "task" => parse_task(cx, e, is_empty, TaskType::Generic)?,
+        "userTask" => parse_task(cx, e, is_empty, TaskType::User)?,
+        "serviceTask" => parse_task(cx, e, is_empty, TaskType::Service)?,
+        "scriptTask" => parse_task(cx, e, is_empty, TaskType::Script)?,
+        "manualTask" => parse_task(cx, e, is_empty, TaskType::Manual)?,
+        "sendTask" => parse_task(cx, e, is_empty, TaskType::Send)?,
+        "receiveTask" => parse_task(cx, e, is_empty, TaskType::Receive)?,
+        "businessRuleTask" => parse_task(cx, e, is_empty, TaskType::BusinessRule)?,
+        // Ad-hoc subprocesses are not modeled yet; they fall through to the
+        // verbatim capture like any other unknown element.
+        "subProcess" | "transaction" => parse_sub_process(cx, e, is_empty)?,
+        "callActivity" => parse_call_activity(cx, e, is_empty)?,
+        "exclusiveGateway" => parse_gateway(cx, e, is_empty, GatewayKind::Exclusive)?,
+        "parallelGateway" => parse_gateway(cx, e, is_empty, GatewayKind::Parallel)?,
+        "inclusiveGateway" => parse_gateway(cx, e, is_empty, GatewayKind::Inclusive)?,
+        "eventBasedGateway" => parse_gateway(cx, e, is_empty, GatewayKind::EventBased)?,
+        "complexGateway" => parse_gateway(cx, e, is_empty, GatewayKind::Complex)?,
+        "sequenceFlow" => FlowElement::SequenceFlow(parse_sequence_flow(cx, e, is_empty)?),
+        _ => return Ok(None),
+    }))
 }
 
 fn parse_event(
@@ -560,6 +564,145 @@ fn parse_task(
                 }
                 Event::End(_) => break,
                 Event::Eof => return Err(structure("unexpected end of file in task")),
+                _ => continue,
+            };
+
+            if node_child(cx, &mut activity.node, pos, nsk, &e, is_empty)? {
+                continue;
+            }
+
+            if nsk == Ns::Model
+                && matches!(
+                    local(&e),
+                    "standardLoopCharacteristics" | "multiInstanceLoopCharacteristics"
+                )
+            {
+                activity.loop_marker = Some(parse_loop_marker(cx, pos, &e, is_empty)?);
+            } else {
+                activity
+                    .node
+                    .base
+                    .unknown_children
+                    .push(cx.capture_any(pos, &e, is_empty)?);
+            }
+        }
+    }
+
+    Ok(FlowElement::Activity(activity))
+}
+
+/// Parses a `subProcess` or `transaction`: an activity whose children mix
+/// nested flow elements with the usual node children.
+fn parse_sub_process(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<FlowElement, ParseError> {
+    let is_transaction = local(start) == "transaction";
+    let mut set = attr_set(start)?;
+    let mut node = flow_node_from(&mut set);
+    let triggered_by_event = set.take_bool("triggeredByEvent").unwrap_or(false);
+    node.base.unknown_attrs = set.rest();
+
+    let kind = if is_transaction {
+        SubProcessKind::Transaction
+    } else if triggered_by_event {
+        SubProcessKind::Event
+    } else {
+        SubProcessKind::Embedded
+    };
+
+    let mut activity = Activity {
+        node,
+        kind: ActivityKind::SubProcess(SubProcess {
+            kind,
+            flow_elements: Vec::new(),
+        }),
+        loop_marker: None,
+    };
+
+    if !empty {
+        loop {
+            let pos = cx.pos();
+            let (nsk, ev) = cx.read()?;
+            let (e, is_empty) = match ev {
+                Event::Start(e) => (e, false),
+                Event::Empty(e) => (e, true),
+                Event::Comment(_) => {
+                    push_sub_element(&mut activity, FlowElement::Unknown(cx.capture_span(pos)));
+                    continue;
+                }
+                Event::End(_) => break,
+                Event::Eof => return Err(structure("unexpected end of file in subProcess")),
+                _ => continue,
+            };
+
+            if node_child(cx, &mut activity.node, pos, nsk, &e, is_empty)? {
+                continue;
+            }
+
+            if nsk == Ns::Model
+                && matches!(
+                    local(&e),
+                    "standardLoopCharacteristics" | "multiInstanceLoopCharacteristics"
+                )
+            {
+                activity.loop_marker = Some(parse_loop_marker(cx, pos, &e, is_empty)?);
+                continue;
+            }
+
+            // Children keep document order: unknown elements interleave with
+            // the modeled ones, exactly like a process body.
+            let element = match parse_flow_element(cx, nsk, &e, is_empty)? {
+                Some(element) => element,
+                None => FlowElement::Unknown(cx.capture_any(pos, &e, is_empty)?),
+            };
+            push_sub_element(&mut activity, element);
+        }
+    }
+
+    Ok(FlowElement::Activity(activity))
+}
+
+fn push_sub_element(activity: &mut Activity, element: FlowElement) {
+    if let ActivityKind::SubProcess(sub) = &mut activity.kind {
+        sub.flow_elements.push(element);
+    }
+}
+
+fn parse_call_activity(
+    cx: &mut Cx<'_>,
+    start: &BytesStart<'_>,
+    empty: bool,
+) -> Result<FlowElement, ParseError> {
+    let mut set = attr_set(start)?;
+    let mut node = flow_node_from(&mut set);
+    let called_element = set.take("calledElement");
+    node.base.unknown_attrs = set.rest();
+
+    let mut activity = Activity {
+        node,
+        kind: ActivityKind::CallActivity(CallActivity { called_element }),
+        loop_marker: None,
+    };
+
+    if !empty {
+        loop {
+            let pos = cx.pos();
+            let (nsk, ev) = cx.read()?;
+            let (e, is_empty) = match ev {
+                Event::Start(e) => (e, false),
+                Event::Empty(e) => (e, true),
+                Event::Comment(_) => {
+                    activity
+                        .node
+                        .base
+                        .unknown_children
+                        .push(cx.capture_span(pos));
+                    continue;
+                }
+                Event::End(_) => break,
+                Event::Eof => return Err(structure("unexpected end of file in callActivity")),
                 _ => continue,
             };
 

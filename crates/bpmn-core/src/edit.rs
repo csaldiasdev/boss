@@ -10,13 +10,13 @@ use crate::document::Document;
 use crate::geometry::{Bounds, Point, Size};
 use crate::ids::BpmnId;
 use crate::model::{
-    Activity, ActivityKind, BOSS_TARGET_NAMESPACE, BaseElement, Condition, Definitions, Event,
-    EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, LoopKind, LoopMarker, Process,
-    RootElement, SequenceFlow, TaskType,
+    Activity, ActivityKind, BOSS_TARGET_NAMESPACE, BaseElement, CallActivity, Condition,
+    Definitions, Event, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, LoopKind,
+    LoopMarker, Process, RootElement, SequenceFlow, SubProcess, SubProcessKind, TaskType,
 };
 use std::collections::HashSet;
 
-/// What the palette can place in M2.
+/// What the palette can place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     /// A plain start event.
@@ -33,6 +33,10 @@ pub enum NodeKind {
     Task(TaskType),
     /// A gateway of the given kind.
     Gateway(GatewayKind),
+    /// An empty subprocess of the given flavor, placed expanded.
+    SubProcess(SubProcessKind),
+    /// A call activity.
+    CallActivity,
 }
 
 impl NodeKind {
@@ -44,8 +48,9 @@ impl NodeKind {
             | NodeKind::IntermediateCatch
             | NodeKind::IntermediateThrow
             | NodeKind::Boundary => Size::new(36.0, 36.0),
-            NodeKind::Task(_) => Size::new(100.0, 80.0),
+            NodeKind::Task(_) | NodeKind::CallActivity => Size::new(100.0, 80.0),
             NodeKind::Gateway(_) => Size::new(50.0, 50.0),
+            NodeKind::SubProcess(_) => Size::new(350.0, 200.0),
         }
     }
 
@@ -56,7 +61,7 @@ impl NodeKind {
             | NodeKind::IntermediateCatch
             | NodeKind::IntermediateThrow
             | NodeKind::Boundary => "Event",
-            NodeKind::Task(_) => "Activity",
+            NodeKind::Task(_) | NodeKind::SubProcess(_) | NodeKind::CallActivity => "Activity",
             NodeKind::Gateway(_) => "Gateway",
         }
     }
@@ -184,10 +189,10 @@ impl Document {
         for root in &self.definitions.root_elements {
             if let RootElement::Process(process) = root {
                 push(Some(&process.base.id));
-                for element in &process.flow_elements {
-                    push(element.id());
-                }
             }
+        }
+        for element in self.flow_elements() {
+            push(element.id());
         }
         for diagram in &self.definitions.diagrams {
             push(diagram.id.as_ref());
@@ -232,11 +237,87 @@ impl Document {
         self.definitions.diagrams.first_mut()?.plane.as_mut()
     }
 
+    /// Mutable access to the flow elements of `container`: a process id or an
+    /// expanded subprocess id.
+    fn elements_of_mut(&mut self, container: &BpmnId) -> Option<&mut Vec<FlowElement>> {
+        fn scan<'a>(
+            container: &BpmnId,
+            elements: &'a mut Vec<FlowElement>,
+        ) -> Option<&'a mut Vec<FlowElement>> {
+            for element in elements {
+                let FlowElement::Activity(activity) = element else {
+                    continue;
+                };
+                let is_it = activity.node.base.id == *container;
+                if let ActivityKind::SubProcess(sub) = &mut activity.kind {
+                    if is_it {
+                        return Some(&mut sub.flow_elements);
+                    }
+                    if let Some(found) = scan(container, &mut sub.flow_elements) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+
+        for root in &mut self.definitions.root_elements {
+            let RootElement::Process(process) = root else {
+                continue;
+            };
+            if process.base.id == *container {
+                return Some(&mut process.flow_elements);
+            }
+            if let Some(found) = scan(container, &mut process.flow_elements) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// The deepest *expanded* subprocess whose shape contains `point`, falling
+    /// back to the first process: where a node dropped at `point` belongs.
+    /// `except` (a node plus its descendants) never counts as a container, so
+    /// a subprocess cannot be dropped into itself.
+    fn container_at(&self, point: Point, except: &HashSet<BpmnId>) -> Option<BpmnId> {
+        let index = self.flow_element_index();
+        let plane = self.diagram()?.plane.as_ref()?;
+        let hidden = self.hidden_by_collapse();
+
+        let mut best: Option<(BpmnId, f64)> = None;
+        for element in &plane.elements {
+            let DiElement::Shape(shape) = element else {
+                continue;
+            };
+            let id = &shape.bpmn_element;
+            if except.contains(id) || hidden.contains(id) || shape.is_expanded != Some(true) {
+                continue;
+            }
+            let Some(FlowElement::Activity(activity)) = index.get(id).copied() else {
+                continue;
+            };
+            if !matches!(activity.kind, ActivityKind::SubProcess(_))
+                || !shape.bounds.contains(point)
+            {
+                continue;
+            }
+            let area = shape.bounds.width * shape.bounds.height;
+            if best.as_ref().is_none_or(|(_, a)| area < *a) {
+                best = Some((id.clone(), area));
+            }
+        }
+
+        best.map(|(id, _)| id)
+            .or_else(|| self.processes().next().map(|p| p.base.id.clone()))
+    }
+
     /// Creates a flow node of `kind` centered at `center`; returns its id.
+    /// The node lands in the expanded subprocess under `center`, if any.
     pub fn create_node(&mut self, kind: NodeKind, center: Point) -> Option<BpmnId> {
         let id = self.fresh_id(kind.id_prefix());
         let shape_id = BpmnId::new(format!("{id}_di").as_str());
         let size = kind.default_size();
+        let container = self.container_at(center, &HashSet::new())?;
 
         let node = FlowNode {
             base: BaseElement::new(id.clone()),
@@ -272,6 +353,19 @@ impl Document {
                 kind: ActivityKind::Task(task_type),
                 loop_marker: None,
             }),
+            NodeKind::SubProcess(sub_kind) => FlowElement::Activity(Activity {
+                node,
+                kind: ActivityKind::SubProcess(SubProcess {
+                    kind: sub_kind,
+                    flow_elements: Vec::new(),
+                }),
+                loop_marker: None,
+            }),
+            NodeKind::CallActivity => FlowElement::Activity(Activity {
+                node,
+                kind: ActivityKind::CallActivity(CallActivity::default()),
+                loop_marker: None,
+            }),
             NodeKind::Gateway(gateway_kind) => FlowElement::Gateway(Gateway {
                 node,
                 kind: gateway_kind,
@@ -280,7 +374,7 @@ impl Document {
             }),
         };
 
-        self.first_process_mut()?.flow_elements.push(element);
+        self.elements_of_mut(&container)?.push(element);
         self.plane_mut()?.elements.push(DiElement::Shape(BpmnShape {
             id: Some(shape_id),
             bpmn_element: id.clone(),
@@ -293,6 +387,8 @@ impl Document {
             // The X marker on exclusive gateways, visible by convention.
             is_marker_visible: matches!(kind, NodeKind::Gateway(GatewayKind::Exclusive))
                 .then_some(true),
+            // Subprocesses start expanded so their body can be edited.
+            is_expanded: matches!(kind, NodeKind::SubProcess(_)).then_some(true),
             ..BpmnShape::default()
         }));
 
@@ -300,9 +396,14 @@ impl Document {
     }
 
     /// Connects two flow nodes with a sequence flow; returns the flow's id.
-    /// Refuses self-connections and unknown endpoints.
+    /// Refuses self-connections, unknown endpoints, and endpoints living in
+    /// different containers (the spec keeps sequence flows inside one).
     pub fn connect(&mut self, source: &BpmnId, target: &BpmnId) -> Option<BpmnId> {
         if source == target {
+            return None;
+        }
+        let container = self.container_of(source)?;
+        if self.container_of(target)? != container {
             return None;
         }
         let (source_outline, source_bounds) = self.node_outline(source)?;
@@ -314,9 +415,7 @@ impl Document {
         let from = source_outline.anchor(source_bounds, target_bounds.center());
         let to = target_outline.anchor(target_bounds, source_bounds.center());
 
-        let process = self.first_process_mut()?;
-        process
-            .flow_elements
+        self.elements_of_mut(&container)?
             .push(FlowElement::SequenceFlow(SequenceFlow {
                 base: BaseElement::new(id.clone()),
                 name: None,
@@ -325,16 +424,11 @@ impl Document {
                 condition: None,
             }));
 
-        for element in &mut process.flow_elements {
-            if element.id() == Some(source) {
-                if let Some(node) = flow_node_mut(element) {
-                    node.outgoing.push(id.clone());
-                }
-            } else if element.id() == Some(target) {
-                if let Some(node) = flow_node_mut(element) {
-                    node.incoming.push(id.clone());
-                }
-            }
+        if let Some(node) = self.flow_element_mut(source).and_then(flow_node_mut) {
+            node.outgoing.push(id.clone());
+        }
+        if let Some(node) = self.flow_element_mut(target).and_then(flow_node_mut) {
+            node.incoming.push(id.clone());
         }
 
         self.plane_mut()?.elements.push(DiElement::Edge(BpmnEdge {
@@ -358,6 +452,7 @@ impl Document {
             return None;
         }
         let center = outline.anchor(bounds, toward);
+        let container = self.container_of(host)?;
 
         let id = self.fresh_id("Event");
         let shape_id = BpmnId::new(format!("{id}_di").as_str());
@@ -373,7 +468,7 @@ impl Document {
             definitions: Vec::new(),
         });
 
-        self.first_process_mut()?.flow_elements.push(element);
+        self.elements_of_mut(&container)?.push(element);
         self.plane_mut()?.elements.push(DiElement::Shape(BpmnShape {
             id: Some(shape_id),
             bpmn_element: id.clone(),
@@ -449,11 +544,36 @@ impl Document {
     }
 
     /// Moves the shapes of `ids` by `(dx, dy)` and re-anchors affected edges.
-    /// Boundary events follow their host; a boundary moved on its own is
-    /// clamped back onto its host's border.
+    /// Boundary events follow their host, subprocess children follow their
+    /// container, and a boundary moved on its own is clamped back onto its
+    /// host's border. A node dropped into (or out of) an expanded subprocess
+    /// is reparented to the container under its new position.
     pub fn move_shapes(&mut self, ids: &HashSet<BpmnId>, dx: f64, dy: f64) {
         let mut moving: HashSet<BpmnId> = ids.clone();
-        moving.extend(self.attached_boundaries(ids));
+        for id in ids {
+            moving.extend(self.descendants_of(id));
+        }
+        moving.extend(self.attached_boundaries(&moving));
+
+        // Edges fully inside the moving set travel rigidly (all waypoints);
+        // edges with one end inside get their endpoints re-anchored.
+        let mut rigid: HashSet<BpmnId> = HashSet::new();
+        let mut touched: Vec<(BpmnId, BpmnId, BpmnId)> = Vec::new();
+        for element in self.flow_elements() {
+            if let FlowElement::SequenceFlow(flow) = element {
+                match (moving.contains(&flow.source), moving.contains(&flow.target)) {
+                    (true, true) => {
+                        rigid.insert(flow.base.id.clone());
+                    }
+                    (true, false) | (false, true) => touched.push((
+                        flow.base.id.clone(),
+                        flow.source.clone(),
+                        flow.target.clone(),
+                    )),
+                    (false, false) => {}
+                }
+            }
+        }
 
         {
             let Some(plane) = self.plane_mut() else {
@@ -471,12 +591,110 @@ impl Document {
                             bounds.y += dy;
                         }
                     }
+                    DiElement::Edge(edge) if rigid.contains(&edge.bpmn_element) => {
+                        for point in &mut edge.waypoints {
+                            point.x += dx;
+                            point.y += dy;
+                        }
+                        if let Some(label) = &mut edge.label
+                            && let Some(bounds) = &mut label.bounds
+                        {
+                            bounds.x += dx;
+                            bounds.y += dy;
+                        }
+                    }
                     _ => {}
                 }
             }
         }
         self.clamp_boundaries(&moving, ids);
-        self.reanchor_edges(&moving);
+        for (flow_id, source, target) in touched {
+            self.reanchor_flow(&flow_id, &source, &target);
+        }
+        self.reparent_moved(ids);
+    }
+
+    /// Reparents explicitly moved nodes whose center now sits in a different
+    /// container, then relocates any flow whose endpoints agree on a container
+    /// the flow is not in. Cross-container flows are left for validation.
+    fn reparent_moved(&mut self, ids: &HashSet<BpmnId>) {
+        let mut relocations: Vec<(BpmnId, BpmnId)> = Vec::new();
+        for id in ids {
+            let movable = match self.flow_element_index().get(id) {
+                // Boundaries stick to their host; flows follow their endpoints.
+                Some(FlowElement::Event(event)) => {
+                    !matches!(event.position, EventPosition::Boundary { .. })
+                }
+                Some(FlowElement::Activity(_) | FlowElement::Gateway(_)) => true,
+                _ => false,
+            };
+            if !movable {
+                continue;
+            }
+            let Some((_, bounds)) = self.node_outline(id) else {
+                continue;
+            };
+            let mut except: HashSet<BpmnId> = self.descendants_of(id).into_iter().collect();
+            except.insert(id.clone());
+            let Some(new) = self.container_at(bounds.center(), &except) else {
+                continue;
+            };
+            if self.container_of(id).is_some_and(|old| old != new) {
+                relocations.push((id.clone(), new));
+            }
+        }
+        if relocations.is_empty() {
+            return;
+        }
+
+        for (id, to) in &relocations {
+            self.relocate(id, to);
+            let host: HashSet<BpmnId> = [id.clone()].into_iter().collect();
+            for boundary in self.attached_boundaries(&host) {
+                self.relocate(&boundary, to);
+            }
+        }
+
+        // A flow belongs with its endpoints when they agree on a container.
+        let mut flow_moves: Vec<(BpmnId, BpmnId)> = Vec::new();
+        for element in self.flow_elements() {
+            if let FlowElement::SequenceFlow(flow) = element
+                && let Some(sc) = self.container_of(&flow.source)
+                && self.container_of(&flow.target) == Some(sc.clone())
+                && self.container_of(&flow.base.id) != Some(sc.clone())
+            {
+                flow_moves.push((flow.base.id.clone(), sc));
+            }
+        }
+        for (id, to) in flow_moves {
+            self.relocate(&id, &to);
+        }
+    }
+
+    /// Moves one flow element from its current container into `to`.
+    fn relocate(&mut self, id: &BpmnId, to: &BpmnId) {
+        let Some(from) = self.container_of(id) else {
+            return;
+        };
+        if from == *to {
+            return;
+        }
+        let Some(elements) = self.elements_of_mut(&from) else {
+            return;
+        };
+        let Some(position) = elements.iter().position(|e| e.id() == Some(id)) else {
+            return;
+        };
+        let element = elements.remove(position);
+        match self.elements_of_mut(to) {
+            Some(target) => target.push(element),
+            // The destination vanished: put the element back rather than lose it.
+            None => {
+                if let Some(back) = self.elements_of_mut(&from) {
+                    back.push(element);
+                }
+            }
+        }
     }
 
     /// Clamps moved boundary events back onto their host borders, unless the
@@ -542,6 +760,98 @@ impl Document {
         }
     }
 
+    /// Collapses or expands a subprocess. Collapsing shrinks the shape to task
+    /// size (children stay in the model but are hidden); expanding resizes it
+    /// around its children again.
+    pub fn set_subprocess_expanded(&mut self, id: &BpmnId, expanded: bool) -> bool {
+        const COLLAPSED: Size = Size {
+            width: 100.0,
+            height: 80.0,
+        };
+        const PADDING: f64 = 40.0;
+
+        match self.flow_element_index().get(id) {
+            Some(FlowElement::Activity(activity))
+                if matches!(activity.kind, ActivityKind::SubProcess(_)) => {}
+            _ => return false,
+        }
+
+        // The expanded size wraps the children; an empty body gets the
+        // default placement size.
+        let mut child_box: Option<Bounds> = None;
+        if expanded {
+            let children: HashSet<BpmnId> = self.descendants_of(id).into_iter().collect();
+            if let Some(plane) = self.diagram().and_then(|d| d.plane.as_ref()) {
+                for element in &plane.elements {
+                    if let DiElement::Shape(shape) = element
+                        && children.contains(&shape.bpmn_element)
+                    {
+                        child_box = Some(match child_box {
+                            None => shape.bounds,
+                            Some(a) => a.union(shape.bounds),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut changed = false;
+        {
+            let Some(plane) = self.plane_mut() else {
+                return false;
+            };
+            for element in &mut plane.elements {
+                let DiElement::Shape(shape) = element else {
+                    continue;
+                };
+                if shape.bpmn_element != *id {
+                    continue;
+                }
+                shape.is_expanded = Some(expanded);
+                if expanded {
+                    let size = NodeKind::SubProcess(SubProcessKind::Embedded).default_size();
+                    shape.bounds = child_box.map_or_else(
+                        || Bounds::new(shape.bounds.x, shape.bounds.y, size.width, size.height),
+                        |b| {
+                            Bounds::new(
+                                b.x - PADDING,
+                                b.y - PADDING,
+                                b.width + PADDING * 2.0,
+                                b.height + PADDING * 2.0,
+                            )
+                        },
+                    );
+                } else {
+                    shape.bounds.width = COLLAPSED.width;
+                    shape.bounds.height = COLLAPSED.height;
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            let moved: HashSet<BpmnId> = [id.clone()].into_iter().collect();
+            let boundaries: HashSet<BpmnId> =
+                self.attached_boundaries(&moved).into_iter().collect();
+            self.clamp_boundaries(&boundaries, &HashSet::new());
+            let mut touching = moved;
+            touching.extend(boundaries);
+            self.reanchor_edges(&touching);
+        }
+        changed
+    }
+
+    /// Sets a call activity's `calledElement`; empty/`None` clears it.
+    pub fn set_called_element(&mut self, id: &BpmnId, called: Option<String>) -> bool {
+        let Some(FlowElement::Activity(activity)) = self.flow_element_mut(id) else {
+            return false;
+        };
+        let ActivityKind::CallActivity(call) = &mut activity.kind else {
+            return false;
+        };
+        call.called_element = called.filter(|c| !c.is_empty());
+        true
+    }
+
     /// Recomputes one flow's endpoint waypoints against its nodes' borders.
     fn reanchor_flow(&mut self, flow_id: &BpmnId, source: &BpmnId, target: &BpmnId) {
         let Some((source_outline, source_bounds)) = self.node_outline(source) else {
@@ -575,11 +885,16 @@ impl Document {
         }
     }
 
-    /// Deletes elements (plus every sequence flow touching a deleted node) and
-    /// their DI, and strips dangling references from surviving nodes.
+    /// Deletes elements (plus the contents of deleted subprocesses and every
+    /// sequence flow touching a deleted node) and their DI, and strips
+    /// dangling references from surviving nodes.
     pub fn delete_elements(&mut self, ids: &HashSet<BpmnId>) {
-        // Expand the set with flows that touch deleted nodes.
+        // Expand the set with subprocess contents, then with flows that touch
+        // deleted nodes.
         let mut doomed: HashSet<BpmnId> = ids.clone();
+        for id in ids {
+            doomed.extend(self.descendants_of(id));
+        }
         for element in self.flow_elements() {
             if let FlowElement::SequenceFlow(flow) = element
                 && (doomed.contains(&flow.source) || doomed.contains(&flow.target))
@@ -588,24 +903,9 @@ impl Document {
             }
         }
 
-        if let Some(process) = self.first_process_mut() {
-            process
-                .flow_elements
-                .retain(|element| element.id().is_none_or(|id| !doomed.contains(id)));
-
-            for element in &mut process.flow_elements {
-                if let Some(node) = flow_node_mut(element) {
-                    node.incoming.retain(|id| !doomed.contains(id));
-                    node.outgoing.retain(|id| !doomed.contains(id));
-                }
-                if let FlowElement::Gateway(gateway) = element
-                    && gateway
-                        .default_flow
-                        .as_ref()
-                        .is_some_and(|id| doomed.contains(id))
-                {
-                    gateway.default_flow = None;
-                }
+        for root in &mut self.definitions.root_elements {
+            if let RootElement::Process(process) = root {
+                prune_deleted(&mut process.flow_elements, &doomed);
             }
         }
 
@@ -621,6 +921,21 @@ impl Document {
 
 impl Document {
     fn flow_element_mut(&mut self, id: &BpmnId) -> Option<&mut FlowElement> {
+        fn scan<'a>(elements: &'a mut [FlowElement], id: &BpmnId) -> Option<&'a mut FlowElement> {
+            for element in elements {
+                if element.id() == Some(id) {
+                    return Some(element);
+                }
+                if let FlowElement::Activity(activity) = element
+                    && let ActivityKind::SubProcess(sub) = &mut activity.kind
+                    && let Some(found) = scan(&mut sub.flow_elements, id)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
         self.definitions
             .root_elements
             .iter_mut()
@@ -628,8 +943,7 @@ impl Document {
                 RootElement::Process(process) => Some(process),
                 RootElement::Unknown(_) => None,
             })
-            .flat_map(|process| process.flow_elements.iter_mut())
-            .find(|element| element.id() == Some(id))
+            .find_map(|process| scan(&mut process.flow_elements, id))
     }
 
     /// Renames a flow element (`None` removes the name).
@@ -645,9 +959,12 @@ impl Document {
         true
     }
 
-    /// Changes a task's type (its XML tag).
+    /// Changes a task's type (its XML tag). Subprocesses and call activities
+    /// are not tasks and keep their kind.
     pub fn set_task_type(&mut self, id: &BpmnId, task_type: TaskType) -> bool {
-        if let Some(FlowElement::Activity(activity)) = self.flow_element_mut(id) {
+        if let Some(FlowElement::Activity(activity)) = self.flow_element_mut(id)
+            && matches!(activity.kind, ActivityKind::Task(_))
+        {
             activity.kind = ActivityKind::Task(task_type);
             true
         } else {
@@ -729,8 +1046,9 @@ impl Document {
         found
     }
 
-    /// Copies `selection` (plus flows fully inside it) into a standalone
-    /// document — the clipboard payload is plain BPMN XML.
+    /// Copies `selection` (plus flows fully inside it, plus the contents of
+    /// selected subprocesses) into a standalone document — the clipboard
+    /// payload is plain BPMN XML.
     #[must_use]
     pub fn extract(&self, selection: &HashSet<BpmnId>) -> Document {
         let mut out = Document::new();
@@ -745,41 +1063,48 @@ impl Document {
             })
             .collect();
 
-        if let Some(process) = out.first_process_mut() {
-            // (populated below; split for borrow clarity)
-            process.flow_elements.clear();
+        // Anything nested inside a kept subprocess travels with its
+        // container's clone; only the roots are copied top-level.
+        let mut nested: HashSet<BpmnId> = HashSet::new();
+        for id in &keep {
+            nested.extend(self.descendants_of(id));
         }
+
         let mut elements = Vec::new();
         for element in self.flow_elements() {
-            if element.id().is_some_and(|id| keep.contains(id)) {
-                let mut element = element.clone();
-                if let Some(node) = flow_node_mut(&mut element) {
-                    node.incoming.retain(|id| keep.contains(id));
-                    node.outgoing.retain(|id| keep.contains(id));
-                }
-                if let FlowElement::Gateway(gateway) = &mut element
-                    && gateway
-                        .default_flow
-                        .as_ref()
-                        .is_some_and(|id| !keep.contains(id))
-                {
-                    gateway.default_flow = None;
-                }
-                elements.push(element);
+            let Some(id) = element.id() else { continue };
+            if !keep.contains(id) || nested.contains(id) {
+                continue;
             }
+            let mut element = element.clone();
+            if let Some(node) = flow_node_mut(&mut element) {
+                node.incoming.retain(|id| keep.contains(id));
+                node.outgoing.retain(|id| keep.contains(id));
+            }
+            if let FlowElement::Gateway(gateway) = &mut element
+                && gateway
+                    .default_flow
+                    .as_ref()
+                    .is_some_and(|id| !keep.contains(id))
+            {
+                gateway.default_flow = None;
+            }
+            elements.push(element);
         }
         if let Some(process) = out.first_process_mut() {
             process.flow_elements = elements;
         }
 
+        let mut di_keep = keep;
+        di_keep.extend(nested);
         let mut di = Vec::new();
         if let Some(plane) = self.diagram().and_then(|d| d.plane.as_ref()) {
             for element in &plane.elements {
                 match element {
-                    DiElement::Shape(shape) if keep.contains(&shape.bpmn_element) => {
+                    DiElement::Shape(shape) if di_keep.contains(&shape.bpmn_element) => {
                         di.push(DiElement::Shape(shape.clone()));
                     }
-                    DiElement::Edge(edge) if keep.contains(&edge.bpmn_element) => {
+                    DiElement::Edge(edge) if di_keep.contains(&edge.bpmn_element) => {
                         di.push(DiElement::Edge(edge.clone()));
                     }
                     _ => {}
@@ -794,11 +1119,8 @@ impl Document {
     }
 
     /// Pastes every modeled flow element of `source` into this document with
-    /// fresh ids, offset by `(dx, dy)`. Returns the new node ids (not flows).
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one coherent remap pass; splitting it obscures the id mapping"
-    )]
+    /// fresh ids, offset by `(dx, dy)`. Returns the new top-level node ids
+    /// (not flows, not subprocess contents).
     pub fn paste_from(&mut self, source: &Document, dx: f64, dy: f64) -> Vec<BpmnId> {
         use std::collections::HashMap;
 
@@ -815,7 +1137,7 @@ impl Document {
             }
         };
 
-        // First pass: a new id for every modeled element.
+        // First pass: a new id for every modeled element, nested ones too.
         let mut mapping: HashMap<BpmnId, BpmnId> = HashMap::new();
         for element in source.flow_elements() {
             let Some(old) = element.id() else { continue };
@@ -828,60 +1150,38 @@ impl Document {
             };
             mapping.insert(old.clone(), fresh(prefix));
         }
-        let remap = |id: &BpmnId, mapping: &HashMap<BpmnId, BpmnId>| {
-            mapping.get(id).cloned().unwrap_or_else(|| id.clone())
-        };
 
         let mut new_nodes = Vec::new();
         let mut elements = Vec::new();
-        for element in source.flow_elements() {
-            let Some(old) = element.id() else { continue };
-            let Some(new) = mapping.get(old) else {
-                continue;
-            };
-            let mut element = element.clone();
-            match &mut element {
-                FlowElement::SequenceFlow(flow) => {
+        // Only top-level elements paste directly; subprocess contents travel
+        // inside their container's clone (remapped recursively).
+        for process in source.processes() {
+            for element in &process.flow_elements {
+                let Some(old) = element.id() else { continue };
+                if let FlowElement::SequenceFlow(flow) = element {
                     // A flow whose endpoints were not pasted makes no sense.
                     if !mapping.contains_key(&flow.source) || !mapping.contains_key(&flow.target) {
                         continue;
                     }
-                    flow.base.id = new.clone();
-                    flow.source = remap(&flow.source, &mapping);
-                    flow.target = remap(&flow.target, &mapping);
                 }
-                other => {
-                    if let Some(node) = flow_node_mut(other) {
-                        node.base.id = new.clone();
-                        node.incoming = node
-                            .incoming
-                            .iter()
-                            .filter(|id| mapping.contains_key(*id))
-                            .map(|id| remap(id, &mapping))
-                            .collect();
-                        node.outgoing = node
-                            .outgoing
-                            .iter()
-                            .filter(|id| mapping.contains_key(*id))
-                            .map(|id| remap(id, &mapping))
-                            .collect();
-                    }
-                    if let FlowElement::Gateway(gateway) = other {
-                        gateway.default_flow = gateway
-                            .default_flow
-                            .take()
-                            .filter(|id| mapping.contains_key(id))
-                            .map(|id| remap(&id, &mapping));
-                    }
+                let Some(new) = mapping.get(old) else {
+                    continue;
+                };
+                let mut element = element.clone();
+                remap_element(&mut element, &mapping);
+                if !matches!(element, FlowElement::SequenceFlow(_)) {
                     new_nodes.push(new.clone());
                 }
+                elements.push(element);
             }
-            elements.push(element);
         }
         if let Some(process) = self.first_process_mut() {
             process.flow_elements.extend(elements);
         }
 
+        let remap = |id: &BpmnId, mapping: &HashMap<BpmnId, BpmnId>| {
+            mapping.get(id).cloned().unwrap_or_else(|| id.clone())
+        };
         let mut di = Vec::new();
         if let Some(plane) = source.diagram().and_then(|d| d.plane.as_ref()) {
             for element in &plane.elements {
@@ -935,12 +1235,97 @@ impl Default for Document {
     }
 }
 
+/// Removes doomed elements from a flow-element collection (descending into
+/// subprocesses) and strips dangling references from the survivors.
+fn prune_deleted(elements: &mut Vec<FlowElement>, doomed: &HashSet<BpmnId>) {
+    elements.retain(|element| element.id().is_none_or(|id| !doomed.contains(id)));
+    for element in elements {
+        if let Some(node) = flow_node_mut(element) {
+            node.incoming.retain(|id| !doomed.contains(id));
+            node.outgoing.retain(|id| !doomed.contains(id));
+        }
+        match element {
+            FlowElement::Gateway(gateway)
+                if gateway
+                    .default_flow
+                    .as_ref()
+                    .is_some_and(|id| doomed.contains(id)) =>
+            {
+                gateway.default_flow = None;
+            }
+            FlowElement::Activity(activity) => {
+                if let ActivityKind::SubProcess(sub) = &mut activity.kind {
+                    prune_deleted(&mut sub.flow_elements, doomed);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn flow_node_mut(element: &mut FlowElement) -> Option<&mut FlowNode> {
     match element {
         FlowElement::Event(event) => Some(&mut event.node),
         FlowElement::Activity(activity) => Some(&mut activity.node),
         FlowElement::Gateway(gateway) => Some(&mut gateway.node),
         FlowElement::SequenceFlow(_) | FlowElement::Unknown(_) => None,
+    }
+}
+
+/// Rewrites every id a pasted element carries through `mapping`, descending
+/// into subprocess contents. References to unpasted elements are dropped from
+/// `incoming`/`outgoing` and gateway defaults, but a boundary's `attachedToRef`
+/// is kept as written (validation will flag it when it dangles).
+fn remap_element(element: &mut FlowElement, mapping: &std::collections::HashMap<BpmnId, BpmnId>) {
+    let remap = |id: &mut BpmnId| {
+        if let Some(new) = mapping.get(id) {
+            *id = new.clone();
+        }
+    };
+
+    match element {
+        FlowElement::SequenceFlow(flow) => {
+            remap(&mut flow.base.id);
+            remap(&mut flow.source);
+            remap(&mut flow.target);
+        }
+        FlowElement::Unknown(_) => {}
+        other => {
+            if let Some(node) = flow_node_mut(other) {
+                remap(&mut node.base.id);
+                for refs in [&mut node.incoming, &mut node.outgoing] {
+                    refs.retain(|id| mapping.contains_key(id));
+                    for id in refs {
+                        remap(id);
+                    }
+                }
+            }
+            match other {
+                FlowElement::Gateway(gateway) => {
+                    gateway.default_flow = gateway
+                        .default_flow
+                        .take()
+                        .filter(|id| mapping.contains_key(id))
+                        .map(|mut id| {
+                            remap(&mut id);
+                            id
+                        });
+                }
+                FlowElement::Event(event) => {
+                    if let EventPosition::Boundary { attached_to, .. } = &mut event.position {
+                        remap(attached_to);
+                    }
+                }
+                FlowElement::Activity(activity) => {
+                    if let ActivityKind::SubProcess(sub) = &mut activity.kind {
+                        for child in &mut sub.flow_elements {
+                            remap_element(child, mapping);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1163,6 +1548,168 @@ mod m3_tests {
         // And the pasted shape is offset.
         let (_, bounds) = doc.node_outline(&BpmnId::from("Event_2")).unwrap();
         assert_eq!(bounds.center(), Point::new(120.0, 120.0));
+    }
+
+    #[test]
+    fn subprocess_containment_and_cascade() {
+        use crate::model::SubProcessKind;
+
+        let mut doc = Document::new();
+        let sub = doc
+            .create_node(
+                NodeKind::SubProcess(SubProcessKind::Embedded),
+                Point::new(0.0, 0.0),
+            )
+            .unwrap();
+        // Placed inside the expanded subprocess area → nested.
+        let a = doc
+            .create_node(NodeKind::StartEvent, Point::new(-100.0, 0.0))
+            .unwrap();
+        let b = doc
+            .create_node(NodeKind::Task(TaskType::User), Point::new(50.0, 0.0))
+            .unwrap();
+        // Placed outside → top level.
+        let outside = doc
+            .create_node(NodeKind::EndEvent, Point::new(400.0, 0.0))
+            .unwrap();
+
+        assert_eq!(doc.container_of(&a), Some(sub.clone()));
+        assert_eq!(doc.container_of(&b), Some(sub.clone()));
+        assert_eq!(doc.container_of(&outside), Some(BpmnId::from("Process_1")));
+
+        // Same-container connections work; cross-container ones refuse.
+        let inner_flow = doc.connect(&a, &b).unwrap();
+        assert_eq!(doc.container_of(&inner_flow), Some(sub.clone()));
+        assert!(doc.connect(&b, &outside).is_none(), "cross-container");
+
+        // Moving the subprocess carries its children and internal edges.
+        let before = doc.node_outline(&a).unwrap().1;
+        let moved: HashSet<BpmnId> = [sub.clone()].into_iter().collect();
+        doc.move_shapes(&moved, 30.0, 40.0);
+        let after = doc.node_outline(&a).unwrap().1;
+        assert_eq!((after.x - before.x, after.y - before.y), (30.0, 40.0));
+
+        // Deleting the subprocess takes the contents and their DI with it.
+        doc.delete_elements(&moved);
+        assert_eq!(doc.flow_elements().count(), 1, "only the outside node left");
+        let plane = doc.diagram().unwrap().plane.as_ref().unwrap();
+        assert_eq!(plane.elements.len(), 1);
+    }
+
+    #[test]
+    fn collapse_hides_and_expand_refits() {
+        use crate::model::SubProcessKind;
+
+        let mut doc = Document::new();
+        let sub = doc
+            .create_node(
+                NodeKind::SubProcess(SubProcessKind::Embedded),
+                Point::new(0.0, 0.0),
+            )
+            .unwrap();
+        let child = doc
+            .create_node(NodeKind::Task(TaskType::Generic), Point::new(0.0, 0.0))
+            .unwrap();
+
+        assert!(doc.set_subprocess_expanded(&sub, false));
+        let (_, bounds) = doc.node_outline(&sub).unwrap();
+        assert_eq!((bounds.width, bounds.height), (100.0, 80.0));
+        assert!(doc.hidden_by_collapse().contains(&child));
+
+        assert!(doc.set_subprocess_expanded(&sub, true));
+        let (_, bounds) = doc.node_outline(&sub).unwrap();
+        assert!(doc.hidden_by_collapse().is_empty());
+        // Re-expanded around the child (100x80 plus 40 padding each side).
+        assert_eq!((bounds.width, bounds.height), (180.0, 160.0));
+
+        // Not a subprocess → refused.
+        assert!(!doc.set_subprocess_expanded(&child, false));
+    }
+
+    #[test]
+    fn dragging_a_node_into_a_subprocess_reparents_it() {
+        use crate::model::SubProcessKind;
+
+        let mut doc = Document::new();
+        let sub = doc
+            .create_node(
+                NodeKind::SubProcess(SubProcessKind::Embedded),
+                Point::new(0.0, 0.0),
+            )
+            .unwrap();
+        let task = doc
+            .create_node(NodeKind::Task(TaskType::User), Point::new(500.0, 0.0))
+            .unwrap();
+        assert_eq!(doc.container_of(&task), Some(BpmnId::from("Process_1")));
+
+        // Drag the task onto the subprocess body...
+        let moved: HashSet<BpmnId> = [task.clone()].into_iter().collect();
+        doc.move_shapes(&moved, -500.0, 0.0);
+        assert_eq!(doc.container_of(&task), Some(sub.clone()));
+
+        // ...and back out again.
+        doc.move_shapes(&moved, 500.0, 0.0);
+        assert_eq!(doc.container_of(&task), Some(BpmnId::from("Process_1")));
+    }
+
+    #[test]
+    fn copying_a_subprocess_remints_nested_ids() {
+        use crate::model::SubProcessKind;
+
+        let mut doc = Document::new();
+        let sub = doc
+            .create_node(
+                NodeKind::SubProcess(SubProcessKind::Embedded),
+                Point::new(0.0, 0.0),
+            )
+            .unwrap();
+        let a = doc
+            .create_node(NodeKind::StartEvent, Point::new(-100.0, 0.0))
+            .unwrap();
+        let b = doc
+            .create_node(NodeKind::EndEvent, Point::new(100.0, 0.0))
+            .unwrap();
+        doc.connect(&a, &b).unwrap();
+
+        let selection: HashSet<BpmnId> = [sub.clone()].into_iter().collect();
+        let clipboard = doc.extract(&selection);
+        // The clone carries the nested elements and their DI.
+        assert_eq!(clipboard.flow_elements().count(), 4);
+        assert_eq!(
+            clipboard
+                .diagram()
+                .unwrap()
+                .plane
+                .as_ref()
+                .unwrap()
+                .elements
+                .len(),
+            4
+        );
+
+        let pasted = doc.paste_from(&clipboard, 500.0, 0.0);
+        assert_eq!(pasted.len(), 1, "one top-level node pasted");
+        assert_eq!(doc.flow_elements().count(), 8);
+
+        // Nested ids were reminted: the pasted subprocess's flow connects the
+        // pasted children, not the originals.
+        let index = doc.flow_element_index();
+        let FlowElement::Activity(activity) = index[&pasted[0]] else {
+            panic!()
+        };
+        let ActivityKind::SubProcess(sub) = &activity.kind else {
+            panic!()
+        };
+        let FlowElement::SequenceFlow(flow) = sub
+            .flow_elements
+            .iter()
+            .find(|e| matches!(e, FlowElement::SequenceFlow(_)))
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_ne!(flow.source, a);
+        assert_eq!(doc.container_of(&flow.source).as_ref(), Some(&pasted[0]));
     }
 
     #[test]

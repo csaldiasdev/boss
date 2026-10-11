@@ -1,7 +1,9 @@
 //! The MCP server: tool definitions and the streamable-HTTP endpoint.
 
 use crate::bridge::{ApplyOutcome, EditAction, EditorHandle};
-use bpmn_core::model::{ActivityKind, EventPosition, FlowElement, GatewayKind, TaskType};
+use bpmn_core::model::{
+    ActivityKind, EventPosition, FlowElement, GatewayKind, SubProcessKind, TaskType,
+};
 use bpmn_core::{BpmnId, Document, NodeKind};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerConfig};
@@ -26,9 +28,8 @@ fn kind_label(element: &FlowElement) -> &'static str {
             EventPosition::IntermediateThrow => "intermediate-throw-event",
             EventPosition::Boundary { .. } => "boundary-event",
         },
-        FlowElement::Activity(activity) => {
-            let ActivityKind::Task(task_type) = activity.kind;
-            match task_type {
+        FlowElement::Activity(activity) => match &activity.kind {
+            ActivityKind::Task(task_type) => match task_type {
                 TaskType::Generic => "task",
                 TaskType::User => "user-task",
                 TaskType::Service => "service-task",
@@ -37,8 +38,14 @@ fn kind_label(element: &FlowElement) -> &'static str {
                 TaskType::Send => "send-task",
                 TaskType::Receive => "receive-task",
                 TaskType::BusinessRule => "business-rule-task",
-            }
-        }
+            },
+            ActivityKind::SubProcess(sub) => match sub.kind {
+                SubProcessKind::Embedded => "subprocess",
+                SubProcessKind::Event => "event-subprocess",
+                SubProcessKind::Transaction => "transaction",
+            },
+            ActivityKind::CallActivity(_) => "call-activity",
+        },
         FlowElement::Gateway(gateway) => match gateway.kind {
             GatewayKind::Exclusive => "exclusive-gateway",
             GatewayKind::Parallel => "parallel-gateway",
@@ -65,6 +72,10 @@ fn parse_kind(kind: &str) -> Option<NodeKind> {
         "send-task" => NodeKind::Task(TaskType::Send),
         "receive-task" => NodeKind::Task(TaskType::Receive),
         "business-rule-task" => NodeKind::Task(TaskType::BusinessRule),
+        "subprocess" => NodeKind::SubProcess(SubProcessKind::Embedded),
+        "event-subprocess" => NodeKind::SubProcess(SubProcessKind::Event),
+        "transaction" => NodeKind::SubProcess(SubProcessKind::Transaction),
+        "call-activity" => NodeKind::CallActivity,
         "exclusive-gateway" => NodeKind::Gateway(GatewayKind::Exclusive),
         "parallel-gateway" => NodeKind::Gateway(GatewayKind::Parallel),
         "inclusive-gateway" => NodeKind::Gateway(GatewayKind::Inclusive),
@@ -124,9 +135,11 @@ fn to_json<T: serde::Serialize>(value: &T) -> Result<String, ErrorData> {
 struct CreateNodeParams {
     /// One of: start-event, end-event, intermediate-catch-event,
     /// intermediate-throw-event, task, user-task, service-task, script-task,
-    /// manual-task, send-task, receive-task, business-rule-task,
-    /// exclusive-gateway, parallel-gateway, inclusive-gateway,
-    /// event-based-gateway, complex-gateway.
+    /// manual-task, send-task, receive-task, business-rule-task, subprocess,
+    /// event-subprocess, transaction, call-activity, exclusive-gateway,
+    /// parallel-gateway, inclusive-gateway, event-based-gateway,
+    /// complex-gateway. Subprocesses are placed expanded (350x200); a node
+    /// created inside their area becomes part of the subprocess.
     kind: String,
     /// Diagram x of the element center (typical diagrams span 150..1200).
     x: f64,
@@ -309,7 +322,9 @@ impl BossMcp {
         Ok(outcome_text(&outcome))
     }
 
-    #[tool(description = "Connect two nodes with a sequence flow; returns the flow id.")]
+    #[tool(
+        description = "Connect two nodes with a sequence flow; returns the flow id. Both nodes must live in the same container (the process, or one subprocess)."
+    )]
     async fn connect(&self, params: Parameters<ConnectParams>) -> Result<String, ErrorData> {
         let p = params.0;
         let outcome = self

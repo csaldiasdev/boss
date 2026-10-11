@@ -203,37 +203,48 @@ fn world_rect(a: Point, b: Point) -> Rectangle {
 }
 
 impl View<'_> {
-    /// Topmost node under a world-space point, shape-accurate.
+    /// The node under a world-space point, shape-accurate. When shapes nest
+    /// (subprocess children), the smallest hit wins so children stay
+    /// selectable inside their container.
     fn hit_node(&self, world: Point) -> Option<BpmnId> {
         let plane = self.document.diagram()?.plane.as_ref()?;
         let index = self.document.flow_element_index();
+        let hidden = self.document.hidden_by_collapse();
         let world = bpmn_core::Point::new(f64::from(world.x), f64::from(world.y));
 
+        let mut best: Option<(BpmnId, f64)> = None;
         for element in plane.elements.iter().rev() {
             let DiElement::Shape(shape) = element else {
                 continue;
             };
+            if hidden.contains(&shape.bpmn_element) {
+                continue;
+            }
             let Some(outline) = index.get(&shape.bpmn_element).copied().and_then(outline_of) else {
                 continue;
             };
             if outline.contains(shape.bounds, world) {
-                return Some(shape.bpmn_element.clone());
+                let area = shape.bounds.width * shape.bounds.height;
+                if best.as_ref().is_none_or(|(_, a)| area < *a) {
+                    best = Some((shape.bpmn_element.clone(), area));
+                }
             }
         }
-        None
+        best.map(|(id, _)| id)
     }
 
     /// Topmost edge whose polyline passes near a world-space point.
     fn hit_edge(&self, world: Point) -> Option<BpmnId> {
         let plane = self.document.diagram()?.plane.as_ref()?;
         let index = self.document.flow_element_index();
+        let hidden = self.document.hidden_by_collapse();
         let tolerance = 6.0 / self.camera.scaling;
 
         for element in plane.elements.iter().rev() {
             let DiElement::Edge(edge) = element else {
                 continue;
             };
-            if !index.contains_key(&edge.bpmn_element) {
+            if !index.contains_key(&edge.bpmn_element) || hidden.contains(&edge.bpmn_element) {
                 continue;
             }
             let points: Vec<Point> = edge

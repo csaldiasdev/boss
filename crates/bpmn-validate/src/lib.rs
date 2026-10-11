@@ -5,7 +5,8 @@
 //! small, so validation is a full pass over a prebuilt [`Graph`].
 
 use bpmn_core::model::{
-    Condition, EventPosition, FlowElement, Gateway, GatewayKind, SequenceFlow, TaskType,
+    ActivityKind, Condition, EventPosition, FlowElement, Gateway, GatewayKind, SequenceFlow,
+    SubProcessKind, TaskType,
 };
 use bpmn_core::{BpmnId, Document};
 use std::collections::{HashMap, HashSet};
@@ -104,6 +105,8 @@ impl Validator {
                 Box::new(DanglingFlowRefs),
                 Box::new(BoundaryAttachment),
                 Box::new(EventBasedTargets),
+                Box::new(CrossContainerFlow),
+                Box::new(SubprocessContents),
             ],
         }
     }
@@ -199,7 +202,13 @@ impl Rule for Disconnected {
                     // A boundary event hangs off its host; no incoming needed.
                     !matches!(event.position, EventPosition::Boundary { .. })
                 }
-                FlowElement::Activity(_) | FlowElement::Gateway(_) => true,
+                // An event subprocess is started by its own events, never by
+                // sequence flow; SubprocessContents polices its flows instead.
+                FlowElement::Activity(activity) => !matches!(
+                    &activity.kind,
+                    ActivityKind::SubProcess(sub) if sub.kind == SubProcessKind::Event
+                ),
+                FlowElement::Gateway(_) => true,
                 _ => false,
             };
             if is_node && graph.incoming(id).is_empty() && graph.outgoing(id).is_empty() {
@@ -427,6 +436,109 @@ impl Rule for EventBasedTargets {
     }
 }
 
+struct CrossContainerFlow;
+
+impl Rule for CrossContainerFlow {
+    fn id(&self) -> &'static str {
+        "cross-container-flow"
+    }
+
+    fn check(&self, graph: &Graph<'_>, out: &mut Vec<Issue>) {
+        for element in graph.document.flow_elements() {
+            let FlowElement::SequenceFlow(flow) = element else {
+                continue;
+            };
+            let source = graph.document.container_of(&flow.source);
+            let target = graph.document.container_of(&flow.target);
+            if let (Some(source), Some(target)) = (source, target)
+                && source != target
+            {
+                out.push(Issue {
+                    rule: self.id(),
+                    severity: Severity::Error,
+                    element: Some(flow.base.id.clone()),
+                    message: format!(
+                        "Flow {} crosses a subprocess boundary (connect through boundary events or the subprocess itself)",
+                        flow.base.id
+                    ),
+                });
+            }
+        }
+    }
+}
+
+struct SubprocessContents;
+
+impl Rule for SubprocessContents {
+    fn id(&self) -> &'static str {
+        "subprocess-contents"
+    }
+
+    fn check(&self, graph: &Graph<'_>, out: &mut Vec<Issue>) {
+        for element in graph.document.flow_elements() {
+            let FlowElement::Activity(activity) = element else {
+                continue;
+            };
+            let ActivityKind::SubProcess(sub) = &activity.kind else {
+                continue;
+            };
+            let id = &activity.node.base.id;
+
+            let mut starts = sub.flow_elements.iter().filter_map(|child| match child {
+                FlowElement::Event(event)
+                    if matches!(event.position, EventPosition::Start { .. }) =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            });
+            let first_start = starts.next();
+
+            if sub.kind == SubProcessKind::Event {
+                match first_start {
+                    None => out.push(Issue {
+                        rule: self.id(),
+                        severity: Severity::Error,
+                        element: Some(id.clone()),
+                        message: format!(
+                            "Event subprocess {} needs a start event that triggers it",
+                            label(element, id)
+                        ),
+                    }),
+                    Some(start) if start.definitions.is_empty() => out.push(Issue {
+                        rule: self.id(),
+                        severity: Severity::Warning,
+                        element: Some(start.node.base.id.clone()),
+                        message: format!(
+                            "The start event of event subprocess {} should have a trigger (message, timer, error, ...)",
+                            label(element, id)
+                        ),
+                    }),
+                    Some(_) => {}
+                }
+                if !graph.incoming(id).is_empty() || !graph.outgoing(id).is_empty() {
+                    out.push(Issue {
+                        rule: self.id(),
+                        severity: Severity::Error,
+                        element: Some(id.clone()),
+                        message: format!(
+                            "Event subprocess {} cannot have incoming or outgoing flows",
+                            label(element, id)
+                        ),
+                    });
+                }
+            } else if first_start.is_none() && !sub.flow_elements.is_empty() {
+                out.push(Issue {
+                    rule: self.id(),
+                    severity: Severity::Warning,
+                    element: Some(id.clone()),
+                    message: format!("Subprocess {} has no start event", label(element, id)),
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +630,91 @@ mod tests {
         // A default flow silences it.
         assert!(doc.set_gateway_default(&gw, Some(yes)));
         assert!(!rules(&validate(&doc)).contains(&"exclusive-without-default"));
+    }
+
+    #[test]
+    fn subprocess_rules() {
+        use bpmn_core::geometry::Point;
+        use bpmn_core::model::SubProcessKind;
+
+        // An embedded subprocess with contents but no start event warns.
+        let mut doc = Document::new();
+        let start = doc
+            .create_node(NodeKind::StartEvent, Point::new(-400.0, 0.0))
+            .unwrap();
+        let sub = doc
+            .create_node(
+                NodeKind::SubProcess(SubProcessKind::Embedded),
+                Point::new(0.0, 0.0),
+            )
+            .unwrap();
+        let task = doc
+            .create_node(
+                NodeKind::Task(bpmn_core::model::TaskType::User),
+                Point::new(0.0, 0.0),
+            )
+            .unwrap();
+        let end = doc
+            .create_node(NodeKind::EndEvent, Point::new(400.0, 0.0))
+            .unwrap();
+        doc.connect(&start, &sub).unwrap();
+        doc.connect(&sub, &end).unwrap();
+
+        let issues = validate(&doc);
+        assert!(rules(&issues).contains(&"subprocess-contents"));
+        assert!(
+            !rules(&issues).contains(&"cross-container-flow"),
+            "outer flows are fine"
+        );
+
+        // A start event inside silences it (the inner pair is connected).
+        let inner_start = doc
+            .create_node(NodeKind::StartEvent, Point::new(-120.0, 0.0))
+            .unwrap();
+        doc.connect(&inner_start, &task).unwrap();
+        assert!(!rules(&validate(&doc)).contains(&"subprocess-contents"));
+    }
+
+    #[test]
+    fn event_subprocess_wants_a_triggered_start_and_no_flows() {
+        use bpmn_core::geometry::Point;
+        use bpmn_core::model::{EventDefinitionKind, SubProcessKind};
+
+        let mut doc = Document::new();
+        let sub = doc
+            .create_node(
+                NodeKind::SubProcess(SubProcessKind::Event),
+                Point::new(0.0, 0.0),
+            )
+            .unwrap();
+        // No start event at all: error.
+        let issues = validate(&doc);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "subprocess-contents" && i.severity == Severity::Error)
+        );
+
+        // A plain start event: warning (it should carry a trigger)...
+        let inner = doc
+            .create_node(NodeKind::StartEvent, Point::new(0.0, 0.0))
+            .unwrap();
+        let issues = validate(&doc);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.rule == "subprocess-contents" && i.severity == Severity::Warning)
+        );
+
+        // ...and a typed one is quiet.
+        doc.set_event_definition(&inner, Some(EventDefinitionKind::Error));
+        assert!(!rules(&validate(&doc)).contains(&"subprocess-contents"));
+        assert!(
+            !validate(&doc)
+                .iter()
+                .any(|i| i.rule == "disconnected" && i.element.as_ref() == Some(&sub)),
+            "the event subprocess itself is never wired by flows"
+        );
     }
 
     #[test]

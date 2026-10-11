@@ -19,6 +19,14 @@ allow = [
   "Unlicense",
 ]
 
+[advisories]
+# Unmaintained transitive dependencies we cannot swap ourselves; each entry
+# names who pulls it in and goes away when the upstream migrates.
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste, pulled in by rmcp/metrics macros; unmaintained but macro-only" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser, pulled in by iced's font stack; waiting on upstream move to skrifa" },
+]
+
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"

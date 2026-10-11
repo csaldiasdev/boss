@@ -9,8 +9,8 @@ use crate::theme::CanvasTokens;
 use bpmn_core::Document;
 use bpmn_core::di::{BpmnLabel, BpmnShape, DiElement};
 use bpmn_core::model::{
-    ActivityKind, Event as BpmnEvent, EventDefinitionKind, EventPosition, FlowElement, Gateway,
-    GatewayKind, LoopKind, TaskType,
+    Activity, ActivityKind, Event as BpmnEvent, EventDefinitionKind, EventPosition, FlowElement,
+    Gateway, GatewayKind, LoopKind, Process, RootElement, SubProcessKind, TaskType,
 };
 use iced::alignment::Vertical;
 use iced::widget::canvas::path::Builder;
@@ -44,6 +44,33 @@ pub enum Badge {
     Error,
 }
 
+/// Nesting depth of every flow element id (0 = directly in a process).
+fn depths(document: &Document) -> std::collections::HashMap<bpmn_core::BpmnId, usize> {
+    fn walk(
+        elements: &[FlowElement],
+        depth: usize,
+        out: &mut std::collections::HashMap<bpmn_core::BpmnId, usize>,
+    ) {
+        for element in elements {
+            if let Some(id) = element.id() {
+                out.insert(id.clone(), depth);
+            }
+            if let FlowElement::Activity(activity) = element
+                && let ActivityKind::SubProcess(sub) = &activity.kind
+            {
+                walk(&sub.flow_elements, depth + 1, out);
+            }
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for root in &document.definitions.root_elements {
+        if let RootElement::Process(Process { flow_elements, .. }) = root {
+            walk(flow_elements, 0, &mut out);
+        }
+    }
+    out
+}
+
 /// Draws `document`'s first diagram into an already camera-transformed frame.
 pub fn draw(
     frame: &mut Frame,
@@ -57,6 +84,7 @@ pub fn draw(
         return;
     };
     let index = document.flow_element_index();
+    let hidden = document.hidden_by_collapse();
 
     // Hairline that never drops under one device pixel.
     let stroke_width = 1.5f32.max(1.0 / zoom);
@@ -64,10 +92,43 @@ pub fn draw(
         .with_width(stroke_width)
         .with_color(tokens.stroke);
 
-    // Edges under shapes, labels on top.
+    // Expanded subprocess bodies go under everything, outermost first, so
+    // edges and child shapes draw on top of their container's fill.
+    let depth_of = depths(document);
+    let mut containers: Vec<(&BpmnShape, usize)> = Vec::new();
+    let mut nodes: Vec<&BpmnShape> = Vec::new();
+    for element in &plane.elements {
+        if let DiElement::Shape(shape) = element {
+            if hidden.contains(&shape.bpmn_element) || !rect(shape.bounds).intersects(&visible) {
+                continue;
+            }
+            let is_container = matches!(
+                index.get(&shape.bpmn_element).copied(),
+                Some(FlowElement::Activity(Activity {
+                    kind: ActivityKind::SubProcess(_),
+                    ..
+                }))
+            ) && shape.is_expanded == Some(true);
+            if is_container {
+                containers.push((
+                    shape,
+                    depth_of.get(&shape.bpmn_element).copied().unwrap_or(0),
+                ));
+            } else {
+                nodes.push(shape);
+            }
+        }
+    }
+    containers.sort_by_key(|(_, depth)| *depth);
+
+    for (shape, _) in &containers {
+        draw_shape(frame, &index, badges, shape, stroke, stroke_width, tokens);
+    }
+
+    // Edges under node shapes, labels on top.
     for element in &plane.elements {
         if let DiElement::Edge(edge) = element {
-            if edge.waypoints.len() < 2 {
+            if edge.waypoints.len() < 2 || hidden.contains(&edge.bpmn_element) {
                 continue;
             }
             let points: Vec<Point> = edge.waypoints.iter().copied().map(pt).collect();
@@ -97,66 +158,169 @@ pub fn draw(
         }
     }
 
-    for element in &plane.elements {
-        if let DiElement::Shape(shape) = element {
-            let bounds = rect(shape.bounds);
-            if !bounds.intersects(&visible) {
-                continue;
-            }
-            if let Some(badge) = badges.get(&shape.bpmn_element) {
-                let color = match badge {
-                    Badge::Warning => tokens.warning,
-                    Badge::Error => tokens.danger,
-                };
-                let center = Point::new(bounds.x + bounds.width - 2.0, bounds.y + 2.0);
-                frame.fill(&Path::circle(center, 5.0), color);
-                frame.stroke(
-                    &Path::circle(center, 5.0),
-                    Stroke::default().with_width(1.5).with_color(tokens.bg),
-                );
-            }
+    for shape in &nodes {
+        draw_shape(frame, &index, badges, shape, stroke, stroke_width, tokens);
+    }
+}
 
-            match index.get(&shape.bpmn_element).copied() {
-                Some(FlowElement::Event(event)) => {
-                    draw_event(frame, event, shape, bounds, stroke, stroke_width, tokens);
-                }
-                Some(FlowElement::Activity(activity)) => {
-                    let path = Path::rounded_rectangle(
-                        bounds.position(),
-                        bounds.size(),
-                        TASK_RADIUS.into(),
-                    );
-                    frame.fill(&path, tokens.fill);
-                    frame.stroke(&path, stroke);
+fn draw_shape(
+    frame: &mut Frame,
+    index: &std::collections::HashMap<&bpmn_core::BpmnId, &FlowElement>,
+    badges: &std::collections::HashMap<bpmn_core::BpmnId, Badge>,
+    shape: &BpmnShape,
+    stroke: Stroke<'_>,
+    stroke_width: f32,
+    tokens: CanvasTokens,
+) {
+    let bounds = rect(shape.bounds);
+    if let Some(badge) = badges.get(&shape.bpmn_element) {
+        let color = match badge {
+            Badge::Warning => tokens.warning,
+            Badge::Error => tokens.danger,
+        };
+        let center = Point::new(bounds.x + bounds.width - 2.0, bounds.y + 2.0);
+        frame.fill(&Path::circle(center, 5.0), color);
+        frame.stroke(
+            &Path::circle(center, 5.0),
+            Stroke::default().with_width(1.5).with_color(tokens.bg),
+        );
+    }
 
-                    let ActivityKind::Task(task_type) = activity.kind;
-                    task_icon(frame, task_type, bounds, stroke_width, tokens);
-                    if let Some(marker) = &activity.loop_marker {
-                        loop_marker_icon(frame, marker.kind, bounds, stroke_width, tokens);
-                    }
-
-                    if let Some(name) = &activity.node.name {
-                        wrapped_label(frame, name, bounds, 12.0, tokens.label);
-                    }
-                }
-                Some(FlowElement::Gateway(gateway)) => {
-                    draw_gateway(frame, gateway, shape, bounds, stroke, stroke_width, tokens);
-                }
-                // Sequence flows have edges, not shapes; anything unmodeled
-                // renders as an honest dashed placeholder.
-                Some(FlowElement::SequenceFlow(_) | FlowElement::Unknown(_)) | None => {
-                    let path = Path::rounded_rectangle(
-                        bounds.position(),
-                        bounds.size(),
-                        TASK_RADIUS.into(),
-                    );
-                    let mut dashed = stroke;
-                    dashed.line_dash.segments = &[6.0, 4.0];
-                    frame.stroke(&path, dashed);
-                }
-            }
+    match index.get(&shape.bpmn_element).copied() {
+        Some(FlowElement::Event(event)) => {
+            draw_event(frame, event, shape, bounds, stroke, stroke_width, tokens);
+        }
+        Some(FlowElement::Activity(activity)) => {
+            draw_activity(frame, activity, shape, bounds, stroke, stroke_width, tokens);
+        }
+        Some(FlowElement::Gateway(gateway)) => {
+            draw_gateway(frame, gateway, shape, bounds, stroke, stroke_width, tokens);
+        }
+        // Sequence flows have edges, not shapes; anything unmodeled
+        // renders as an honest dashed placeholder.
+        Some(FlowElement::SequenceFlow(_) | FlowElement::Unknown(_)) | None => {
+            let path =
+                Path::rounded_rectangle(bounds.position(), bounds.size(), TASK_RADIUS.into());
+            let mut dashed = stroke;
+            dashed.line_dash.segments = &[6.0, 4.0];
+            frame.stroke(&path, dashed);
         }
     }
+}
+
+fn draw_activity(
+    frame: &mut Frame,
+    activity: &Activity,
+    shape: &BpmnShape,
+    bounds: Rectangle,
+    stroke: Stroke<'_>,
+    stroke_width: f32,
+    tokens: CanvasTokens,
+) {
+    let body = Path::rounded_rectangle(bounds.position(), bounds.size(), TASK_RADIUS.into());
+    frame.fill(&body, tokens.fill);
+
+    // Border per activity kind: dotted for event subprocesses, doubled for
+    // transactions, thick for call activities, plain otherwise.
+    match &activity.kind {
+        ActivityKind::SubProcess(sub) => match sub.kind {
+            SubProcessKind::Event => {
+                let mut dotted = stroke;
+                dotted.line_dash.segments = &[2.5, 3.5];
+                frame.stroke(&body, dotted);
+            }
+            SubProcessKind::Transaction => {
+                frame.stroke(&body, stroke);
+                let inset = 3.0;
+                let inner = Path::rounded_rectangle(
+                    Point::new(bounds.x + inset, bounds.y + inset),
+                    Size::new(bounds.width - inset * 2.0, bounds.height - inset * 2.0),
+                    (TASK_RADIUS - 2.0).into(),
+                );
+                frame.stroke(&inner, stroke);
+            }
+            SubProcessKind::Embedded => frame.stroke(&body, stroke),
+        },
+        ActivityKind::CallActivity(_) => {
+            frame.stroke(&body, stroke.with_width(stroke_width * 2.2));
+        }
+        ActivityKind::Task(_) => frame.stroke(&body, stroke),
+    }
+
+    let expanded =
+        matches!(&activity.kind, ActivityKind::SubProcess(_)) && shape.is_expanded == Some(true);
+
+    // Bottom-center markers: the [+] of collapsed containers plus any loop
+    // marker, laid out side by side.
+    let mut marker_slots: Vec<bool> = Vec::new(); // true = plus, false = loop
+    if matches!(
+        &activity.kind,
+        ActivityKind::SubProcess(_) | ActivityKind::CallActivity(_)
+    ) && !expanded
+    {
+        marker_slots.push(true);
+    }
+    if activity.loop_marker.is_some() {
+        marker_slots.push(false);
+    }
+    let slot_width = 16.0;
+    let start_x =
+        bounds.x + bounds.width / 2.0 - slot_width * (marker_slots.len() as f32 - 1.0) / 2.0;
+    for (i, is_plus) in marker_slots.iter().enumerate() {
+        let center = Point::new(
+            start_x + slot_width * i as f32,
+            bounds.y + bounds.height - 9.0,
+        );
+        if *is_plus {
+            plus_marker(frame, center, stroke_width, tokens);
+        } else if let Some(marker) = &activity.loop_marker {
+            loop_marker_icon(frame, marker.kind, center, stroke_width, tokens);
+        }
+    }
+
+    match &activity.kind {
+        ActivityKind::Task(task_type) => {
+            task_icon(frame, *task_type, bounds, stroke_width, tokens);
+        }
+        ActivityKind::SubProcess(_) | ActivityKind::CallActivity(_) => {}
+    }
+
+    if let Some(name) = &activity.node.name {
+        if expanded {
+            // The body belongs to the children; the name sits along the top.
+            label(
+                frame,
+                name,
+                Point::new(bounds.x + bounds.width / 2.0, bounds.y + 14.0),
+                12.0,
+                tokens.label,
+            );
+        } else {
+            wrapped_label(frame, name, bounds, 12.0, tokens.label);
+        }
+    }
+}
+
+/// The collapsed-container marker: a small square with a plus.
+fn plus_marker(frame: &mut Frame, center: Point, stroke_width: f32, tokens: CanvasTokens) {
+    let stroke = Stroke::default()
+        .with_width(stroke_width * 0.9)
+        .with_color(tokens.stroke);
+    let half = 6.0;
+    frame.stroke(
+        &Path::rectangle(
+            Point::new(center.x - half, center.y - half),
+            Size::new(half * 2.0, half * 2.0),
+        ),
+        stroke,
+    );
+    let plus = Path::new(|b| {
+        b.move_to(Point::new(center.x, center.y - half + 2.5));
+        b.line_to(Point::new(center.x, center.y + half - 2.5));
+        b.move_to(Point::new(center.x - half + 2.5, center.y));
+        b.line_to(Point::new(center.x + half - 2.5, center.y));
+    });
+    frame.stroke(&plus, stroke);
 }
 
 fn polyline_box(points: &[Point]) -> Rectangle {
@@ -701,21 +865,17 @@ fn task_icon(
     }
 }
 
-/// Loop / multi-instance marker at the bottom center of a task.
+/// Loop / multi-instance marker, centered at `c` (the bottom marker row).
 fn loop_marker_icon(
     frame: &mut Frame,
     kind: LoopKind,
-    bounds: Rectangle,
+    c: Point,
     stroke_width: f32,
     tokens: CanvasTokens,
 ) {
     let stroke = Stroke::default()
         .with_width(stroke_width * 0.9)
         .with_color(tokens.stroke);
-    let c = Point::new(
-        bounds.x + bounds.width / 2.0,
-        bounds.y + bounds.height - 9.0,
-    );
 
     match kind {
         LoopKind::Standard => {

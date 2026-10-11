@@ -11,7 +11,7 @@ use bpmn_core::geometry::Bounds;
 use bpmn_core::model::{
     Activity, ActivityKind, BaseElement, Condition, Definitions, Event, EventDefinition,
     EventDefinitionBody, EventPosition, FlowElement, FlowNode, Gateway, GatewayKind, LoopKind,
-    LoopMarker, Process, RootElement, SequenceFlow, TaskType,
+    LoopMarker, Process, RootElement, SequenceFlow, SubProcessKind, TaskType,
 };
 use bpmn_core::{BpmnId, Document, RawXml};
 use quick_xml::escape::escape;
@@ -329,18 +329,22 @@ impl Emitter {
         self.open(&name, &attrs);
         self.base_children(&process.base);
         for element in &process.flow_elements {
-            match element {
-                FlowElement::Event(event) => self.event(event),
-                FlowElement::Activity(activity) => self.activity(activity),
-                FlowElement::Gateway(gateway) => self.gateway(gateway),
-                FlowElement::SequenceFlow(flow) => self.sequence_flow(flow),
-                FlowElement::Unknown(raw) => self.raw(raw),
-            }
+            self.flow_element(element);
         }
         for raw in &process.base.unknown_children {
             self.raw(raw);
         }
         self.close(&name);
+    }
+
+    fn flow_element(&mut self, element: &FlowElement) {
+        match element {
+            FlowElement::Event(event) => self.event(event),
+            FlowElement::Activity(activity) => self.activity(activity),
+            FlowElement::Gateway(gateway) => self.gateway(gateway),
+            FlowElement::SequenceFlow(flow) => self.sequence_flow(flow),
+            FlowElement::Unknown(raw) => self.raw(raw),
+        }
     }
 
     fn event(&mut self, event: &Event) {
@@ -425,22 +429,44 @@ impl Emitter {
     }
 
     fn activity(&mut self, activity: &Activity) {
-        let ActivityKind::Task(task_type) = activity.kind;
-        let local = match task_type {
-            TaskType::Generic => "task",
-            TaskType::User => "userTask",
-            TaskType::Service => "serviceTask",
-            TaskType::Script => "scriptTask",
-            TaskType::Manual => "manualTask",
-            TaskType::Send => "sendTask",
-            TaskType::Receive => "receiveTask",
-            TaskType::BusinessRule => "businessRuleTask",
+        let local = match &activity.kind {
+            ActivityKind::Task(task_type) => match task_type {
+                TaskType::Generic => "task",
+                TaskType::User => "userTask",
+                TaskType::Service => "serviceTask",
+                TaskType::Script => "scriptTask",
+                TaskType::Manual => "manualTask",
+                TaskType::Send => "sendTask",
+                TaskType::Receive => "receiveTask",
+                TaskType::BusinessRule => "businessRuleTask",
+            },
+            ActivityKind::SubProcess(sub) => match sub.kind {
+                SubProcessKind::Embedded | SubProcessKind::Event => "subProcess",
+                SubProcessKind::Transaction => "transaction",
+            },
+            ActivityKind::CallActivity(_) => "callActivity",
         };
         let mut attrs = Self::node_attrs(&activity.node);
+        match &activity.kind {
+            ActivityKind::SubProcess(sub) if sub.kind == SubProcessKind::Event => {
+                attrs.push("triggeredByEvent", "true");
+            }
+            ActivityKind::CallActivity(call) => {
+                attrs.push_opt("calledElement", call.called_element.as_deref());
+            }
+            _ => {}
+        }
         attrs.push_unknown(&activity.node.base.unknown_attrs);
 
+        let nested = match &activity.kind {
+            ActivityKind::SubProcess(sub) => sub.flow_elements.as_slice(),
+            _ => &[],
+        };
         let name = self.model_tag(local);
-        if !Self::node_has_children(&activity.node) && activity.loop_marker.is_none() {
+        if !Self::node_has_children(&activity.node)
+            && activity.loop_marker.is_none()
+            && nested.is_empty()
+        {
             self.empty(&name, &attrs);
             return;
         }
@@ -449,6 +475,9 @@ impl Emitter {
         self.node_children(&activity.node);
         if let Some(marker) = &activity.loop_marker {
             self.loop_marker(marker);
+        }
+        for element in nested {
+            self.flow_element(element);
         }
         for raw in &activity.node.base.unknown_children {
             self.raw(raw);

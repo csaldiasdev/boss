@@ -112,11 +112,25 @@ fn parses_extension_fixture_event_details() {
         }] if m == "Message_Order"
     ));
 
-    // The subprocess is outside the modeled subset but must survive verbatim.
-    let unknown_subprocess = doc.flow_elements().any(
-        |e| matches!(e, FlowElement::Unknown(raw) if raw.as_str().starts_with("<bpmn:subProcess")),
+    // The subprocess is modeled since M6: its contents nest under it.
+    let FlowElement::Activity(sub) = index[&BpmnId::from("Sub_1")] else {
+        panic!("Sub_1 is an activity");
+    };
+    let ActivityKind::SubProcess(sub) = &sub.kind else {
+        panic!("Sub_1 is a subprocess");
+    };
+    assert_eq!(sub.kind, bpmn_core::model::SubProcessKind::Embedded);
+    assert_eq!(sub.flow_elements.len(), 3, "start, end, and one flow");
+    assert!(
+        index.contains_key(&BpmnId::from("Sub_Start")),
+        "nested ids indexed"
     );
-    assert!(unknown_subprocess, "subProcess preserved as raw fragment");
+    assert_eq!(
+        doc.container_of(&BpmnId::from("Sub_Start")),
+        Some(BpmnId::from("Sub_1"))
+    );
+    // Collapsed in DI, so its contents are hidden on the canvas.
+    assert!(doc.hidden_by_collapse().contains(&BpmnId::from("Sub_Flow")));
 
     // The message root element survives too.
     assert!(doc.definitions.root_elements.iter().any(|root| {

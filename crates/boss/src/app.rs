@@ -7,7 +7,8 @@ use crate::session::EditSession;
 use crate::theme::{self, Mode, Tokens};
 use bpmn_core::di::DiElement;
 use bpmn_core::model::{
-    Condition, EventDefinitionKind, EventPosition, FlowElement, GatewayKind, LoopKind, TaskType,
+    ActivityKind, Condition, EventDefinitionKind, EventPosition, FlowElement, GatewayKind,
+    LoopKind, SubProcessKind, TaskType,
 };
 use bpmn_core::{BpmnId, Document, NodeKind};
 use bpmn_validate::{Issue, Severity, Validator};
@@ -29,6 +30,19 @@ fn branded_for_save(document: &Document) -> Document {
     def.exporter_version = Some(String::from(env!("CARGO_PKG_VERSION")));
     def.target_namespace = String::from(bpmn_core::model::BOSS_TARGET_NAMESPACE);
     document
+}
+
+/// Whether the DI shape of `id` carries `isExpanded="true"`.
+fn shape_is_expanded(document: &Document, id: &BpmnId) -> bool {
+    document
+        .diagram()
+        .and_then(|d| d.plane.as_ref())
+        .into_iter()
+        .flat_map(|plane| &plane.elements)
+        .any(|element| {
+            matches!(element, DiElement::Shape(shape)
+                if shape.bpmn_element == *id && shape.is_expanded == Some(true))
+        })
 }
 
 /// A transient message for the status bar.
@@ -246,6 +260,10 @@ pub enum Message {
     TriggerChanged(TriggerChoice),
     /// The loop marker of the selected activity changed.
     LoopChanged(LoopChoice),
+    /// Collapse or expand the selected subprocess.
+    ToggleExpanded,
+    /// The called element of the selected call activity changed.
+    CalledElementEdited(String),
     /// An issue row was clicked: select and center its element.
     IssueClicked(Option<BpmnId>),
     /// Start the MCP server (native only; it runs until the app exits).
@@ -545,10 +563,12 @@ impl App {
                 );
                 let document = self.session.document();
                 let index = document.flow_element_index();
+                let hidden = document.hidden_by_collapse();
                 if let Some(plane) = document.diagram().and_then(|d| d.plane.as_ref()) {
                     for element in &plane.elements {
                         if let DiElement::Shape(shape) = element
                             && index.contains_key(&shape.bpmn_element)
+                            && !hidden.contains(&shape.bpmn_element)
                             && world.intersects(&shape.bounds)
                         {
                             self.selection.insert(shape.bpmn_element.clone());
@@ -599,6 +619,17 @@ impl App {
             Message::LoopChanged(choice) => {
                 self.session
                     .commit(|doc| doc.set_loop_marker(&id, choice.0));
+            }
+            Message::ToggleExpanded => {
+                let expanded = shape_is_expanded(self.session.document(), &id);
+                self.session
+                    .commit(|doc| doc.set_subprocess_expanded(&id, !expanded));
+            }
+            Message::CalledElementEdited(called) => {
+                let called = (!called.is_empty()).then_some(called);
+                self.session.commit_merged(format!("called:{id}"), |doc| {
+                    doc.set_called_element(&id, called)
+                });
             }
             _ => {}
         }
@@ -664,11 +695,12 @@ impl App {
             }
             Message::WindowResized(size) => self.window_size = size,
             Message::SelectAll => {
-                self.selection = self
-                    .session
-                    .document()
+                let document = self.session.document();
+                let hidden = document.hidden_by_collapse();
+                self.selection = document
                     .flow_elements()
                     .filter_map(|element| element.id().cloned())
+                    .filter(|id| !hidden.contains(id))
                     .collect();
             }
             message @ (Message::Copy
@@ -680,7 +712,9 @@ impl App {
             | Message::DefaultFlowChanged(_)
             | Message::ConditionEdited(_)
             | Message::TriggerChanged(_)
-            | Message::LoopChanged(_)) => self.handle_property(message),
+            | Message::LoopChanged(_)
+            | Message::ToggleExpanded
+            | Message::CalledElementEdited(_)) => self.handle_property(message),
             Message::IssueClicked(Some(id)) => {
                 if let Some((_, bounds)) = self.session.document().node_outline(&id) {
                     let center = bounds.center();
@@ -1133,6 +1167,20 @@ impl App {
                     "Business rule",
                     Tool::Place(NodeKind::Task(TaskType::BusinessRule))
                 ),
+                section("Containers"),
+                entry(
+                    "Subprocess",
+                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Embedded))
+                ),
+                entry(
+                    "Event subproc.",
+                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Event))
+                ),
+                entry(
+                    "Transaction",
+                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Transaction))
+                ),
+                entry("Call activity", Tool::Place(NodeKind::CallActivity)),
                 section("Gateways"),
                 entry(
                     "Exclusive",
@@ -1205,25 +1253,7 @@ impl App {
 
         match element {
             FlowElement::Activity(activity) => {
-                let bpmn_core::model::ActivityKind::Task(task_type) = activity.kind;
-                form = form.push(caption("Task type")).push(
-                    pick_list(
-                        TASK_TYPES,
-                        Some(TaskTypeChoice(task_type)),
-                        Message::TaskTypeChanged,
-                    )
-                    .text_size(13)
-                    .width(Fill),
-                );
-                form = form.push(caption("Marker")).push(
-                    pick_list(
-                        LOOP_CHOICES,
-                        Some(LoopChoice(activity.loop_marker.as_ref().map(|m| m.kind))),
-                        Message::LoopChanged,
-                    )
-                    .text_size(13)
-                    .width(Fill),
-                );
+                form = Self::activity_form(form, t, document, id, activity);
             }
             FlowElement::Gateway(gateway) => {
                 let mut options = vec![String::from(NO_DEFAULT)];
@@ -1280,6 +1310,71 @@ impl App {
         }
 
         form.into()
+    }
+
+    /// The kind-specific rows of the properties form for an activity.
+    fn activity_form<'a>(
+        mut form: iced::widget::Column<'a, Message>,
+        t: Tokens,
+        document: &Document,
+        id: &BpmnId,
+        activity: &bpmn_core::model::Activity,
+    ) -> iced::widget::Column<'a, Message> {
+        let caption = |label: &'static str| text(label).size(11).color(t.muted);
+
+        match &activity.kind {
+            ActivityKind::Task(task_type) => {
+                form = form.push(caption("Task type")).push(
+                    pick_list(
+                        TASK_TYPES,
+                        Some(TaskTypeChoice(*task_type)),
+                        Message::TaskTypeChanged,
+                    )
+                    .text_size(13)
+                    .width(Fill),
+                );
+            }
+            ActivityKind::SubProcess(sub) => {
+                let kind_label = match sub.kind {
+                    SubProcessKind::Embedded => "Subprocess",
+                    SubProcessKind::Event => "Event subprocess",
+                    SubProcessKind::Transaction => "Transaction",
+                };
+                let expanded = shape_is_expanded(document, id);
+                form = form
+                    .push(caption("Kind"))
+                    .push(text(kind_label).size(13))
+                    .push(caption("Contents"))
+                    .push(
+                        text(format!("{} elements", sub.flow_elements.len()))
+                            .size(12)
+                            .color(t.muted),
+                    )
+                    .push(
+                        button(text(if expanded { "Collapse" } else { "Expand" }).size(13))
+                            .style(theme::tool_button(t))
+                            .padding([4, 10])
+                            .on_press(Message::ToggleExpanded),
+                    );
+            }
+            ActivityKind::CallActivity(call) => {
+                form = form.push(caption("Called element")).push(
+                    text_input("Process id", call.called_element.as_deref().unwrap_or(""))
+                        .on_input(Message::CalledElementEdited)
+                        .font(theme::MONO)
+                        .size(13),
+                );
+            }
+        }
+        form.push(caption("Marker")).push(
+            pick_list(
+                LOOP_CHOICES,
+                Some(LoopChoice(activity.loop_marker.as_ref().map(|m| m.kind))),
+                Message::LoopChanged,
+            )
+            .text_size(13)
+            .width(Fill),
+        )
     }
 
     fn status_bar(&self, t: Tokens) -> Element<'_, Message> {
