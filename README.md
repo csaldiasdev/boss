@@ -9,6 +9,8 @@ interoperable with Camunda Modeler, bpmn.io, and friends. The running app also
 exposes an [MCP](https://modelcontextprotocol.io) server so AI agents can build and
 edit processes live on the canvas.
 
+![boss editing a BPMN collaboration diagram](app_screen.png)
+
 **Status:** feature-complete editor — events, tasks, gateways, subprocesses,
 pools/lanes with message flows, data objects and annotations, live validation,
 orthogonal routing, SVG export, and the live MCP server.
