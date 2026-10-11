@@ -85,9 +85,16 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+        # A hyphen in the tag (v1.2.3-beta, v1.2.3-rc1, ...) marks a
+        # pre-release, matching SemVer's pre-release syntax.
         run: |
+          prerelease=""
+          case "${{ github.ref_name }}" in
+            *-*) prerelease="--prerelease" ;;
+          esac
           gh release create "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
             --title "boss ${{ github.ref_name }}" \
             --generate-notes \
+            $prerelease \
             boss-${{ github.ref_name }}-*.tar.gz boss-${{ github.ref_name }}-*.zip
