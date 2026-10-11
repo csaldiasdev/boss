@@ -2,6 +2,7 @@
 
 use crate::camera::Camera;
 use crate::canvas::{CanvasMessage, DiagramCanvas, Tool};
+use crate::icons;
 use crate::platform::{self, OpenedFile, SavedFile};
 use crate::session::EditSession;
 use crate::theme::{self, Mode, Tokens};
@@ -43,6 +44,18 @@ fn shape_is_expanded(document: &Document, id: &BpmnId) -> bool {
             matches!(element, DiElement::Shape(shape)
                 if shape.bpmn_element == *id && shape.is_expanded == Some(true))
         })
+}
+
+/// The MCP port shown in the UI (the server itself is native-only).
+fn boss_mcp_port() -> u16 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        boss_mcp::DEFAULT_PORT
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        4555
+    }
 }
 
 /// A transient message for the status bar.
@@ -167,11 +180,23 @@ const LOOP_CHOICES: [LoopChoice; 4] = [
 ];
 
 /// Top-level application state.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent UI toggles, not a state machine"
+)]
 pub struct App {
     camera: Camera,
     canvas: DiagramCanvas,
-    mode: Mode,
+    /// The OS color scheme (kept fresh by `SystemTheme` messages).
+    system_mode: Mode,
+    /// A manual Light/Dark choice overriding the OS until restart.
+    mode_override: Option<Mode>,
     theme: Theme,
+    palette_open: bool,
+    properties_open: bool,
+    issues_open: bool,
+    /// The cursor position in diagram units, for the status bar.
+    cursor_world: Option<(i32, i32)>,
     session: EditSession,
     file_name: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -192,8 +217,13 @@ impl Default for App {
         Self {
             camera: Camera::default(),
             canvas: DiagramCanvas::default(),
-            mode: Mode::default(),
+            system_mode: Mode::default(),
+            mode_override: None,
             theme: theme::iced_theme(Mode::default()),
+            palette_open: true,
+            properties_open: true,
+            issues_open: true,
+            cursor_world: None,
             session: EditSession::new(Document::new()),
             file_name: String::from("untitled.bpmn"),
             #[cfg(not(target_arch = "wasm32"))]
@@ -222,8 +252,24 @@ pub enum Message {
     ZoomOut,
     /// Zoom to fit the document.
     ZoomFit,
-    /// Switch between light and dark.
+    /// Switch between light and dark (overrides the OS scheme).
     ToggleTheme,
+    /// The OS color scheme was reported or changed.
+    SystemTheme(iced::theme::Mode),
+    /// The window regained focus (re-checks the OS scheme).
+    WindowFocused,
+    /// A window opened (Windows attaches its native menu here).
+    WindowOpened(iced::window::Id),
+    /// Collapse or expand the tools panel.
+    TogglePalette,
+    /// Collapse or expand the properties panel.
+    ToggleProperties,
+    /// Show or hide the validation issues panel.
+    ToggleIssues,
+    /// Copy the MCP connect command to the clipboard (native only; the chip
+    /// is inert on the web).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    CopyMcpCommand,
     /// A palette/toolbar tool was picked.
     ToolSelected(Tool),
     /// Undo one step.
@@ -336,11 +382,19 @@ impl App {
             if start_mcp {
                 let _ = app.update(Message::McpStart);
             }
+            // The native menu bar (macOS attaches immediately; Windows waits
+            // for the window handle via `WindowOpened`).
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            crate::menu::install();
+            let task = Task::batch([task, iced::system::theme().map(Message::SystemTheme)]);
             (app, task)
         }
         #[cfg(target_arch = "wasm32")]
         {
-            (Self::default(), Task::none())
+            (
+                Self::default(),
+                iced::system::theme().map(Message::SystemTheme),
+            )
         }
     }
 
@@ -362,7 +416,15 @@ impl App {
         let mut subscriptions = vec![
             iced::keyboard::listen().map(Message::Keyboard),
             iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
+            iced::system::theme_changes().map(Message::SystemTheme),
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocused),
+                _ => None,
+            }),
+            iced::window::open_events().map(Message::WindowOpened),
         ];
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        subscriptions.push(crate::menu::subscription());
         #[cfg(not(target_arch = "wasm32"))]
         if self.mcp_running {
             subscriptions.push(crate::mcp_bridge::subscription().map(Message::Mcp));
@@ -396,14 +458,28 @@ impl App {
         }
     }
 
+    /// The mode in effect: the manual override, else the OS scheme.
+    fn effective_mode(&self) -> Mode {
+        self.mode_override.unwrap_or(self.system_mode)
+    }
+
     fn tokens(&self) -> Tokens {
-        theme::tokens(self.mode)
+        theme::tokens(self.effective_mode())
+    }
+
+    fn apply_mode(&mut self) {
+        self.theme = theme::iced_theme(self.effective_mode());
+        self.canvas.invalidate();
     }
 
     /// Re-runs validation and refreshes the canvas; call after any document
     /// mutation (documents are small — a full pass is microseconds).
     fn document_changed(&mut self) {
+        let was_clean = self.issues.is_empty();
         self.issues = self.validator.run(self.session.document());
+        if was_clean && !self.issues.is_empty() {
+            self.issues_open = true;
+        }
         self.badges.clear();
         for issue in &self.issues {
             if let Some(id) = &issue.element {
@@ -430,6 +506,13 @@ impl App {
         });
     }
 
+    /// The width the side panels occupy, honoring their collapsed state.
+    fn side_panels_width(&self) -> f32 {
+        let palette = if self.palette_open { 170.0 } else { 36.0 };
+        let properties = if self.properties_open { 230.0 } else { 36.0 };
+        palette + properties + 30.0
+    }
+
     /// Centers the camera on the document and picks a zoom that shows all of
     /// it, based on the window size minus the surrounding panels.
     fn zoom_to_fit(&mut self) {
@@ -440,8 +523,9 @@ impl App {
             return;
         };
 
+        let panels = self.side_panels_width();
         let viewport = Size::new(
-            (self.window_size.width - 430.0).max(200.0),
+            (self.window_size.width - panels).max(200.0),
             (self.window_size.height - 110.0).max(200.0),
         );
         let (width, height) = (bounds.width as f32 + MARGIN, bounds.height as f32 + MARGIN);
@@ -499,6 +583,7 @@ impl App {
     fn handle_canvas(&mut self, message: CanvasMessage) -> Task<Message> {
         match message {
             CanvasMessage::EditLabel(id) => return self.edit_label(id),
+            CanvasMessage::CursorAt(x, y) => self.cursor_world = Some((x, y)),
             CanvasMessage::Panned(translation) => {
                 self.camera.translation = translation;
                 self.canvas.invalidate();
@@ -692,36 +777,94 @@ impl App {
         self.document_changed();
     }
 
+    /// Window chrome and appearance: theme, panels, and native-shell glue.
+    fn handle_chrome(&mut self, message: &Message) -> Task<Message> {
+        match *message {
+            Message::ToggleTheme => {
+                self.mode_override = Some(self.effective_mode().toggled());
+                self.apply_mode();
+            }
+            Message::SystemTheme(mode) => {
+                self.system_mode = if mode == iced::theme::Mode::Dark {
+                    Mode::Dark
+                } else {
+                    Mode::Light
+                };
+                if self.mode_override.is_none() {
+                    self.apply_mode();
+                }
+            }
+            // macOS can suppress live theme events once a custom theme forces
+            // the window appearance; re-query whenever the window regains
+            // focus so an OS theme change still lands.
+            Message::WindowFocused => {
+                return iced::system::theme().map(Message::SystemTheme);
+            }
+            Message::WindowOpened(id) => {
+                // The native menu attaches once the app is fully launched:
+                // earlier, winit's own default macOS menu would replace it.
+                #[cfg(target_os = "macos")]
+                crate::menu::attach();
+                #[cfg(target_os = "windows")]
+                return iced::window::run(id, |window| crate::menu::attach_to_window(window))
+                    .discard();
+                #[cfg(not(target_os = "windows"))]
+                let _ = id;
+            }
+            Message::WindowResized(size) => self.window_size = size,
+            Message::TogglePalette => self.palette_open = !self.palette_open,
+            Message::ToggleProperties => self.properties_open = !self.properties_open,
+            Message::ToggleIssues => self.issues_open = !self.issues_open,
+            Message::CopyMcpCommand => {
+                self.status("Copied the MCP connect command", false);
+                return iced::clipboard::write(format!(
+                    "claude mcp add --transport http boss http://127.0.0.1:{}/",
+                    boss_mcp_port()
+                ));
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
     /// Handles a message.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive dispatch; the bodies live in handle_* helpers"
+    )]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Canvas(canvas_message) => return self.handle_canvas(canvas_message),
-            Message::ZoomIn => {
-                self.camera = self.camera.zoomed(1.2);
-                self.canvas.invalidate();
-            }
-            Message::ZoomOut => {
-                self.camera = self.camera.zoomed(1.0 / 1.2);
+            message @ (Message::ZoomIn | Message::ZoomOut) => {
+                let factor = if matches!(message, Message::ZoomIn) {
+                    1.2
+                } else {
+                    1.0 / 1.2
+                };
+                self.camera = self.camera.zoomed(factor);
                 self.canvas.invalidate();
             }
             Message::ZoomFit => {
                 self.zoom_to_fit();
                 self.canvas.invalidate();
             }
-            Message::ToggleTheme => {
-                self.mode = self.mode.toggled();
-                self.theme = theme::iced_theme(self.mode);
-                self.canvas.invalidate();
-            }
+            ref message @ (Message::ToggleTheme
+            | Message::SystemTheme(_)
+            | Message::WindowFocused
+            | Message::WindowOpened(_)
+            | Message::WindowResized(_)
+            | Message::TogglePalette
+            | Message::ToggleProperties
+            | Message::ToggleIssues
+            | Message::CopyMcpCommand) => return self.handle_chrome(message),
             Message::ToolSelected(tool) => self.tool = tool,
-            Message::Undo => {
-                if self.session.undo() {
-                    self.selection.clear();
-                    self.document_changed();
-                }
-            }
-            Message::Redo => {
-                if self.session.redo() {
+            message @ (Message::Undo | Message::Redo) => {
+                let stepped = if matches!(message, Message::Undo) {
+                    self.session.undo()
+                } else {
+                    self.session.redo()
+                };
+                if stepped {
                     self.selection.clear();
                     self.document_changed();
                 }
@@ -749,7 +892,6 @@ impl App {
                     self.tool = Tool::Select;
                 }
             }
-            Message::WindowResized(size) => self.window_size = size,
             Message::RenameSelection => {
                 if let Some(id) = self.single_selection() {
                     return self.edit_label(id);
@@ -1150,7 +1292,7 @@ impl App {
     }
 
     fn issues_panel(&self, t: Tokens) -> Element<'_, Message> {
-        if self.issues.is_empty() {
+        if self.issues.is_empty() || !self.issues_open {
             return space::vertical().height(0).into();
         }
 
@@ -1186,10 +1328,24 @@ impl App {
     }
 
     fn toolbar(&self, t: Tokens) -> Element<'_, Message> {
-        let tool = |label: &'static str, message: Message, enabled: bool| {
-            let base = button(text(label).size(13))
+        let tool = |glyph: char, label: &'static str, message: Message, enabled: bool| {
+            let base = button(
+                row![icons::icon(glyph), text(label).size(13)]
+                    .spacing(5)
+                    .align_y(Center),
+            )
+            .style(theme::tool_button(t))
+            .padding([4, 10]);
+            if enabled {
+                base.on_press(message)
+            } else {
+                base
+            }
+        };
+        let icon_tool = |glyph: char, message: Message, enabled: bool| {
+            let base = button(icons::icon(glyph))
                 .style(theme::tool_button(t))
-                .padding([4, 10]);
+                .padding([4, 8]);
             if enabled {
                 base.on_press(message)
             } else {
@@ -1204,23 +1360,25 @@ impl App {
         };
 
         let mut bar = row![
-            tool("New", Message::NewRequested, true),
-            tool("Open…", Message::OpenRequested, true),
-            tool(save_label, Message::SaveRequested, true),
+            tool(icons::NEW, "New", Message::NewRequested, true),
+            tool(icons::OPEN, "Open…", Message::OpenRequested, true),
+            tool(icons::SAVE, save_label, Message::SaveRequested, true),
         ]
         .spacing(8)
         .align_y(Center);
 
-        bar = bar.push(tool("SVG", Message::ExportSvg, true));
+        bar = bar.push(tool(icons::EXPORT, "SVG", Message::ExportSvg, true));
         #[cfg(not(target_arch = "wasm32"))]
         {
-            bar = bar.push(tool("Save as…", Message::SaveAsRequested, true));
             bar = bar.push(tool(
-                if self.mcp_running {
-                    "MCP on"
-                } else {
-                    "Start MCP"
-                },
+                icons::SAVE_AS,
+                "Save as…",
+                Message::SaveAsRequested,
+                true,
+            ));
+            bar = bar.push(tool(
+                icons::MCP,
+                if self.mcp_running { "MCP on" } else { "MCP" },
                 Message::McpStart,
                 !self.mcp_running,
             ));
@@ -1228,10 +1386,18 @@ impl App {
 
         bar = bar
             .push(space::horizontal())
-            .push(tool("Undo", Message::Undo, self.session.can_undo()))
-            .push(tool("Redo", Message::Redo, self.session.can_redo()))
+            .push(icon_tool(
+                icons::UNDO,
+                Message::Undo,
+                self.session.can_undo(),
+            ))
+            .push(icon_tool(
+                icons::REDO,
+                Message::Redo,
+                self.session.can_redo(),
+            ))
             .push(space::horizontal())
-            .push(tool("−", Message::ZoomOut, true))
+            .push(icon_tool(icons::ZOOM_OUT, Message::ZoomOut, true))
             .push(
                 container(
                     text(format!("{:>3}%", self.camera.zoom_percent()))
@@ -1240,101 +1406,177 @@ impl App {
                 )
                 .padding([4, 6]),
             )
-            .push(tool("+", Message::ZoomIn, true))
-            .push(tool("Fit", Message::ZoomFit, true))
-            .push(tool(
-                match self.mode {
-                    Mode::Light => "Dark",
-                    Mode::Dark => "Light",
+            .push(icon_tool(icons::ZOOM_IN, Message::ZoomIn, true))
+            .push(icon_tool(icons::FIT, Message::ZoomFit, true))
+            .push(icon_tool(
+                match self.effective_mode() {
+                    Mode::Light => icons::MOON,
+                    Mode::Dark => icons::SUN,
                 },
                 Message::ToggleTheme,
                 true,
             ));
 
+        // On macOS the title bar is transparent and the content extends under
+        // it, so the toolbar leaves room for the traffic lights and acts as
+        // the draggable strip.
+        let padding = if cfg!(target_os = "macos") {
+            iced::Padding::from(8).left(78)
+        } else {
+            iced::Padding::from(8)
+        };
         container(bar)
             .style(move |_| theme::panel(t))
-            .padding(8)
+            .padding(padding)
             .width(Fill)
             .into()
     }
 
-    fn palette(&self, t: Tokens) -> Element<'_, Message> {
-        let entry = |label: &'static str, target: Tool| {
-            button(text(label).size(13))
-                .style(theme::palette_button(t, self.tool == target))
-                .padding([5, 10])
-                .width(Fill)
-                .on_press(Message::ToolSelected(target))
-        };
-        let section = |label: &'static str| text(label).font(theme::SANS_MEDIUM).size(14);
-
-        container(scrollable(
-            column![
-                section("Tools"),
-                entry("Select", Tool::Select),
-                entry("Connect", Tool::Connect),
-                section("Events"),
-                entry("Start", Tool::Place(NodeKind::StartEvent)),
-                entry("Catch", Tool::Place(NodeKind::IntermediateCatch)),
-                entry("Throw", Tool::Place(NodeKind::IntermediateThrow)),
-                entry("Boundary", Tool::Place(NodeKind::Boundary)),
-                entry("End", Tool::Place(NodeKind::EndEvent)),
-                section("Tasks"),
-                entry("Task", Tool::Place(NodeKind::Task(TaskType::Generic))),
-                entry("User", Tool::Place(NodeKind::Task(TaskType::User))),
-                entry("Service", Tool::Place(NodeKind::Task(TaskType::Service))),
-                entry("Script", Tool::Place(NodeKind::Task(TaskType::Script))),
-                entry("Manual", Tool::Place(NodeKind::Task(TaskType::Manual))),
-                entry("Send", Tool::Place(NodeKind::Task(TaskType::Send))),
-                entry("Receive", Tool::Place(NodeKind::Task(TaskType::Receive))),
-                entry(
+    /// The palette catalog: section headers interleaved with placeable tools.
+    const PALETTE: &'static [(&'static str, &'static [(&'static str, Tool)])] = &[
+        (
+            "Tools",
+            &[("Select", Tool::Select), ("Connect", Tool::Connect)],
+        ),
+        (
+            "Events",
+            &[
+                ("Start", Tool::Place(NodeKind::StartEvent)),
+                ("Catch", Tool::Place(NodeKind::IntermediateCatch)),
+                ("Throw", Tool::Place(NodeKind::IntermediateThrow)),
+                ("Boundary", Tool::Place(NodeKind::Boundary)),
+                ("End", Tool::Place(NodeKind::EndEvent)),
+            ],
+        ),
+        (
+            "Tasks",
+            &[
+                ("Task", Tool::Place(NodeKind::Task(TaskType::Generic))),
+                ("User", Tool::Place(NodeKind::Task(TaskType::User))),
+                ("Service", Tool::Place(NodeKind::Task(TaskType::Service))),
+                ("Script", Tool::Place(NodeKind::Task(TaskType::Script))),
+                ("Manual", Tool::Place(NodeKind::Task(TaskType::Manual))),
+                ("Send", Tool::Place(NodeKind::Task(TaskType::Send))),
+                ("Receive", Tool::Place(NodeKind::Task(TaskType::Receive))),
+                (
                     "Business rule",
-                    Tool::Place(NodeKind::Task(TaskType::BusinessRule))
+                    Tool::Place(NodeKind::Task(TaskType::BusinessRule)),
                 ),
-                section("Containers"),
-                entry(
+            ],
+        ),
+        (
+            "Containers",
+            &[
+                (
                     "Subprocess",
-                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Embedded))
+                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Embedded)),
                 ),
-                entry(
+                (
                     "Event subproc.",
-                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Event))
+                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Event)),
                 ),
-                entry(
+                (
                     "Transaction",
-                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Transaction))
+                    Tool::Place(NodeKind::SubProcess(SubProcessKind::Transaction)),
                 ),
-                entry("Call activity", Tool::Place(NodeKind::CallActivity)),
-                section("Collaboration"),
-                entry("Pool", Tool::PlacePool),
-                section("Data & artifacts"),
-                entry("Data object", Tool::Place(NodeKind::DataObject)),
-                entry("Data store", Tool::Place(NodeKind::DataStore)),
-                entry("Annotation", Tool::Place(NodeKind::TextAnnotation)),
-                entry("Group", Tool::Place(NodeKind::Group)),
-                section("Gateways"),
-                entry(
+                ("Call activity", Tool::Place(NodeKind::CallActivity)),
+            ],
+        ),
+        ("Collaboration", &[("Pool", Tool::PlacePool)]),
+        (
+            "Data & artifacts",
+            &[
+                ("Data object", Tool::Place(NodeKind::DataObject)),
+                ("Data store", Tool::Place(NodeKind::DataStore)),
+                ("Annotation", Tool::Place(NodeKind::TextAnnotation)),
+                ("Group", Tool::Place(NodeKind::Group)),
+            ],
+        ),
+        (
+            "Gateways",
+            &[
+                (
                     "Exclusive",
-                    Tool::Place(NodeKind::Gateway(GatewayKind::Exclusive))
+                    Tool::Place(NodeKind::Gateway(GatewayKind::Exclusive)),
                 ),
-                entry(
+                (
                     "Parallel",
-                    Tool::Place(NodeKind::Gateway(GatewayKind::Parallel))
+                    Tool::Place(NodeKind::Gateway(GatewayKind::Parallel)),
                 ),
-                entry(
+                (
                     "Inclusive",
-                    Tool::Place(NodeKind::Gateway(GatewayKind::Inclusive))
+                    Tool::Place(NodeKind::Gateway(GatewayKind::Inclusive)),
                 ),
-                entry(
+                (
                     "Event-based",
-                    Tool::Place(NodeKind::Gateway(GatewayKind::EventBased))
+                    Tool::Place(NodeKind::Gateway(GatewayKind::EventBased)),
                 ),
-            ]
-            .spacing(6),
-        ))
+            ],
+        ),
+    ];
+
+    fn palette(&self, t: Tokens) -> Element<'_, Message> {
+        if !self.palette_open {
+            return Self::collapsed_panel(t, icons::PANEL_LEFT, Message::TogglePalette);
+        }
+
+        let entry = |label: &'static str, target: Tool| {
+            let glyph: Element<'_, Message> = match target {
+                Tool::Place(kind) => icons::shape_glyph(icons::ShapeGlyph::Node(kind), t.canvas),
+                Tool::PlacePool => icons::shape_glyph(icons::ShapeGlyph::Pool, t.canvas),
+                Tool::Select => icons::icon(icons::SELECT).into(),
+                Tool::Connect => icons::icon(icons::CONNECT).into(),
+            };
+            button(
+                row![container(glyph).width(26), text(label).size(13)]
+                    .spacing(4)
+                    .align_y(Center),
+            )
+            .style(theme::palette_button(t, self.tool == target))
+            .padding([2, 6])
+            .width(Fill)
+            .on_press(Message::ToolSelected(target))
+        };
+
+        let mut list = column![].spacing(4);
+        for (section, entries) in Self::PALETTE {
+            if *section != "Tools" {
+                list = list.push(text(*section).font(theme::SANS_MEDIUM).size(14));
+            }
+            for (label, target) in *entries {
+                list = list.push(entry(label, *target));
+            }
+        }
+
+        let header = row![
+            text("Tools").font(theme::SANS_MEDIUM).size(14),
+            space::horizontal(),
+            button(icons::icon(icons::CHEVRON_LEFT))
+                .style(theme::tool_button(t))
+                .padding([2, 6])
+                .on_press(Message::TogglePalette),
+        ]
+        .align_y(Center);
+
+        container(column![header, scrollable(list)].spacing(8))
+            .style(move |_| theme::panel(t))
+            .padding(10)
+            .width(170)
+            .height(Fill)
+            .into()
+    }
+
+    /// A collapsed side panel: a slim strip holding only the reopen button.
+    fn collapsed_panel(t: Tokens, glyph: char, message: Message) -> Element<'static, Message> {
+        container(
+            button(icons::icon(glyph))
+                .style(theme::tool_button(t))
+                .padding([4, 4])
+                .on_press(message),
+        )
         .style(move |_| theme::panel(t))
-        .padding(12)
-        .width(170)
+        .padding(4)
+        .width(36)
         .height(Fill)
         .into()
     }
@@ -1357,9 +1599,22 @@ impl App {
             text("No selection").size(13).color(t.muted).into()
         };
 
-        container(column![text("Properties").font(theme::SANS_MEDIUM).size(14), body].spacing(12))
+        if !self.properties_open {
+            return Self::collapsed_panel(t, icons::PANEL_RIGHT, Message::ToggleProperties);
+        }
+        let header = row![
+            text("Properties").font(theme::SANS_MEDIUM).size(14),
+            space::horizontal(),
+            button(icons::icon(icons::CHEVRON_RIGHT))
+                .style(theme::tool_button(t))
+                .padding([2, 6])
+                .on_press(Message::ToggleProperties),
+        ]
+        .align_y(Center);
+
+        container(column![header, body].spacing(12))
             .style(move |_| theme::panel(t))
-            .padding(12)
+            .padding(10)
             .width(230)
             .height(Fill)
             .into()
@@ -1555,6 +1810,66 @@ impl App {
         )
     }
 
+    /// Validation chip: a check when clean, the count otherwise; clicking it
+    /// shows or hides the issues panel.
+    fn issue_chip<'a>(
+        &self,
+        t: Tokens,
+        chip: &impl Fn(Element<'a, Message>, Option<Message>) -> iced::widget::Button<'a, Message>,
+    ) -> Element<'a, Message> {
+        if self.issues.is_empty() {
+            chip(
+                row![
+                    icons::icon(icons::CHECK).size(11).color(t.muted),
+                    text("no issues").size(11).color(t.muted),
+                ]
+                .spacing(4)
+                .align_y(Center)
+                .into(),
+                None,
+            )
+            .into()
+        } else {
+            let worst_is_error = self.issues.iter().any(|i| i.severity == Severity::Error);
+            let color = if worst_is_error { t.danger } else { t.warning };
+            chip(
+                row![
+                    icons::icon(icons::ALERT).size(11).color(color),
+                    text(format!("{} issues", self.issues.len()))
+                        .size(11)
+                        .color(color),
+                ]
+                .spacing(4)
+                .align_y(Center)
+                .into(),
+                Some(Message::ToggleIssues),
+            )
+            .into()
+        }
+    }
+
+    /// MCP chip: clicking it copies the connect command.
+    fn mcp_chip<'a>(
+        &self,
+        t: Tokens,
+        chip: &impl Fn(Element<'a, Message>, Option<Message>) -> iced::widget::Button<'a, Message>,
+    ) -> Element<'a, Message> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.mcp_running {
+            return chip(
+                text(format!("MCP :{}", boss_mcp_port()))
+                    .font(theme::MONO)
+                    .size(11)
+                    .color(t.accent)
+                    .into(),
+                Some(Message::CopyMcpCommand),
+            )
+            .into();
+        }
+        let _ = (self, t, chip);
+        text("").size(11).into()
+    }
+
     fn status_bar(&self, t: Tokens) -> Element<'_, Message> {
         let hint = match self.tool {
             Tool::Select => "click to select · shift-click to add · drag empty space to marquee",
@@ -1572,37 +1887,43 @@ impl App {
             None => text(hint).size(11).color(t.muted).into(),
         };
 
+        let chip = |content: Element<'static, Message>, message: Option<Message>| {
+            let base = button(content).style(theme::tool_button(t)).padding([1, 6]);
+            match message {
+                Some(message) => base.on_press(message),
+                None => base,
+            }
+        };
+
+        // File name with an unsaved-changes dot.
+        let file_chip: Element<'_, Message> = row![
+            text(if self.session.is_dirty() {
+                "\u{25cf} "
+            } else {
+                ""
+            })
+            .size(11)
+            .color(t.accent),
+            text(self.file_name.clone()).font(theme::MONO).size(11),
+        ]
+        .align_y(Center)
+        .into();
+
         let selection_label = match self.selection.len() {
             0 => String::new(),
             n => format!("· {n} selected"),
         };
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let mcp_chip: Element<'_, Message> = if self.mcp_running {
-            text(format!("MCP :{}", boss_mcp::DEFAULT_PORT))
-                .font(theme::MONO)
-                .size(11)
-                .color(t.accent)
-                .into()
-        } else {
-            text("").size(11).into()
-        };
-        #[cfg(target_arch = "wasm32")]
-        let mcp_chip: Element<'_, Message> = text("").size(11).into();
+        let cursor_label = self
+            .cursor_world
+            .map_or(String::new(), |(x, y)| format!("x {x}  y {y}"));
 
-        let issue_chip: Element<'_, Message> = if self.issues.is_empty() {
-            text("").size(11).into()
-        } else {
-            let worst_is_error = self.issues.iter().any(|i| i.severity == Severity::Error);
-            let color = if worst_is_error { t.danger } else { t.warning };
-            text(format!("\u{25cf} {} issues", self.issues.len()))
-                .size(11)
-                .color(color)
-                .into()
-        };
+        let issue_chip = self.issue_chip(t, &chip);
+        let mcp_chip = self.mcp_chip(t, &chip);
 
         container(
             row![
+                file_chip,
                 text(format!("zoom {}%", self.camera.zoom_percent()))
                     .font(theme::MONO)
                     .size(11),
@@ -1610,6 +1931,7 @@ impl App {
                     .font(theme::MONO)
                     .size(11)
                     .color(t.muted),
+                text(cursor_label).font(theme::MONO).size(11).color(t.muted),
                 issue_chip,
                 mcp_chip,
                 space::horizontal(),
@@ -1619,7 +1941,7 @@ impl App {
             .align_y(Center),
         )
         .style(move |_| theme::panel(t))
-        .padding([4, 12])
+        .padding([3, 12])
         .width(Fill)
         .into()
     }

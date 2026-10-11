@@ -80,6 +80,8 @@ pub enum CanvasMessage {
     },
     /// Double-click on an element: select it and focus its name field.
     EditLabel(BpmnId),
+    /// The cursor moved to this diagram position (status-bar readout).
+    CursorAt(i32, i32),
     /// Abort the armed tool (clicked empty space while connecting).
     CancelTool,
 }
@@ -143,6 +145,8 @@ pub struct CanvasState {
     shift: bool,
     /// The previous left click, for double-click detection.
     last_click: Option<mouse::Click>,
+    /// The last cursor position reported to the status bar.
+    last_cursor: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -617,7 +621,17 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                     *moved = true;
                     Some(canvas::Action::request_redraw().and_capture())
                 }
-                Interaction::None => None,
+                Interaction::None => {
+                    // Report the diagram position for the status bar, but only
+                    // when the rounded coordinate actually changed.
+                    let at = (world.x.round() as i32, world.y.round() as i32);
+                    if state.last_cursor == Some(at) {
+                        None
+                    } else {
+                        state.last_cursor = Some(at);
+                        Some(canvas::Action::publish(CanvasMessage::CursorAt(at.0, at.1)))
+                    }
+                }
             },
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => match *delta {
                 mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => {

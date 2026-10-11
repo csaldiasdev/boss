@@ -731,10 +731,34 @@ fn draw_gateway(
     frame.fill(&diamond, tokens.fill);
     frame.stroke(&diamond, stroke);
 
+    gateway_marker(
+        frame,
+        gateway.kind,
+        shape.is_marker_visible == Some(true),
+        center,
+        bounds.width * 0.17,
+        stroke,
+        stroke_width,
+    );
+
+    if let Some(name) = &gateway.node.name {
+        outside_label(frame, name, shape.label.as_ref(), bounds, tokens);
+    }
+}
+
+/// The marker inside a gateway diamond (shared with the palette glyphs).
+pub(crate) fn gateway_marker(
+    frame: &mut Frame,
+    kind: GatewayKind,
+    show_x: bool,
+    center: Point,
+    r: f32,
+    stroke: Stroke<'_>,
+    stroke_width: f32,
+) {
     let marker_stroke = stroke.with_width(stroke_width * 1.6);
-    let r = bounds.width * 0.17;
-    match gateway.kind {
-        GatewayKind::Exclusive if shape.is_marker_visible == Some(true) => {
+    match kind {
+        GatewayKind::Exclusive if show_x => {
             let x = Path::new(|builder| {
                 builder.move_to(Point::new(center.x - r, center.y - r));
                 builder.line_to(Point::new(center.x + r, center.y + r));
@@ -786,10 +810,6 @@ fn draw_gateway(
             frame.stroke(&star, marker_stroke);
         }
         GatewayKind::Exclusive => {}
-    }
-
-    if let Some(name) = &gateway.node.name {
-        outside_label(frame, name, shape.label.as_ref(), bounds, tokens);
     }
 }
 
@@ -990,7 +1010,7 @@ fn definition_icon(
     clippy::too_many_lines,
     reason = "one icon per task type; a table of small drawings"
 )]
-fn task_icon(
+pub(crate) fn task_icon(
     frame: &mut Frame,
     task_type: TaskType,
     bounds: Rectangle,

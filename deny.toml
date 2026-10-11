@@ -25,6 +25,7 @@ allow = [
 ignore = [
   { id = "RUSTSEC-2024-0436", reason = "paste, pulled in by rmcp/metrics macros; unmaintained but macro-only" },
   { id = "RUSTSEC-2026-0192", reason = "ttf-parser, pulled in by iced's font stack; waiting on upstream move to skrifa" },
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error, pulled in by muda's macros; macro-only, build-time" },
 ]
 
 [bans]

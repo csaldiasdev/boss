@@ -20,6 +20,11 @@ boss-mcp.workspace = true
 tokio = { workspace = true, features = ["sync", "macros"] }
 log.workspace = true
 
+# Native menu bars: application-level on macOS, per-window on Windows. Linux
+# is out — muda needs GTK there, which the iced/winit stack does not use.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+muda.workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 iced = { workspace = true, features = ["webgl"] }
 console_error_panic_hook = "0.1"
