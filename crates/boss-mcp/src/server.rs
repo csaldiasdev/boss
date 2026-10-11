@@ -543,8 +543,11 @@ impl ServerHandler for BossMcp {
 }
 
 /// Serves the MCP endpoint on `127.0.0.1:{port}` until the process exits.
+/// With a `token`, every request must carry `Authorization: Bearer {token}`.
 /// The returned future completes only on a bind/serve error.
-pub async fn serve(port: u16, handle: EditorHandle) -> std::io::Result<()> {
+pub async fn serve(port: u16, handle: EditorHandle, token: Option<String>) -> std::io::Result<()> {
+    use axum::response::IntoResponse;
+
     let service: StreamableHttpService<BossMcp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(BossMcp::new(handle.clone())),
         Arc::new(LocalSessionManager::default()),
@@ -552,6 +555,26 @@ pub async fn serve(port: u16, handle: EditorHandle) -> std::io::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    let router = axum::Router::new().fallback_service(service);
+    let mut router = axum::Router::new().fallback_service(service);
+    if let Some(token) = token {
+        let expected = format!("Bearer {token}");
+        router = router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let expected = expected.clone();
+                async move {
+                    let authorized = request
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        == Some(expected.as_str());
+                    if authorized {
+                        next.run(request).await
+                    } else {
+                        axum::http::StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }
+            },
+        ));
+    }
     axum::serve(listener, router).await
 }

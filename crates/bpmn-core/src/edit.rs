@@ -584,6 +584,39 @@ impl Document {
 
     /// Creates an `association` between two elements; it lives in the
     /// source's container (or the target's, when the source sits elsewhere).
+    /// An orthogonal (Manhattan) route between two shapes: straight when the
+    /// centers are nearly aligned, otherwise an axis-aligned Z through the
+    /// midpoint. Associations keep straight lines; flows use this.
+    fn orthogonal_route(source: (Outline, Bounds), target: (Outline, Bounds)) -> Vec<Point> {
+        const ALIGNED: f64 = 20.0;
+        let (source_outline, source_bounds) = source;
+        let (target_outline, target_bounds) = target;
+        let s = source_bounds.center();
+        let t = target_bounds.center();
+        let (dx, dy) = (t.x - s.x, t.y - s.y);
+
+        if dx.abs() < ALIGNED || dy.abs() < ALIGNED {
+            // Near-aligned: a straight connection reads best.
+            return vec![
+                source_outline.anchor(source_bounds, t),
+                target_outline.anchor(target_bounds, s),
+            ];
+        }
+        if dx.abs() >= dy.abs() {
+            // Leave and arrive horizontally, bending at the middle.
+            let a = source_outline.anchor(source_bounds, Point::new(t.x, s.y));
+            let b = target_outline.anchor(target_bounds, Point::new(s.x, t.y));
+            let mid = f64::midpoint(a.x, b.x);
+            vec![a, Point::new(mid, a.y), Point::new(mid, b.y), b]
+        } else {
+            // Leave and arrive vertically.
+            let a = source_outline.anchor(source_bounds, Point::new(s.x, t.y));
+            let b = target_outline.anchor(target_bounds, Point::new(t.x, s.y));
+            let mid = f64::midpoint(a.y, b.y);
+            vec![a, Point::new(a.x, mid), Point::new(b.x, mid), b]
+        }
+    }
+
     fn connect_association(&mut self, source: &BpmnId, target: &BpmnId) -> Option<BpmnId> {
         let container = self
             .container_of(source)
@@ -625,9 +658,10 @@ impl Document {
 
         let id = self.fresh_id("Flow");
         let edge_id = BpmnId::new(format!("{id}_di").as_str());
-
-        let from = source_outline.anchor(source_bounds, target_bounds.center());
-        let to = target_outline.anchor(target_bounds, source_bounds.center());
+        let waypoints = Self::orthogonal_route(
+            (source_outline, source_bounds),
+            (target_outline, target_bounds),
+        );
 
         self.elements_of_mut(container)?
             .push(FlowElement::SequenceFlow(SequenceFlow {
@@ -648,7 +682,7 @@ impl Document {
         self.plane_mut()?.elements.push(DiElement::Edge(BpmnEdge {
             id: Some(edge_id),
             bpmn_element: id.clone(),
-            waypoints: vec![from, to],
+            waypoints,
             ..BpmnEdge::default()
         }));
 
@@ -681,8 +715,10 @@ impl Document {
 
         let id = self.fresh_id("MessageFlow");
         let edge_id = BpmnId::new(format!("{id}_di").as_str());
-        let from = source_outline.anchor(source_bounds, target_bounds.center());
-        let to = target_outline.anchor(target_bounds, source_bounds.center());
+        let waypoints = Self::orthogonal_route(
+            (source_outline, source_bounds),
+            (target_outline, target_bounds),
+        );
 
         self.collaboration_mut()?.message_flows.push(MessageFlow {
             base: BaseElement::new(id.clone()),
@@ -693,7 +729,7 @@ impl Document {
         self.plane_mut()?.elements.push(DiElement::Edge(BpmnEdge {
             id: Some(edge_id),
             bpmn_element: id.clone(),
-            waypoints: vec![from, to],
+            waypoints,
             ..BpmnEdge::default()
         }));
         Some(id)
@@ -1506,17 +1542,19 @@ impl Document {
                 && edge.bpmn_element == *flow_id
                 && edge.waypoints.len() >= 2
             {
+                // An edge that still looks auto-routed (short, axis-aligned)
+                // is re-routed from scratch; hand-shaped polylines keep their
+                // interior and only re-anchor the endpoints.
+                if looks_auto_routed(&edge.waypoints) {
+                    edge.waypoints = Self::orthogonal_route(
+                        (source_outline, source_bounds),
+                        (target_outline, target_bounds),
+                    );
+                    continue;
+                }
                 let n = edge.waypoints.len();
-                let toward_first = if n == 2 {
-                    target_bounds.center()
-                } else {
-                    edge.waypoints[1]
-                };
-                let toward_last = if n == 2 {
-                    source_bounds.center()
-                } else {
-                    edge.waypoints[n - 2]
-                };
+                let toward_first = edge.waypoints[1];
+                let toward_last = edge.waypoints[n - 2];
                 edge.waypoints[0] = source_outline.anchor(source_bounds, toward_first);
                 edge.waypoints[n - 1] = target_outline.anchor(target_bounds, toward_last);
             }
@@ -2033,6 +2071,17 @@ fn prune_deleted(elements: &mut Vec<FlowElement>, doomed: &HashSet<BpmnId>) {
     }
 }
 
+/// Whether a polyline looks like the router produced it: at most four points,
+/// every segment axis-aligned. Hand-dragged waypoints almost always introduce
+/// a diagonal or a fifth point, which protects them from re-routing.
+fn looks_auto_routed(points: &[Point]) -> bool {
+    points.len() == 2
+        || (points.len() <= 4
+            && points.windows(2).all(|pair| {
+                (pair[0].x - pair[1].x).abs() < 0.5 || (pair[0].y - pair[1].y).abs() < 0.5
+            }))
+}
+
 fn flow_node_mut(element: &mut FlowElement) -> Option<&mut FlowNode> {
     match element {
         FlowElement::Event(event) => Some(&mut event.node),
@@ -2167,7 +2216,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_reanchors_edges() {
+    fn moving_reroutes_auto_edges_orthogonally() {
         let (mut doc, _a, b, flow) = two_connected_nodes();
         let moved: HashSet<BpmnId> = [b].into_iter().collect();
         doc.move_shapes(&moved, 0.0, 200.0);
@@ -2181,10 +2230,18 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        // Start anchor now points down-right toward the moved task.
-        assert!(edge.waypoints[0].y > 100.0);
-        // End anchor sits on the task border (its top edge faces the start).
-        assert!((edge.waypoints[1].y - 260.0).abs() < 1e-9);
+        // The edge still looked auto-routed, so it got a fresh Manhattan
+        // route: a Z with axis-aligned segments only.
+        assert_eq!(edge.waypoints.len(), 4);
+        for pair in edge.waypoints.windows(2) {
+            assert!(
+                (pair[0].x - pair[1].x).abs() < 0.5 || (pair[0].y - pair[1].y).abs() < 0.5,
+                "segment {pair:?} is not axis-aligned"
+            );
+        }
+        // It leaves the start event's border and reaches the moved task's.
+        assert_eq!(edge.waypoints[0], Point::new(118.0, 100.0));
+        assert_eq!(edge.waypoints[3], Point::new(250.0, 300.0));
     }
 
     #[test]

@@ -1,0 +1,20 @@
+# cargo-about configuration: generates THIRD-PARTY-LICENSES.html at release
+# time. The accepted list mirrors deny.toml.
+accepted = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Zlib",
+  "ISC",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "Unlicense",
+  "OFL-1.1",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+]
+# The binary is what ships; dev-dependencies stay out of the report.
+ignore-dev-dependencies = true

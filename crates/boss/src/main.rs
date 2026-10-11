@@ -8,6 +8,7 @@ mod mcp_bridge;
 mod platform;
 mod render;
 mod session;
+mod svg;
 mod theme;
 
 use app::App;

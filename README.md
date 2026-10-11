@@ -5,11 +5,13 @@ A truly open-source BPMN application.
 boss is a BPMN 2.0 process designer written in Rust with [iced](https://iced.rs),
 targeting desktop (macOS, Windows, Linux) and the web (WebAssembly) from a single
 codebase. Files are standard BPMN 2.0 XML (ISO/IEC 19510) with diagram interchange,
-interoperable with Camunda Modeler, bpmn.io, and friends. The running app will also
-expose an [MCP](https://modelcontextprotocol.io) server so AI agents can build and
+interoperable with Camunda Modeler, bpmn.io, and friends. The running app also
+exposes an [MCP](https://modelcontextprotocol.io) server so AI agents can build and
 edit processes live on the canvas.
 
-**Status:** early development (M0 — application skeleton).
+**Status:** feature-complete editor — events, tasks, gateways, subprocesses,
+pools/lanes with message flows, data objects and annotations, live validation,
+orthogonal routing, SVG export, and the live MCP server.
 
 ## Workspace
 
@@ -47,7 +49,9 @@ then connect a client to `http://127.0.0.1:4555/`, e.g.:
 claude mcp add --transport http boss http://127.0.0.1:4555/
 ```
 
-The endpoint binds to localhost only.
+The endpoint binds to localhost only. To require an access token, start with
+`--mcp-token <secret>`; every request must then carry
+`Authorization: Bearer <secret>`.
 
 UI fonts (IBM Plex, OFL licensed) are embedded from `assets/fonts/`.
 

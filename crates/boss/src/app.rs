@@ -264,6 +264,8 @@ pub enum Message {
     ToggleExpanded,
     /// Append a lane to the selected pool.
     AddLane,
+    /// Focus the name field of the selected element (F2).
+    RenameSelection,
     /// The called element of the selected call activity changed.
     CalledElementEdited(String),
     /// An issue row was clicked: select and center its element.
@@ -288,6 +290,10 @@ pub enum Message {
     SaveAsRequested,
     /// Saving finished.
     Saved(Option<SavedFile>),
+    /// Export the diagram as SVG (web: download).
+    ExportSvg,
+    /// The SVG export finished.
+    Exported(Option<SavedFile>),
 }
 
 impl App {
@@ -299,15 +305,36 @@ impl App {
             let mut app = Self::default();
             let mut task = Task::none();
 
-            for argument in std::env::args().skip(1) {
-                if argument == "--mcp" {
-                    let _ = app.update(Message::McpStart);
-                } else if !argument.starts_with('-') {
-                    task = Task::perform(
-                        async move { platform::read_path(&argument) },
-                        Message::FileOpened,
-                    );
+            let arguments: Vec<String> = std::env::args().skip(1).collect();
+            let mut start_mcp = false;
+            let mut token = None;
+            let mut index = 0;
+            while index < arguments.len() {
+                match arguments[index].as_str() {
+                    "--mcp" => start_mcp = true,
+                    // A token implies the server; agents must send
+                    // `Authorization: Bearer <token>`.
+                    "--mcp-token" => {
+                        index += 1;
+                        if let Some(value) = arguments.get(index) {
+                            token = Some(value.clone());
+                            start_mcp = true;
+                        }
+                    }
+                    argument if !argument.starts_with('-') => {
+                        let path = argument.to_string();
+                        task = Task::perform(
+                            async move { platform::read_path(&path) },
+                            Message::FileOpened,
+                        );
+                    }
+                    _ => {}
                 }
+                index += 1;
+            }
+            crate::mcp_bridge::set_token(token);
+            if start_mcp {
+                let _ = app.update(Message::McpStart);
             }
             (app, task)
         }
@@ -355,6 +382,7 @@ impl App {
         match key.as_ref() {
             Key::Named(Named::Delete | Named::Backspace) => Some(Message::DeleteSelection),
             Key::Named(Named::Escape) => Some(Message::Escape),
+            Key::Named(Named::F2) => Some(Message::RenameSelection),
             Key::Character("z") if command && modifiers.shift() => Some(Message::Redo),
             Key::Character("z") if command => Some(Message::Undo),
             Key::Character("y") if command => Some(Message::Redo),
@@ -455,8 +483,22 @@ impl App {
         }
     }
 
-    fn handle_canvas(&mut self, message: CanvasMessage) {
+    /// The id of the properties-panel name input, so double-click and F2 can
+    /// focus it.
+    fn name_input_id() -> iced::advanced::widget::Id {
+        iced::advanced::widget::Id::new("element-name")
+    }
+
+    /// Selects an element and moves focus into its name field.
+    fn edit_label(&mut self, id: BpmnId) -> Task<Message> {
+        self.selection.clear();
+        self.selection.insert(id);
+        iced::widget::operation::focus(Self::name_input_id())
+    }
+
+    fn handle_canvas(&mut self, message: CanvasMessage) -> Task<Message> {
         match message {
+            CanvasMessage::EditLabel(id) => return self.edit_label(id),
             CanvasMessage::Panned(translation) => {
                 self.camera.translation = translation;
                 self.canvas.invalidate();
@@ -527,6 +569,7 @@ impl App {
             }
             CanvasMessage::CancelTool => self.tool = Tool::Select,
         }
+        Task::none()
     }
 
     /// Places a node (`Some(kind)`) or a pool (`None`) at a canvas position.
@@ -652,7 +695,7 @@ impl App {
     /// Handles a message.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Canvas(canvas_message) => self.handle_canvas(canvas_message),
+            Message::Canvas(canvas_message) => return self.handle_canvas(canvas_message),
             Message::ZoomIn => {
                 self.camera = self.camera.zoomed(1.2);
                 self.canvas.invalidate();
@@ -707,6 +750,11 @@ impl App {
                 }
             }
             Message::WindowResized(size) => self.window_size = size,
+            Message::RenameSelection => {
+                if let Some(id) = self.single_selection() {
+                    return self.edit_label(id);
+                }
+            }
             Message::SelectAll => {
                 let document = self.session.document();
                 let hidden = document.hidden_by_collapse();
@@ -753,9 +801,14 @@ impl App {
         match message {
             Message::McpStart => {
                 self.mcp_running = true;
+                let auth = if crate::mcp_bridge::token_required() {
+                    " (Authorization: Bearer token required)"
+                } else {
+                    ""
+                };
                 self.status(
                     format!(
-                        "MCP server listening on http://127.0.0.1:{port} — connect with: \
+                        "MCP server listening on http://127.0.0.1:{port}{auth} — connect with: \
                          claude mcp add --transport http boss http://127.0.0.1:{port}/",
                         port = boss_mcp::DEFAULT_PORT
                     ),
@@ -1026,6 +1079,29 @@ impl App {
             },
             Message::SaveRequested => return self.save_task(false),
             Message::SaveAsRequested => return self.save_task(true),
+            Message::ExportSvg => {
+                let svg = crate::svg::export(self.session.document());
+                let name = format!(
+                    "{}.svg",
+                    self.file_name
+                        .trim_end_matches(".bpmn")
+                        .trim_end_matches(".xml")
+                );
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    return Task::perform(platform::save_file(name, svg), Message::Exported);
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Task::perform(
+                        async move { platform::save_file(&name, &svg) },
+                        Message::Exported,
+                    );
+                }
+            }
+            Message::Exported(Some(saved)) => {
+                self.status(format!("Exported {}", saved.name), false);
+            }
             Message::Saved(Some(saved)) => {
                 self.session.mark_saved();
                 self.file_name.clone_from(&saved.name);
@@ -1135,6 +1211,7 @@ impl App {
         .spacing(8)
         .align_y(Center);
 
+        bar = bar.push(tool("SVG", Message::ExportSvg, true));
         #[cfg(not(target_arch = "wasm32"))]
         {
             bar = bar.push(tool("Save as…", Message::SaveAsRequested, true));
@@ -1301,6 +1378,7 @@ impl App {
             text(id.as_str().to_string()).font(theme::MONO).size(12),
             caption("Name"),
             text_input("Unnamed", element.name().unwrap_or(""))
+                .id(Self::name_input_id())
                 .on_input(Message::NameEdited)
                 .size(13),
         ]
@@ -1395,6 +1473,7 @@ impl App {
             text(id.as_str().to_string()).font(theme::MONO).size(12),
             caption("Name"),
             text_input("Unnamed", name.unwrap_or(""))
+                .id(Self::name_input_id())
                 .on_input(Message::NameEdited)
                 .size(13),
         ]

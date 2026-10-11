@@ -1,0 +1,93 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  licenses:
+    name: third-party licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+      - name: Generate THIRD-PARTY-LICENSES.html
+        run: cargo about generate about.hbs -o THIRD-PARTY-LICENSES.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: third-party-licenses
+          path: THIRD-PARTY-LICENSES.html
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: licenses
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: third-party-licenses
+      - name: Build release binary
+        run: cargo build --release -p boss --target ${{ matrix.target }}
+      - name: Package (tar)
+        if: matrix.archive == 'tar'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/boss dist/
+          cp LICENSE README.md THIRD-PARTY-LICENSES.html dist/
+          tar -czf boss-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist .
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/boss.exe dist/
+          Copy-Item LICENSE,README.md,THIRD-PARTY-LICENSES.html dist/
+          Compress-Archive -Path dist/* -DestinationPath boss-${{ github.ref_name }}-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boss-${{ matrix.target }}
+          path: boss-${{ github.ref_name }}-${{ matrix.target }}.*
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: boss-*
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "boss ${{ github.ref_name }}" \
+            --generate-notes \
+            boss-${{ github.ref_name }}-*.tar.gz boss-${{ github.ref_name }}-*.zip

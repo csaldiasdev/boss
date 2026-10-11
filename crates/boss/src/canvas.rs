@@ -7,7 +7,7 @@ use crate::theme::CanvasTokens;
 use bpmn_core::di::DiElement;
 use bpmn_core::edit::outline_of;
 use bpmn_core::{BpmnId, Document, NodeKind};
-use iced::mouse;
+use iced::advanced::mouse;
 use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, Geometry, Path, Stroke};
 use iced::{Element, Fill, Point, Rectangle, Renderer, Size, Theme, Vector};
 use std::collections::HashSet;
@@ -78,6 +78,8 @@ pub enum CanvasMessage {
         /// The full new waypoint list, in world units.
         points: Vec<Point>,
     },
+    /// Double-click on an element: select it and focus its name field.
+    EditLabel(BpmnId),
     /// Abort the armed tool (clicked empty space while connecting).
     CancelTool,
 }
@@ -139,6 +141,8 @@ struct View<'a> {
 pub struct CanvasState {
     interaction: Interaction,
     shift: bool,
+    /// The previous left click, for double-click detection.
+    last_click: Option<mouse::Click>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -525,6 +529,17 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                     }
                 }
                 Tool::Select => {
+                    let click =
+                        mouse::Click::new(cursor_position, mouse::Button::Left, state.last_click);
+                    state.last_click = Some(click);
+                    if click.kind() == mouse::click::Kind::Double
+                        && let Some(id) = self.hit_node(world).or_else(|| self.hit_edge(world))
+                    {
+                        state.interaction = Interaction::None;
+                        return Some(
+                            canvas::Action::publish(CanvasMessage::EditLabel(id)).and_capture(),
+                        );
+                    }
                     if self.grab_waypoint(state, world) {
                         return Some(canvas::Action::request_redraw().and_capture());
                     }

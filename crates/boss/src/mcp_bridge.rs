@@ -8,7 +8,22 @@
 use boss_mcp::EditorRequest;
 use iced::Subscription;
 use iced::futures::{SinkExt, Stream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// The access token the server will require, set once at startup before the
+/// subscription spins the server up (`--mcp-token`). `None` = open localhost.
+static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+
+/// Stores the token the MCP server must require. Only the first call wins,
+/// matching the server's own run-until-exit lifetime.
+pub fn set_token(token: Option<String>) {
+    let _ = TOKEN.set(token);
+}
+
+/// Whether the running server demands an `Authorization` header.
+pub fn token_required() -> bool {
+    TOKEN.get().is_some_and(Option::is_some)
+}
 
 /// An [`EditorRequest`] wrapped to satisfy iced's `Clone + Debug` message
 /// bounds; the update loop takes it out exactly once.
@@ -40,7 +55,8 @@ pub fn subscription() -> Subscription<McpRequest> {
 fn worker() -> impl Stream<Item = McpRequest> {
     iced::stream::channel(32, async |mut output| {
         let (handle, mut requests) = boss_mcp::channel();
-        let server = boss_mcp::serve(boss_mcp::DEFAULT_PORT, handle);
+        let token = TOKEN.get().cloned().flatten();
+        let server = boss_mcp::serve(boss_mcp::DEFAULT_PORT, handle, token);
         tokio::pin!(server);
 
         loop {
