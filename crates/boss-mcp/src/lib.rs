@@ -7,8 +7,12 @@
 
 mod apply;
 mod bridge;
+mod dto;
+mod placement;
 mod server;
 
 pub use apply::apply;
-pub use bridge::{ApplyOutcome, EditAction, EditorHandle, EditorRequest, channel};
+pub use bridge::{
+    ApplyOutcome, EditAction, EditorHandle, EditorRequest, NodeSpec, UpdatePatch, channel,
+};
 pub use server::{BossMcp, DEFAULT_PORT, serve};

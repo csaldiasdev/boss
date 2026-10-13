@@ -5,22 +5,76 @@
 //! requests, applies them through the same edit session as user input (so
 //! agent edits are undoable), and answers with snapshots or outcomes.
 
+use bpmn_core::model::{EventDefinitionKind, LoopKind, TaskType};
 use bpmn_core::{BpmnId, Document, NodeKind};
 use tokio::sync::{mpsc, oneshot};
+
+/// A node of a [`EditAction::CreateSequence`] chain.
+#[derive(Debug)]
+pub struct NodeSpec {
+    /// What to create.
+    pub kind: NodeKind,
+    /// Optional label.
+    pub name: Option<String>,
+}
+
+/// The optional fields of an [`EditAction::Update`]. The outer `Option` is
+/// "touch this field at all"; a `Some(None)` inner value clears it.
+#[derive(Debug, Default)]
+pub struct UpdatePatch {
+    /// Rename (`Some(None)` clears the name).
+    pub name: Option<Option<String>>,
+    /// Change a task's type.
+    pub task_type: Option<TaskType>,
+    /// Set or clear an event's trigger.
+    pub event_trigger: Option<Option<EventDefinitionKind>>,
+    /// Set or clear a gateway's default flow.
+    pub gateway_default: Option<Option<BpmnId>>,
+    /// Set or clear a sequence flow's condition expression.
+    pub condition: Option<Option<String>>,
+    /// Set or clear an activity's loop marker.
+    pub loop_marker: Option<Option<LoopKind>>,
+    /// Set or clear a call activity's called element.
+    pub called_element: Option<Option<String>>,
+    /// Expand or collapse a subprocess.
+    pub expanded: Option<bool>,
+}
 
 /// A mutation an agent asked for.
 #[derive(Debug)]
 pub enum EditAction {
-    /// Create a flow node centered at `(x, y)`.
+    /// Create a flow node. Placement, in priority order: explicit `(x, y)`
+    /// center; right of `after` (auto-connected from it); inside
+    /// `container`; else right of the existing content.
     CreateNode {
         /// What to create.
         kind: NodeKind,
         /// World/DI x of the center.
-        x: f64,
+        x: Option<f64>,
         /// World/DI y of the center.
-        y: f64,
+        y: Option<f64>,
+        /// Place right of this node and connect from it.
+        after: Option<BpmnId>,
+        /// Place inside this subprocess.
+        container: Option<BpmnId>,
         /// Optional label.
         name: Option<String>,
+    },
+    /// Create a connected left-to-right chain of nodes in one step.
+    CreateSequence {
+        /// The chain, in order.
+        nodes: Vec<NodeSpec>,
+        /// Start right of this node and connect from it.
+        after: Option<BpmnId>,
+        /// Build inside this subprocess.
+        container: Option<BpmnId>,
+    },
+    /// Patch an element's properties (only the named fields change).
+    Update {
+        /// The element.
+        id: BpmnId,
+        /// What to change.
+        patch: UpdatePatch,
     },
     /// Create a boundary event on `host`'s border, toward `(x, y)`.
     CreateBoundary {
@@ -57,13 +111,6 @@ pub enum EditAction {
         /// Optional flow label.
         name: Option<String>,
     },
-    /// Rename an element (`None` clears the name).
-    SetName {
-        /// The element.
-        id: BpmnId,
-        /// The new name.
-        name: Option<String>,
-    },
     /// Delete elements (connected flows go with them).
     Delete {
         /// The elements to delete.
@@ -94,6 +141,20 @@ pub enum EditAction {
 pub enum ApplyOutcome {
     /// A new element with this id.
     Created(BpmnId),
+    /// New nodes and the flows that chain them.
+    CreatedMany {
+        /// The created nodes, in order.
+        nodes: Vec<BpmnId>,
+        /// The created flows, in order.
+        flows: Vec<BpmnId>,
+    },
+    /// A patch applied these fields and refused those, with reasons.
+    Updated {
+        /// Field names that changed.
+        applied: Vec<&'static str>,
+        /// Field names that did not, and why.
+        failed: Vec<(&'static str, String)>,
+    },
     /// A bulk action touched `affected` and skipped `unknown` ids.
     Affected {
         /// The ids that existed and were acted on.
@@ -114,7 +175,8 @@ impl ApplyOutcome {
         match self {
             Self::Nothing => false,
             Self::Affected { affected, .. } => !affected.is_empty(),
-            Self::Created(_) | Self::Changed => true,
+            Self::Updated { applied, .. } => !applied.is_empty(),
+            Self::Created(_) | Self::CreatedMany { .. } | Self::Changed => true,
         }
     }
 }
