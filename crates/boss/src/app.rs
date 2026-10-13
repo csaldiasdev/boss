@@ -11,7 +11,7 @@ use bpmn_core::model::{
     ActivityKind, Condition, EventDefinitionKind, EventPosition, FlowElement, GatewayKind,
     LoopKind, SubProcessKind, TaskType,
 };
-use bpmn_core::{BpmnId, Document, NodeKind};
+use bpmn_core::{BpmnId, Document, NodeKind, Scope};
 use bpmn_validate::{Issue, Severity, Validator};
 use iced::widget::{
     button, column, container, pick_list, row, scrollable, space, text, text_editor, text_input,
@@ -80,6 +80,18 @@ enum CanvasOverlay {
     /// The inline name editor (double-click). The element is the single
     /// selection, as everywhere else in the properties path.
     LabelEdit { at: iced::Point },
+}
+
+/// The height of the navigation tab bar above the canvas.
+const TAB_BAR_HEIGHT: f32 = 34.0;
+
+/// One drilled-in level of the subprocess navigation path.
+struct ScopeLevel {
+    /// The subprocess whose plane this level edits.
+    id: BpmnId,
+    /// The camera to restore when navigating back up to the PARENT view;
+    /// `None` (a level entered indirectly) zooms the parent to fit instead.
+    parent_camera: Option<Camera>,
 }
 
 /// A transient message for the status bar.
@@ -226,6 +238,8 @@ pub struct App {
     overlay: Option<CanvasOverlay>,
     /// The inline name editor's buffer, (re)loaded when the editor opens.
     inline_name: text_editor::Content,
+    /// The drill-down path: one level per subprocess the user navigated into.
+    scope_path: Vec<ScopeLevel>,
     session: EditSession,
     file_name: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -254,6 +268,7 @@ impl Default for App {
             window_id: None,
             overlay: None,
             inline_name: text_editor::Content::default(),
+            scope_path: Vec::new(),
             session: EditSession::new(Document::new()),
             file_name: String::from("untitled.bpmn"),
             #[cfg(not(target_arch = "wasm32"))]
@@ -301,6 +316,10 @@ pub enum Message {
     AddBoundaryHere,
     /// Open the inline name editor from the element menu.
     RenameHere,
+    /// Drill into the element-menu's subprocess.
+    ViewSubprocess,
+    /// Jump to a level of the drill-down path (0 = the root view).
+    NavigateToDepth(usize),
     /// Copy the MCP connect command to the clipboard (native only; the chip
     /// is inert on the web).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -510,6 +529,27 @@ impl App {
     /// Re-runs validation and refreshes the canvas; call after any document
     /// mutation (documents are small — a full pass is microseconds).
     fn document_changed(&mut self) {
+        // Undo, delete, or a wholesale replace can invalidate the drill-down
+        // path; back out to the deepest level that still exists.
+        let document = self.session.document();
+        let valid = self
+            .scope_path
+            .iter()
+            .take_while(|level| {
+                document
+                    .plane_index(&Scope::Subprocess(level.id.clone()))
+                    .is_some()
+            })
+            .count();
+        if valid < self.scope_path.len() {
+            let restore = self.scope_path[valid].parent_camera;
+            self.scope_path.truncate(valid);
+            match restore {
+                Some(camera) => self.camera = camera,
+                None => self.zoom_to_fit(),
+            }
+        }
+
         let was_clean = self.issues.is_empty();
         self.issues = self.validator.run(self.session.document());
         if was_clean && !self.issues.is_empty() {
@@ -552,7 +592,7 @@ impl App {
     fn zoom_to_fit(&mut self) {
         const MARGIN: f32 = 60.0;
 
-        let Some(bounds) = self.session.document().content_bounds() else {
+        let Some(bounds) = self.session.document().content_bounds_in(&self.scope()) else {
             self.camera = Camera::default();
             return;
         };
@@ -560,7 +600,7 @@ impl App {
         let panels = self.side_panels_width();
         let viewport = Size::new(
             (self.window_size.width - panels).max(200.0),
-            (self.window_size.height - 110.0).max(200.0),
+            (self.window_size.height - 110.0 - TAB_BAR_HEIGHT).max(200.0),
         );
         let (width, height) = (bounds.width as f32 + MARGIN, bounds.height as f32 + MARGIN);
         let scaling = (viewport.width / width)
@@ -634,6 +674,100 @@ impl App {
                     })
             })
             .unwrap_or_default()
+    }
+
+    /// The scope the canvas currently edits.
+    fn scope(&self) -> Scope {
+        self.scope_path
+            .last()
+            .map_or(Scope::Root, |level| Scope::Subprocess(level.id.clone()))
+    }
+
+    /// Drills into `id` (a subprocess), making sure it owns a DI plane first.
+    fn enter_subprocess(&mut self, id: BpmnId, parent_camera: Option<Camera>) {
+        let mut entered = false;
+        self.session.commit(|doc| {
+            doc.ensure_subprocess_plane(&id)
+                .inspect(|_| entered = true)
+                .is_some_and(|(_, changed)| changed)
+        });
+        if !entered {
+            self.status("Only subprocesses can be opened", true);
+            return;
+        }
+        self.scope_path.push(ScopeLevel { id, parent_camera });
+        self.selection.clear();
+        self.overlay = None;
+        self.document_changed();
+        self.zoom_to_fit();
+    }
+
+    /// Jumps to `depth` levels of the drill-down path (0 = root).
+    fn navigate_to_depth(&mut self, depth: usize) {
+        if depth >= self.scope_path.len() {
+            return;
+        }
+        let restore = self.scope_path[depth].parent_camera;
+        self.scope_path.truncate(depth);
+        self.selection.clear();
+        self.overlay = None;
+        match restore {
+            Some(camera) => self.camera = camera,
+            None => self.zoom_to_fit(),
+        }
+        self.canvas.invalidate();
+    }
+
+    /// Selects `id` and centers the camera on it, first navigating the
+    /// drill-down path to wherever the element is actually drawn (collapsed
+    /// subprocess ancestors keep their children on their own planes).
+    fn reveal(&mut self, id: BpmnId) {
+        // The collapsed-subprocess ancestors hiding `id`, outermost first.
+        let chain: Vec<BpmnId> = {
+            let document = self.session.document();
+            let index = document.flow_element_index();
+            let mut chain = Vec::new();
+            let mut cursor = id.clone();
+            while let Some(container) = document.container_of(&cursor) {
+                let is_sub = matches!(
+                    index.get(&container),
+                    Some(FlowElement::Activity(activity))
+                        if matches!(activity.kind, ActivityKind::SubProcess(_))
+                );
+                if !is_sub {
+                    break;
+                }
+                if !shape_is_expanded(document, &container) {
+                    chain.push(container.clone());
+                }
+                cursor = container;
+            }
+            chain.reverse();
+            chain
+        };
+
+        let current: Vec<&BpmnId> = self.scope_path.iter().map(|level| &level.id).collect();
+        if current != chain.iter().collect::<Vec<_>>() {
+            // The camera the root view had, to restore when navigating back.
+            let root_camera = self
+                .scope_path
+                .first()
+                .map_or(Some(self.camera), |level| level.parent_camera);
+            self.scope_path.clear();
+            let mut parent_camera = root_camera;
+            for sub in chain {
+                self.enter_subprocess(sub, parent_camera);
+                parent_camera = None;
+            }
+        }
+
+        if let Some((_, bounds)) = self.session.document().node_outline(&id) {
+            let center = bounds.center();
+            self.camera.translation = Vector::new(-(center.x as f32), -(center.y as f32));
+        }
+        self.selection.clear();
+        self.selection.insert(id);
+        self.canvas.invalidate();
     }
 
     /// Opens the floating name editor over the element at `at`.
@@ -727,10 +861,15 @@ impl App {
     /// Places a node (`Some(kind)`) or a pool (`None`) at a canvas position.
     fn handle_place(&mut self, kind: Option<NodeKind>, at: iced::Point) {
         let center = bpmn_core::Point::new(f64::from(at.x), f64::from(at.y));
+        let scope = self.scope();
+        if kind.is_none() && scope != Scope::Root {
+            self.status("Pools live on the root canvas", true);
+            return;
+        }
         let mut created = None;
         self.session.commit(|doc| {
             created = match kind {
-                Some(kind) => doc.create_node(kind, center),
+                Some(kind) => doc.create_node_in(&scope, kind, center),
                 None => doc.create_pool(None, center),
             };
             created.is_some()
@@ -765,10 +904,11 @@ impl App {
                     f64::from(rect.width),
                     f64::from(rect.height),
                 );
+                let scope = self.scope();
                 let document = self.session.document();
                 let index = document.flow_element_index();
-                let hidden = document.hidden_by_collapse();
-                if let Some(plane) = document.diagram().and_then(|d| d.plane.as_ref()) {
+                let hidden = document.hidden_by_collapse_in(&scope);
+                if let Some(plane) = document.plane_in(&scope) {
                     for element in &plane.elements {
                         if let DiElement::Shape(shape) = element
                             && index.contains_key(&shape.bpmn_element)
@@ -983,6 +1123,13 @@ impl App {
                     return self.edit_label(&id, at);
                 }
             }
+            Message::ViewSubprocess => {
+                if let Some(CanvasOverlay::ElementMenu { id, .. }) = self.overlay.take() {
+                    let camera = self.camera;
+                    self.enter_subprocess(id, Some(camera));
+                }
+            }
+            Message::NavigateToDepth(depth) => self.navigate_to_depth(depth),
             Message::Escape => {
                 if self.overlay.take().is_some() {
                     return Task::none();
@@ -995,13 +1142,22 @@ impl App {
                 }
             }
             Message::SelectAll => {
+                let scope = self.scope();
                 let document = self.session.document();
-                let hidden = document.hidden_by_collapse();
+                let hidden = document.hidden_by_collapse_in(&scope);
+                let index = document.flow_element_index();
                 self.selection = document
-                    .flow_elements()
-                    .filter_map(|element| element.id().cloned())
-                    .filter(|id| !hidden.contains(id))
-                    .collect();
+                    .plane_in(&scope)
+                    .map(|plane| {
+                        plane
+                            .elements
+                            .iter()
+                            .filter_map(DiElement::bpmn_element)
+                            .filter(|id| index.contains_key(*id) && !hidden.contains(*id))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
             }
             message @ (Message::Copy
             | Message::Cut
@@ -1025,15 +1181,7 @@ impl App {
                     self.handle_property(Message::NameEdited(name));
                 }
             }
-            Message::IssueClicked(Some(id)) => {
-                if let Some((_, bounds)) = self.session.document().node_outline(&id) {
-                    let center = bounds.center();
-                    self.camera.translation = Vector::new(-(center.x as f32), -(center.y as f32));
-                }
-                self.selection.clear();
-                self.selection.insert(id);
-                self.canvas.invalidate();
-            }
+            Message::IssueClicked(Some(id)) => self.reveal(id),
             Message::IssueClicked(None) => {}
             #[cfg(not(target_arch = "wasm32"))]
             message @ (Message::McpStart | Message::Mcp(_)) => self.handle_mcp_message(message),
@@ -1264,9 +1412,10 @@ impl App {
             }
             Message::ClipboardPasted(Some(contents)) => {
                 if let Ok(source) = bpmn_xml::parse(&contents) {
+                    let scope = self.scope();
                     let mut pasted = Vec::new();
                     self.session.commit(|doc| {
-                        pasted = doc.paste_from(&source, 20.0, 20.0);
+                        pasted = doc.paste_from_in(&scope, &source, 20.0, 20.0);
                         !pasted.is_empty()
                     });
                     if pasted.is_empty() {
@@ -1298,6 +1447,7 @@ impl App {
                         self.path = None;
                     }
                     self.selection.clear();
+                    self.scope_path.clear();
                     self.camera = Camera::default();
                     self.document_changed();
                 }
@@ -1319,6 +1469,7 @@ impl App {
                         self.path = file.path;
                     }
                     self.selection.clear();
+                    self.scope_path.clear();
                     self.zoom_to_fit();
                     self.document_changed();
                 }
@@ -1364,34 +1515,89 @@ impl App {
         Task::none()
     }
 
+    /// The navigation tab bar: the file at the root, then one tab per
+    /// drilled subprocess. On macOS it starts after the traffic lights and
+    /// its empty space drags the window (commands live in the native menu).
+    fn tab_bar(&self, t: Tokens) -> Element<'_, Message> {
+        let depth = self.scope_path.len();
+        let mut bar = row![].spacing(4).align_y(Center);
+        if cfg!(target_os = "macos") {
+            // Clearance for the traffic lights floating over the bar.
+            bar = bar.push(space::horizontal().width(70.0));
+        }
+        bar = bar.push(Self::tab(t, self.file_name.clone(), 0, depth));
+        for (i, level) in self.scope_path.iter().enumerate() {
+            bar = bar.push(text("›").size(12).color(t.muted));
+            let mut name = self.element_name(&level.id);
+            if name.is_empty() {
+                name = level.id.as_str().to_string();
+            }
+            bar = bar.push(Self::tab(t, name, i + 1, depth));
+        }
+
+        let filler: Element<'_, Message> = if cfg!(target_os = "macos") {
+            iced::widget::mouse_area(space::horizontal().width(Fill).height(Fill))
+                .on_press(Message::Canvas(CanvasMessage::DragWindow))
+                .into()
+        } else {
+            space::horizontal().into()
+        };
+        bar = bar.push(filler);
+
+        // Transparent: the bar floats over the canvas, which stays visible
+        // (and reaches the window top on macOS) underneath it.
+        container(bar.width(Fill).height(Fill))
+            .width(Fill)
+            .height(TAB_BAR_HEIGHT)
+            .padding([2, 8])
+            .into()
+    }
+
+    /// One navigation tab; the active (deepest) one is highlighted and inert.
+    fn tab(t: Tokens, label: String, depth: usize, current: usize) -> Element<'static, Message> {
+        let active = depth == current;
+        button(text(label).size(12).font(theme::SANS_MEDIUM))
+            .style(theme::palette_button(t, active))
+            .padding([2, 10])
+            .on_press_maybe((!active).then_some(Message::NavigateToDepth(depth)))
+            .into()
+    }
+
     /// Builds the widget tree for this frame.
     pub fn view(&self) -> Element<'_, Message> {
         let t = self.tokens();
 
-        // On macOS there is no bar at all: the canvas reaches the top of the
-        // window, the traffic lights float over it, and the strip under them
-        // drags the window (see `CanvasMessage::DragWindow`). Commands live
-        // in the native menu bar.
+        // On macOS there is no toolbar: commands live in the native menu bar
+        // and the tab bar doubles as the window-drag strip under the traffic
+        // lights.
         let mut layout = column![];
         if !cfg!(target_os = "macos") {
             layout = layout.push(self.toolbar(t));
         }
 
+        // The tab bar floats transparently over the canvas top, so the
+        // workspace stays visible underneath (up to the window top on macOS).
+        let canvas = iced::widget::stack![
+            container(
+                self.canvas
+                    .view(
+                        &self.camera,
+                        self.session.document(),
+                        self.scope(),
+                        &self.selection,
+                        &self.badges,
+                        t.canvas,
+                    )
+                    .map(Message::Canvas)
+            )
+            .width(Fill)
+            .height(Fill),
+            self.tab_bar(t),
+        ];
+
         layout = layout.push(
             row![
-                container(
-                    self.canvas
-                        .view(
-                            &self.camera,
-                            self.session.document(),
-                            &self.selection,
-                            &self.badges,
-                            t.canvas,
-                        )
-                        .map(Message::Canvas)
-                )
-                .width(Fill)
-                .height(Fill),
+                container(canvas).width(Fill).height(Fill),
                 self.properties(t),
             ]
             .width(Fill)
@@ -1638,10 +1844,22 @@ impl App {
     /// The small menu shown on element right-click.
     fn element_menu(&self, t: Tokens, id: &BpmnId) -> Element<'_, Message> {
         let mut list = column![].spacing(2);
-        let is_activity = matches!(
-            self.session.document().flow_element_index().get(id),
-            Some(FlowElement::Activity(_))
+        let document = self.session.document();
+        let index = document.flow_element_index();
+        let is_activity = matches!(index.get(id), Some(FlowElement::Activity(_)));
+        let is_subprocess = matches!(
+            index.get(id),
+            Some(FlowElement::Activity(activity))
+                if matches!(activity.kind, ActivityKind::SubProcess(_))
         );
+        if is_subprocess {
+            list = list.push(Self::overlay_entry(
+                t,
+                None,
+                "View subprocess",
+                Message::ViewSubprocess,
+            ));
+        }
         if is_activity {
             list = list.push(Self::overlay_entry(
                 t,

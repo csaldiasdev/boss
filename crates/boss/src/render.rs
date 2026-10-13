@@ -108,16 +108,17 @@ fn depths(document: &Document) -> std::collections::HashMap<bpmn_core::BpmnId, u
 pub fn draw(
     frame: &mut Frame,
     document: &Document,
+    scope: &bpmn_core::Scope,
     badges: &std::collections::HashMap<bpmn_core::BpmnId, Badge>,
     tokens: CanvasTokens,
     zoom: f32,
     visible: Rectangle,
 ) {
-    let Some(plane) = document.diagram().and_then(|d| d.plane.as_ref()) else {
+    let Some(plane) = document.plane_in(scope) else {
         return;
     };
     let index = document.flow_element_index();
-    let hidden = document.hidden_by_collapse();
+    let hidden = document.hidden_by_collapse_in(scope);
 
     // Hairline that never drops under one device pixel.
     let stroke_width = 1.5f32.max(1.0 / zoom);
@@ -174,7 +175,9 @@ pub fn draw(
         draw_shape(frame, &index, badges, shape, stroke, stroke_width, tokens);
     }
 
-    draw_edges(frame, document, &index, &hidden, stroke, tokens, visible);
+    draw_edges(
+        frame, document, scope, &index, &hidden, stroke, tokens, visible,
+    );
 
     for shape in &nodes {
         draw_shape(frame, &index, badges, shape, stroke, stroke_width, tokens);
@@ -183,16 +186,21 @@ pub fn draw(
 
 /// Sequence flows (solid, filled arrowhead) and message flows (dashed, circle
 /// at the source, hollow arrowhead), drawn under node shapes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one draw pass; the arguments are the shared frame state"
+)]
 fn draw_edges(
     frame: &mut Frame,
     document: &Document,
+    scope: &bpmn_core::Scope,
     index: &std::collections::HashMap<&bpmn_core::BpmnId, &FlowElement>,
     hidden: &std::collections::HashSet<bpmn_core::BpmnId>,
     stroke: Stroke<'_>,
     tokens: CanvasTokens,
     visible: Rectangle,
 ) {
-    let Some(plane) = document.diagram().and_then(|d| d.plane.as_ref()) else {
+    let Some(plane) = document.plane_in(scope) else {
         return;
     };
     let message_flows: std::collections::HashMap<&bpmn_core::BpmnId, Option<&str>> = document

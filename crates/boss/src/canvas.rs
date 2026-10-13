@@ -102,6 +102,7 @@ impl DiagramCanvas {
         &'a self,
         camera: &'a Camera,
         document: &'a Document,
+        scope: bpmn_core::Scope,
         selection: &'a HashSet<BpmnId>,
         badges: &'a std::collections::HashMap<BpmnId, crate::render::Badge>,
         tokens: CanvasTokens,
@@ -111,6 +112,7 @@ impl DiagramCanvas {
             content_cache: &self.content_cache,
             camera,
             document,
+            scope,
             selection,
             badges,
             tokens,
@@ -133,6 +135,7 @@ struct View<'a> {
     content_cache: &'a Cache,
     camera: &'a Camera,
     document: &'a Document,
+    scope: bpmn_core::Scope,
     selection: &'a HashSet<BpmnId>,
     badges: &'a std::collections::HashMap<BpmnId, crate::render::Badge>,
     tokens: CanvasTokens,
@@ -219,9 +222,9 @@ impl View<'_> {
     fn hit_node(&self, world: Point) -> Option<BpmnId> {
         const HEADER: f64 = 30.0;
 
-        let plane = self.document.diagram()?.plane.as_ref()?;
+        let plane = self.document.plane_in(&self.scope)?;
         let index = self.document.flow_element_index();
-        let hidden = self.document.hidden_by_collapse();
+        let hidden = self.document.hidden_by_collapse_in(&self.scope);
         let world = bpmn_core::Point::new(f64::from(world.x), f64::from(world.y));
 
         let mut best: Option<(BpmnId, f64)> = None;
@@ -291,9 +294,9 @@ impl View<'_> {
     /// Topmost edge (sequence or message flow) whose polyline passes near a
     /// world-space point.
     fn hit_edge(&self, world: Point) -> Option<BpmnId> {
-        let plane = self.document.diagram()?.plane.as_ref()?;
+        let plane = self.document.plane_in(&self.scope)?;
         let index = self.document.flow_element_index();
-        let hidden = self.document.hidden_by_collapse();
+        let hidden = self.document.hidden_by_collapse_in(&self.scope);
         let message_flows: std::collections::HashSet<&BpmnId> = self
             .document
             .message_flows()
@@ -326,7 +329,7 @@ impl View<'_> {
 
     /// The waypoints of a flow's edge, in world units.
     fn edge_points(&self, flow: &BpmnId) -> Option<Vec<Point>> {
-        let plane = self.document.diagram()?.plane.as_ref()?;
+        let plane = self.document.plane_in(&self.scope)?;
         plane.elements.iter().find_map(|element| match element {
             DiElement::Edge(edge) if edge.bpmn_element == *flow => Some(
                 edge.waypoints
@@ -567,11 +570,6 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                     )
                 }
             }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                if cfg!(target_os = "macos") && cursor.position().is_some_and(|p| p.y < 28.0) =>
-            {
-                Some(canvas::Action::publish(CanvasMessage::DragWindow).and_capture())
-            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 // An armed connection resolves (or cancels) on this click.
                 if let Interaction::ConnectFrom { source, .. } = &state.interaction {
@@ -770,6 +768,7 @@ impl canvas::Program<CanvasMessage> for View<'_> {
                 render::draw(
                     frame,
                     self.document,
+                    &self.scope,
                     self.badges,
                     self.tokens,
                     self.camera.scaling,
@@ -882,7 +881,7 @@ impl View<'_> {
         };
 
         // Selection outlines (at the preview position while moving).
-        if let Some(plane) = self.document.diagram().and_then(|d| d.plane.as_ref()) {
+        if let Some(plane) = self.document.plane_in(&self.scope) {
             for element in &plane.elements {
                 let DiElement::Shape(shape) = element else {
                     continue;
@@ -916,7 +915,7 @@ impl View<'_> {
             Interaction::DraggingWaypoint { flow, .. } => Some(flow.clone()),
             _ => None,
         };
-        if let Some(plane) = self.document.diagram().and_then(|d| d.plane.as_ref()) {
+        if let Some(plane) = self.document.plane_in(&self.scope) {
             for element in &plane.elements {
                 let DiElement::Edge(edge) = element else {
                     continue;
