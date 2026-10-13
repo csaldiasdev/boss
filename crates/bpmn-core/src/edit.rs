@@ -6,7 +6,7 @@
 //! The editor and the MCP server both go through these methods.
 
 use crate::di::{BpmnDiagram, BpmnEdge, BpmnPlane, BpmnShape, DiElement};
-use crate::document::Document;
+use crate::document::{Document, Scope};
 use crate::geometry::{Bounds, Point, Size};
 use crate::ids::BpmnId;
 use crate::model::{
@@ -347,6 +347,43 @@ impl Document {
         })
     }
 
+    /// The plane that `scope` looks at, mutable.
+    fn plane_in_mut(&mut self, scope: &Scope) -> Option<&mut BpmnPlane> {
+        let index = self.plane_index(scope)?;
+        self.definitions.diagrams[index].plane.as_mut()
+    }
+
+    /// The index of the diagram whose plane holds the DI shape of `id`.
+    fn plane_index_of_shape(&self, id: &BpmnId) -> Option<usize> {
+        self.definitions.diagrams.iter().position(|diagram| {
+            diagram.plane.as_ref().is_some_and(|plane| {
+                plane.elements.iter().any(|element| {
+                    matches!(element, DiElement::Shape(shape) if shape.bpmn_element == *id)
+                })
+            })
+        })
+    }
+
+    /// Mutable access to the plane holding the DI shape of `id` — where the
+    /// DI of edges and boundary events touching it belongs.
+    fn plane_of_shape_mut(&mut self, id: &BpmnId) -> Option<&mut BpmnPlane> {
+        let index = self.plane_index_of_shape(id)?;
+        self.definitions.diagrams[index].plane.as_mut()
+    }
+
+    /// The scope whose plane holds the DI shape of `id`: the root for the
+    /// first diagram, the owning subprocess for a secondary plane.
+    fn scope_of_shape(&self, id: &BpmnId) -> Scope {
+        match self.plane_index_of_shape(id) {
+            Some(index) if index > 0 => self.definitions.diagrams[index]
+                .plane
+                .as_ref()
+                .and_then(|plane| plane.bpmn_element.clone())
+                .map_or(Scope::Root, Scope::Subprocess),
+            _ => Scope::Root,
+        }
+    }
+
     /// Mutable access to the DI edge of `id`, on whichever plane holds it.
     fn edge_mut(&mut self, id: &BpmnId) -> Option<&mut BpmnEdge> {
         self.definitions.diagrams.iter_mut().find_map(|diagram| {
@@ -400,16 +437,22 @@ impl Document {
         None
     }
 
-    /// The deepest container whose shape contains `point`: an expanded
-    /// subprocess, or the process behind a pool. Without a collaboration the
-    /// first process is the fallback canvas; with one, a point outside every
-    /// pool belongs nowhere (`None`). `except` (a node plus its descendants)
-    /// never counts as a container, so a subprocess cannot be dropped into
-    /// itself.
-    fn container_at(&self, point: Point, except: &HashSet<BpmnId>) -> Option<BpmnId> {
+    /// The deepest container whose shape on `scope`'s plane contains `point`:
+    /// an expanded subprocess, or the process behind a pool. At the root,
+    /// without a collaboration the first process is the fallback canvas, and
+    /// with one, a point outside every pool belongs nowhere (`None`); in a
+    /// drilled subprocess the fallback container is that subprocess itself.
+    /// `except` (a node plus its descendants) never counts as a container, so
+    /// a subprocess cannot be dropped into itself.
+    fn container_at_in(
+        &self,
+        scope: &Scope,
+        point: Point,
+        except: &HashSet<BpmnId>,
+    ) -> Option<BpmnId> {
         let index = self.flow_element_index();
-        let plane = self.diagram()?.plane.as_ref()?;
-        let hidden = self.hidden_by_collapse();
+        let plane = self.plane_in(scope)?;
+        let hidden = self.hidden_by_collapse_in(scope);
 
         let mut best: Option<(BpmnId, f64)> = None;
         for element in &plane.elements {
@@ -440,11 +483,13 @@ impl Document {
             }
         }
 
-        best.map(|(id, _)| id).or_else(|| {
+        best.map(|(id, _)| id).or_else(|| match scope {
             // In a collaboration everything lives in some pool.
-            (self.collaboration().is_none())
+            Scope::Root => (self.collaboration().is_none())
                 .then(|| self.processes().next().map(|p| p.base.id.clone()))
-                .flatten()
+                .flatten(),
+            // A drilled view IS the subprocess; empty space belongs to it.
+            Scope::Subprocess(sub) => Some(sub.clone()),
         })
     }
 
@@ -548,11 +593,22 @@ impl Document {
 
     /// Creates a flow node of `kind` centered at `center`; returns its id.
     /// The node lands in the expanded subprocess under `center`, if any.
+    #[inline]
     pub fn create_node(&mut self, kind: NodeKind, center: Point) -> Option<BpmnId> {
+        self.create_node_in(&Scope::Root, kind, center)
+    }
+
+    /// [`Self::create_node`], on `scope`'s plane and inside its containers.
+    pub fn create_node_in(
+        &mut self,
+        scope: &Scope,
+        kind: NodeKind,
+        center: Point,
+    ) -> Option<BpmnId> {
         let id = self.fresh_id(kind.id_prefix());
         let shape_id = BpmnId::new(format!("{id}_di").as_str());
         let size = kind.default_size();
-        let container = self.container_at(center, &HashSet::new())?;
+        let container = self.container_at_in(scope, center, &HashSet::new())?;
 
         let (element, backing) = self.build_node_element(kind, &id)?;
 
@@ -561,22 +617,24 @@ impl Document {
             elements.push(backing);
         }
         elements.push(element);
-        self.plane_mut()?.elements.push(DiElement::Shape(BpmnShape {
-            id: Some(shape_id),
-            bpmn_element: id.clone(),
-            bounds: Bounds::new(
-                center.x - size.width / 2.0,
-                center.y - size.height / 2.0,
-                size.width,
-                size.height,
-            ),
-            // The X marker on exclusive gateways, visible by convention.
-            is_marker_visible: matches!(kind, NodeKind::Gateway(GatewayKind::Exclusive))
-                .then_some(true),
-            // Subprocesses start expanded so their body can be edited.
-            is_expanded: matches!(kind, NodeKind::SubProcess(_)).then_some(true),
-            ..BpmnShape::default()
-        }));
+        self.plane_in_mut(scope)?
+            .elements
+            .push(DiElement::Shape(BpmnShape {
+                id: Some(shape_id),
+                bpmn_element: id.clone(),
+                bounds: Bounds::new(
+                    center.x - size.width / 2.0,
+                    center.y - size.height / 2.0,
+                    size.width,
+                    size.height,
+                ),
+                // The X marker on exclusive gateways, visible by convention.
+                is_marker_visible: matches!(kind, NodeKind::Gateway(GatewayKind::Exclusive))
+                    .then_some(true),
+                // Subprocesses start expanded so their body can be edited.
+                is_expanded: matches!(kind, NodeKind::SubProcess(_)).then_some(true),
+                ..BpmnShape::default()
+            }));
         self.assign_lanes();
 
         Some(id)
@@ -668,12 +726,14 @@ impl Document {
                     direction: None,
                 },
             }));
-        self.plane_mut()?.elements.push(DiElement::Edge(BpmnEdge {
-            id: Some(edge_id),
-            bpmn_element: id.clone(),
-            waypoints: vec![from, to],
-            ..BpmnEdge::default()
-        }));
+        self.plane_of_shape_mut(source)?
+            .elements
+            .push(DiElement::Edge(BpmnEdge {
+                id: Some(edge_id),
+                bpmn_element: id.clone(),
+                waypoints: vec![from, to],
+                ..BpmnEdge::default()
+            }));
         Some(id)
     }
 
@@ -709,12 +769,14 @@ impl Document {
             node.incoming.push(id.clone());
         }
 
-        self.plane_mut()?.elements.push(DiElement::Edge(BpmnEdge {
-            id: Some(edge_id),
-            bpmn_element: id.clone(),
-            waypoints,
-            ..BpmnEdge::default()
-        }));
+        self.plane_of_shape_mut(source)?
+            .elements
+            .push(DiElement::Edge(BpmnEdge {
+                id: Some(edge_id),
+                bpmn_element: id.clone(),
+                waypoints,
+                ..BpmnEdge::default()
+            }));
 
         Some(id)
     }
@@ -793,12 +855,14 @@ impl Document {
         });
 
         self.elements_of_mut(&container)?.push(element);
-        self.plane_mut()?.elements.push(DiElement::Shape(BpmnShape {
-            id: Some(shape_id),
-            bpmn_element: id.clone(),
-            bounds: Bounds::new(center.x - 18.0, center.y - 18.0, 36.0, 36.0),
-            ..BpmnShape::default()
-        }));
+        self.plane_of_shape_mut(host)?
+            .elements
+            .push(DiElement::Shape(BpmnShape {
+                id: Some(shape_id),
+                bpmn_element: id.clone(),
+                bounds: Bounds::new(center.x - 18.0, center.y - 18.0, 36.0, 36.0),
+                ..BpmnShape::default()
+            }));
         Some(id)
     }
 
@@ -994,7 +1058,10 @@ impl Document {
             };
             let mut except: HashSet<BpmnId> = self.descendants_of(id).into_iter().collect();
             except.insert(id.clone());
-            let Some(new) = self.container_at(bounds.center(), &except) else {
+            // Containment is judged on the plane the node is drawn on: in a
+            // drilled subprocess the fallback container is that subprocess.
+            let scope = self.scope_of_shape(id);
+            let Some(new) = self.container_at_in(&scope, bounds.center(), &except) else {
                 continue;
             };
             if self.container_of(id).is_some_and(|old| old != new) {
@@ -1033,6 +1100,7 @@ impl Document {
     /// offset by `(dx, dy)`.
     fn paste_di(
         &mut self,
+        scope: &Scope,
         source: &Document,
         mapping: &std::collections::HashMap<BpmnId, BpmnId>,
         dx: f64,
@@ -1071,7 +1139,7 @@ impl Document {
                 }
             }
         }
-        if let Some(plane) = self.plane_mut() {
+        if let Some(plane) = self.plane_in_mut(scope) {
             plane.elements.extend(di);
         }
     }
@@ -1170,13 +1238,22 @@ impl Document {
                 if matches!(activity.kind, ActivityKind::SubProcess(_)) => {}
             _ => return false,
         }
+        let Some(shape_plane) = self.plane_index_of_shape(id) else {
+            return false;
+        };
 
-        // The expanded size wraps the children; an empty body gets the
-        // default placement size.
-        let mut child_box: Option<Bounds> = None;
         if expanded {
+            // Bring the children's DI home from the subprocess's own plane,
+            // landing inside the shape; then refit the shape around it.
+            self.adopt_subprocess_di(id, shape_plane, PADDING);
+            // Dropping the emptied diagram can shift plane indices.
+            let Some(shape_plane) = self.plane_index_of_shape(id) else {
+                return false;
+            };
+
             let children: HashSet<BpmnId> = self.descendants_of(id).into_iter().collect();
-            if let Some(plane) = self.diagram().and_then(|d| d.plane.as_ref()) {
+            let mut child_box: Option<Bounds> = None;
+            if let Some(plane) = self.definitions.diagrams[shape_plane].plane.as_ref() {
                 for element in &plane.elements {
                     if let DiElement::Shape(shape) = element
                         && children.contains(&shape.bpmn_element)
@@ -1188,51 +1265,168 @@ impl Document {
                     }
                 }
             }
+
+            let Some(shape) = self.shape_mut(id) else {
+                return false;
+            };
+            shape.is_expanded = Some(true);
+            // The expanded size wraps the children; an empty body gets the
+            // default placement size.
+            let size = NodeKind::SubProcess(SubProcessKind::Embedded).default_size();
+            shape.bounds = child_box.map_or_else(
+                || Bounds::new(shape.bounds.x, shape.bounds.y, size.width, size.height),
+                |b| {
+                    Bounds::new(
+                        b.x - PADDING,
+                        b.y - PADDING,
+                        b.width + PADDING * 2.0,
+                        b.height + PADDING * 2.0,
+                    )
+                },
+            );
+        } else {
+            let Some(shape) = self.shape_mut(id) else {
+                return false;
+            };
+            shape.is_expanded = Some(false);
+            shape.bounds.width = COLLAPSED.width;
+            shape.bounds.height = COLLAPSED.height;
+            // The children's DI moves onto the subprocess's own plane — the
+            // bpmn.io layout, which the drilled view edits.
+            self.ensure_subprocess_plane(id);
+        }
+
+        let moved: HashSet<BpmnId> = [id.clone()].into_iter().collect();
+        let boundaries: HashSet<BpmnId> = self.attached_boundaries(&moved).into_iter().collect();
+        self.clamp_boundaries(&boundaries, &HashSet::new());
+        let mut touching = moved;
+        touching.extend(boundaries);
+        self.reanchor_edges(&touching);
+        true
+    }
+
+    /// Makes sure the subprocess `sub` owns a DI plane, creating its diagram
+    /// when missing and sweeping onto it any descendant DI parked on a
+    /// foreign plane (the legacy hide-in-place layout). Returns the plane
+    /// index and whether the document changed; `None` when `sub` is not a
+    /// subprocess.
+    pub fn ensure_subprocess_plane(&mut self, sub: &BpmnId) -> Option<(usize, bool)> {
+        match self.flow_element_index().get(sub) {
+            Some(FlowElement::Activity(activity))
+                if matches!(activity.kind, ActivityKind::SubProcess(_)) => {}
+            _ => return None,
         }
 
         let mut changed = false;
-        {
-            let Some(plane) = self.plane_mut() else {
-                return false;
+        let index = if let Some(index) = self.plane_index(&Scope::Subprocess(sub.clone())) {
+            index
+        } else {
+            let diagram_id = self.fresh_id("BPMNDiagram");
+            let plane_id = self.fresh_id("BPMNPlane");
+            self.definitions.diagrams.push(BpmnDiagram {
+                id: Some(diagram_id),
+                plane: Some(BpmnPlane {
+                    id: Some(plane_id),
+                    bpmn_element: Some(sub.clone()),
+                    ..BpmnPlane::default()
+                }),
+                ..BpmnDiagram::default()
+            });
+            changed = true;
+            self.definitions.diagrams.len() - 1
+        };
+
+        // Sweep: descendant DI living on planes that belong to neither `sub`
+        // nor a deeper subprocess moves here, coordinates untouched.
+        let descendants: HashSet<BpmnId> = self.descendants_of(sub).into_iter().collect();
+        let owned: HashSet<usize> = self
+            .definitions
+            .diagrams
+            .iter()
+            .enumerate()
+            .filter_map(|(i, diagram)| {
+                let owner = diagram.plane.as_ref()?.bpmn_element.as_ref()?;
+                descendants.contains(owner).then_some(i)
+            })
+            .collect();
+        let mut moved: Vec<DiElement> = Vec::new();
+        for (i, diagram) in self.definitions.diagrams.iter_mut().enumerate() {
+            if i == index || owned.contains(&i) {
+                continue;
+            }
+            let Some(plane) = diagram.plane.as_mut() else {
+                continue;
             };
-            for element in &mut plane.elements {
-                let DiElement::Shape(shape) = element else {
-                    continue;
-                };
-                if shape.bpmn_element != *id {
-                    continue;
-                }
-                shape.is_expanded = Some(expanded);
-                if expanded {
-                    let size = NodeKind::SubProcess(SubProcessKind::Embedded).default_size();
-                    shape.bounds = child_box.map_or_else(
-                        || Bounds::new(shape.bounds.x, shape.bounds.y, size.width, size.height),
-                        |b| {
-                            Bounds::new(
-                                b.x - PADDING,
-                                b.y - PADDING,
-                                b.width + PADDING * 2.0,
-                                b.height + PADDING * 2.0,
-                            )
-                        },
-                    );
+            let mut kept = Vec::with_capacity(plane.elements.len());
+            for element in plane.elements.drain(..) {
+                if element
+                    .bpmn_element()
+                    .is_some_and(|id| descendants.contains(id))
+                {
+                    moved.push(element);
                 } else {
-                    shape.bounds.width = COLLAPSED.width;
-                    shape.bounds.height = COLLAPSED.height;
+                    kept.push(element);
                 }
-                changed = true;
+            }
+            plane.elements = kept;
+        }
+        if !moved.is_empty() {
+            changed = true;
+            if let Some(plane) = self.definitions.diagrams[index].plane.as_mut() {
+                plane.elements.extend(moved);
             }
         }
-        if changed {
-            let moved: HashSet<BpmnId> = [id.clone()].into_iter().collect();
-            let boundaries: HashSet<BpmnId> =
-                self.attached_boundaries(&moved).into_iter().collect();
-            self.clamp_boundaries(&boundaries, &HashSet::new());
-            let mut touching = moved;
-            touching.extend(boundaries);
-            self.reanchor_edges(&touching);
+        Some((index, changed))
+    }
+
+    /// Expand's inverse of the plane split: detaches the descendants' DI from
+    /// `sub`'s own plane, translates it to sit inside the shape (which lives
+    /// on plane `target`) with `padding`, and drops the emptied diagram.
+    fn adopt_subprocess_di(&mut self, sub: &BpmnId, target: usize, padding: f64) {
+        let Some(own) = self.plane_index(&Scope::Subprocess(sub.clone())) else {
+            return;
+        };
+        if own == target || own == 0 {
+            return;
         }
-        changed
+        let descendants: HashSet<BpmnId> = self.descendants_of(sub).into_iter().collect();
+
+        let mut moved: Vec<DiElement> = Vec::new();
+        if let Some(plane) = self.definitions.diagrams[own].plane.as_mut() {
+            let mut kept = Vec::with_capacity(plane.elements.len());
+            for element in plane.elements.drain(..) {
+                if element
+                    .bpmn_element()
+                    .is_some_and(|id| descendants.contains(id))
+                {
+                    moved.push(element);
+                } else {
+                    kept.push(element);
+                }
+            }
+            plane.elements = kept;
+        }
+
+        if !moved.is_empty() {
+            // Land the migrated box at the shape's top-left plus padding.
+            if let (Some(moved_box), Some((_, shape))) = (di_bounds(&moved), self.node_outline(sub))
+            {
+                let dx = shape.x + padding - moved_box.x;
+                let dy = shape.y + padding - moved_box.y;
+                translate_di(&mut moved, dx, dy);
+            }
+            if let Some(plane) = self.definitions.diagrams[target].plane.as_mut() {
+                plane.elements.extend(moved);
+            }
+        }
+
+        if self.definitions.diagrams[own]
+            .plane
+            .as_ref()
+            .is_some_and(|plane| plane.elements.is_empty())
+        {
+            self.definitions.diagrams.remove(own);
+        }
     }
 
     /// Creates a pool (participant) centered at `at`; returns its id. The
@@ -1949,7 +2143,19 @@ impl Document {
     /// Pastes every modeled flow element of `source` into this document with
     /// fresh ids, offset by `(dx, dy)`. Returns the new top-level node ids
     /// (not flows, not subprocess contents).
+    #[inline]
     pub fn paste_from(&mut self, source: &Document, dx: f64, dy: f64) -> Vec<BpmnId> {
+        self.paste_from_in(&Scope::Root, source, dx, dy)
+    }
+
+    /// [`Self::paste_from`], landing in `scope`'s container and plane.
+    pub fn paste_from_in(
+        &mut self,
+        scope: &Scope,
+        source: &Document,
+        dx: f64,
+        dy: f64,
+    ) -> Vec<BpmnId> {
         use std::collections::HashMap;
 
         let mut used = self.used_ids();
@@ -2031,11 +2237,15 @@ impl Document {
                 elements.push(element);
             }
         }
-        if let Some(process) = self.first_process_mut() {
-            process.flow_elements.extend(elements);
+        let host = match scope {
+            Scope::Root => self.first_process_mut().map(|p| &mut p.flow_elements),
+            Scope::Subprocess(id) => self.elements_of_mut(&id.clone()),
+        };
+        if let Some(host) = host {
+            host.extend(elements);
         }
 
-        self.paste_di(source, &mapping, dx, dy);
+        self.paste_di(scope, source, &mapping, dx, dy);
 
         // Pasted geometry decides containment and lane membership, exactly
         // like a drop would.
@@ -2079,6 +2289,54 @@ fn prune_lanes(sets: &mut Vec<LaneSet>, doomed: &HashSet<BpmnId>) {
 
 /// Removes doomed elements from a flow-element collection (descending into
 /// subprocesses) and strips dangling references from the survivors.
+/// The bounding box of a batch of DI elements (shape bounds and waypoints).
+fn di_bounds(elements: &[DiElement]) -> Option<Bounds> {
+    let mut acc: Option<Bounds> = None;
+    let mut extend = |b: Bounds| {
+        acc = Some(match acc {
+            None => b,
+            Some(a) => a.union(b),
+        });
+    };
+    for element in elements {
+        match element {
+            DiElement::Shape(shape) => extend(shape.bounds),
+            DiElement::Edge(edge) => {
+                for point in &edge.waypoints {
+                    extend(Bounds::new(point.x, point.y, 0.0, 0.0));
+                }
+            }
+            DiElement::Unknown(_) => {}
+        }
+    }
+    acc
+}
+
+/// Translates a batch of DI elements (shapes, waypoints, and their labels).
+fn translate_di(elements: &mut [DiElement], dx: f64, dy: f64) {
+    for element in elements {
+        let label = match element {
+            DiElement::Shape(shape) => {
+                shape.bounds.x += dx;
+                shape.bounds.y += dy;
+                &mut shape.label
+            }
+            DiElement::Edge(edge) => {
+                for point in &mut edge.waypoints {
+                    point.x += dx;
+                    point.y += dy;
+                }
+                &mut edge.label
+            }
+            DiElement::Unknown(_) => continue,
+        };
+        if let Some(bounds) = label.as_mut().and_then(|l| l.bounds.as_mut()) {
+            bounds.x += dx;
+            bounds.y += dy;
+        }
+    }
+}
+
 fn prune_deleted(elements: &mut Vec<FlowElement>, doomed: &HashSet<BpmnId>) {
     elements.retain(|element| element.id().is_none_or(|id| !doomed.contains(id)));
     for element in elements {

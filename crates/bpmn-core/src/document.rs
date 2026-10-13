@@ -1,6 +1,6 @@
 //! The in-memory document: semantic model + DI, with lookup helpers.
 
-use crate::di::{BpmnDiagram, DiElement};
+use crate::di::{BpmnDiagram, BpmnPlane, DiElement};
 use crate::geometry::Bounds;
 use crate::ids::BpmnId;
 use crate::model::{
@@ -17,6 +17,17 @@ use std::collections::{HashMap, HashSet};
 pub struct Document {
     /// The document root.
     pub definitions: Definitions,
+}
+
+/// Which plane the canvas is looking at: the root diagram, or the own plane
+/// of a collapsed subprocess the user drilled into.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Scope {
+    /// The first diagram — the process or collaboration itself.
+    #[default]
+    Root,
+    /// The plane whose `bpmnElement` is this subprocess.
+    Subprocess(BpmnId),
 }
 
 impl Document {
@@ -146,11 +157,39 @@ impl Document {
         out
     }
 
+    /// The index of the diagram `scope` looks at: the first one for the root,
+    /// or the diagram whose plane's `bpmnElement` is the drilled subprocess.
+    pub fn plane_index(&self, scope: &Scope) -> Option<usize> {
+        match scope {
+            Scope::Root => (!self.definitions.diagrams.is_empty()).then_some(0),
+            Scope::Subprocess(id) => self.definitions.diagrams.iter().position(|diagram| {
+                diagram
+                    .plane
+                    .as_ref()
+                    .and_then(|plane| plane.bpmn_element.as_ref())
+                    == Some(id)
+            }),
+        }
+    }
+
+    /// The plane `scope` looks at.
+    pub fn plane_in(&self, scope: &Scope) -> Option<&BpmnPlane> {
+        self.definitions.diagrams[self.plane_index(scope)?]
+            .plane
+            .as_ref()
+    }
+
     /// Ids hidden on the canvas because an ancestor subprocess is collapsed
     /// (its DI shape does not carry `isExpanded="true"`).
+    #[inline]
     pub fn hidden_by_collapse(&self) -> HashSet<BpmnId> {
+        self.hidden_by_collapse_in(&Scope::Root)
+    }
+
+    /// [`Self::hidden_by_collapse`], over the shapes of `scope`'s plane.
+    pub fn hidden_by_collapse_in(&self, scope: &Scope) -> HashSet<BpmnId> {
         let mut hidden = HashSet::new();
-        let Some(plane) = self.diagram().and_then(|d| d.plane.as_ref()) else {
+        let Some(plane) = self.plane_in(scope) else {
             return hidden;
         };
         for element in &plane.elements {
@@ -179,8 +218,14 @@ impl Document {
 
     /// The bounding box of everything the first diagram draws, in world
     /// coordinates. Drives zoom-to-fit when a file opens.
+    #[inline]
     pub fn content_bounds(&self) -> Option<Bounds> {
-        let plane = self.diagram()?.plane.as_ref()?;
+        self.content_bounds_in(&Scope::Root)
+    }
+
+    /// [`Self::content_bounds`], over the shapes of `scope`'s plane.
+    pub fn content_bounds_in(&self, scope: &Scope) -> Option<Bounds> {
+        let plane = self.plane_in(scope)?;
 
         let mut min_x = f64::INFINITY;
         let mut min_y = f64::INFINITY;

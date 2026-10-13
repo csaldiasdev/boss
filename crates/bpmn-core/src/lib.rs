@@ -13,7 +13,7 @@ pub mod ids;
 pub mod model;
 pub mod raw;
 
-pub use document::Document;
+pub use document::{Document, Scope};
 pub use edit::{NodeKind, Outline};
 pub use geometry::{Bounds, Point, Size};
 pub use ids::BpmnId;

@@ -416,6 +416,68 @@ fn parses_the_secondary_plane_fixture() {
 }
 
 #[test]
+fn drill_down_scope_and_plane_migration() {
+    use bpmn_core::model::SubProcessKind;
+    use bpmn_core::{Document, NodeKind, Point, Scope};
+
+    // A bpmn.io-style file already has the plane: drilling is a no-op.
+    let mut doc = parse(PLANES).unwrap();
+    let sub = BpmnId::from("Activity_Assess");
+    let (index, changed) = doc.ensure_subprocess_plane(&sub).expect("is a subprocess");
+    assert_eq!((index, changed), (1, false));
+
+    // Creating a node in the drilled scope: semantics inside the subprocess,
+    // DI on the subprocess's plane.
+    let scope = Scope::Subprocess(sub.clone());
+    let task = doc
+        .create_node_in(
+            &scope,
+            NodeKind::Task(TaskType::Generic),
+            Point::new(600.0, 180.0),
+        )
+        .expect("node created");
+    assert_eq!(doc.container_of(&task), Some(sub.clone()));
+    let on_plane = |doc: &Document, plane: usize, id: &BpmnId| {
+        doc.definitions.diagrams[plane]
+            .plane
+            .as_ref()
+            .is_some_and(|p| p.elements.iter().any(|e| e.bpmn_element() == Some(id)))
+    };
+    assert!(on_plane(&doc, 1, &task));
+    assert!(!on_plane(&doc, 0, &task));
+
+    // Collapse/expand migrate children DI between the parent plane and the
+    // subprocess's own plane.
+    let mut doc = Document::new();
+    let sub = doc
+        .create_node(
+            NodeKind::SubProcess(SubProcessKind::Embedded),
+            Point::new(300.0, 200.0),
+        )
+        .expect("subprocess created");
+    let inner = doc
+        .create_node(NodeKind::Task(TaskType::Generic), Point::new(300.0, 200.0))
+        .expect("inner task lands in the expanded subprocess");
+    assert_eq!(doc.container_of(&inner), Some(sub.clone()));
+
+    assert!(doc.set_subprocess_expanded(&sub, false));
+    assert_eq!(doc.definitions.diagrams.len(), 2);
+    assert!(on_plane(&doc, 1, &inner));
+    assert!(!on_plane(&doc, 0, &inner));
+    // The migrated child no longer inflates the root view.
+    let root_box = doc.content_bounds_in(&Scope::Root).unwrap();
+    assert!(root_box.width <= 100.0 + f64::EPSILON);
+
+    assert!(doc.set_subprocess_expanded(&sub, true));
+    assert_eq!(doc.definitions.diagrams.len(), 1, "emptied diagram dropped");
+    assert!(on_plane(&doc, 0, &inner));
+    // The child sits inside the refitted shape.
+    let (_, sub_bounds) = doc.node_outline(&sub).unwrap();
+    let (_, inner_bounds) = doc.node_outline(&inner).unwrap();
+    assert!(sub_bounds.contains(inner_bounds.center()));
+}
+
+#[test]
 fn edits_reach_secondary_planes() {
     use std::collections::HashSet;
 
