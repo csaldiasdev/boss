@@ -305,6 +305,18 @@ impl BossMcp {
 fn outcome_text(outcome: &ApplyOutcome) -> String {
     match outcome {
         ApplyOutcome::Created(id) => format!("created {id}"),
+        ApplyOutcome::Affected { affected, unknown } => match (affected.len(), unknown.len()) {
+            (_, 0) => String::from("done"),
+            (0, _) => String::from("nothing to do: no such elements"),
+            (_, _) => format!(
+                "done, except unknown ids: {}",
+                unknown
+                    .iter()
+                    .map(bpmn_core::BpmnId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
         ApplyOutcome::Changed => String::from("done"),
         ApplyOutcome::Nothing => String::from("nothing to do"),
     }

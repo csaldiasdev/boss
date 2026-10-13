@@ -1245,39 +1245,9 @@ impl App {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    /// The collaboration half of the MCP actions (pools and lanes).
-    #[cfg(not(target_arch = "wasm32"))]
-    fn apply_mcp_pool_action(
-        &mut self,
-        action: boss_mcp::EditAction,
-    ) -> Result<boss_mcp::ApplyOutcome, String> {
-        use boss_mcp::{ApplyOutcome, EditAction};
-
-        match action {
-            EditAction::CreatePool { name, x, y } => {
-                let mut created = None;
-                self.session.commit(|doc| {
-                    created = doc.create_pool(name.clone(), bpmn_core::Point::new(x, y));
-                    created.is_some()
-                });
-                created
-                    .map(ApplyOutcome::Created)
-                    .ok_or_else(|| String::from("could not create a pool"))
-            }
-            EditAction::AddLane { pool, name } => {
-                let mut created = None;
-                self.session.commit(|doc| {
-                    created = doc.add_lane(&pool, name.clone());
-                    created.is_some()
-                });
-                created
-                    .map(ApplyOutcome::Created)
-                    .ok_or_else(|| format!("{pool} is not a pool backed by a process"))
-            }
-            _ => Ok(ApplyOutcome::Nothing),
-        }
-    }
-
+    /// Applies one MCP action: history steps go to the edit session, every
+    /// other action runs through the shared `boss_mcp::apply` inside one
+    /// undoable commit. UI side effects (selection, camera) stay here.
     #[cfg(not(target_arch = "wasm32"))]
     fn apply_mcp_action(
         &mut self,
@@ -1285,104 +1255,34 @@ impl App {
     ) -> Result<boss_mcp::ApplyOutcome, String> {
         use boss_mcp::{ApplyOutcome, EditAction};
 
-        match action {
-            EditAction::CreateNode { kind, x, y, name } => {
-                let mut created = None;
-                self.session.commit(|doc| {
-                    created = doc.create_node(kind, bpmn_core::Point::new(x, y));
-                    if let (Some(id), Some(name)) = (&created, &name) {
-                        doc.set_name(id, Some(name.clone()));
-                    }
-                    created.is_some()
-                });
-                created
-                    .map(ApplyOutcome::Created)
-                    .ok_or_else(|| String::from("could not create that element"))
-            }
-            action @ (EditAction::CreatePool { .. } | EditAction::AddLane { .. }) => {
-                self.apply_mcp_pool_action(action)
-            }
-            EditAction::CreateBoundary { host, x, y } => {
-                let mut created = None;
-                self.session.commit(|doc| {
-                    created = doc.create_boundary_event(&host, bpmn_core::Point::new(x, y));
-                    created.is_some()
-                });
-                created
-                    .map(ApplyOutcome::Created)
-                    .ok_or_else(|| format!("{host} is not a task; boundary events attach to tasks"))
-            }
-            EditAction::Connect {
-                source,
-                target,
-                name,
-            } => {
-                let mut created = None;
-                self.session.commit(|doc| {
-                    created = doc.connect(&source, &target);
-                    if let (Some(id), Some(name)) = (&created, &name) {
-                        doc.set_name(id, Some(name.clone()));
-                    }
-                    created.is_some()
-                });
-                created.map(ApplyOutcome::Created).ok_or_else(|| {
-                    String::from("cannot connect: unknown endpoint ids or a self-connection")
-                })
-            }
-            EditAction::SetName { id, name } => {
-                let mut renamed = false;
-                self.session.commit(|doc| {
-                    renamed = doc.set_name(&id, name.clone());
-                    renamed
-                });
-                if renamed {
-                    Ok(ApplyOutcome::Changed)
-                } else {
-                    Err(format!("no element with id {id}"))
-                }
-            }
-            EditAction::Delete { ids } => {
-                if ids.is_empty() {
-                    return Ok(ApplyOutcome::Nothing);
-                }
-                let doomed: HashSet<BpmnId> = ids.into_iter().collect();
-                self.session.commit(|doc| {
-                    doc.delete_elements(&doomed);
-                    true
-                });
+        if action.is_history() {
+            let stepped = match action {
+                EditAction::Undo => self.session.undo(),
+                _ => self.session.redo(),
+            };
+            if stepped {
                 self.selection.clear();
-                Ok(ApplyOutcome::Changed)
+                return Ok(ApplyOutcome::Changed);
             }
-            EditAction::Move { ids, dx, dy } => {
-                let ids: HashSet<BpmnId> = ids.into_iter().collect();
-                self.session.commit(|doc| {
-                    doc.move_shapes(&ids, dx, dy);
-                    true
-                });
-                Ok(ApplyOutcome::Changed)
-            }
-            EditAction::Replace { document } => {
-                self.session.commit(|doc| {
-                    *doc = *document;
-                    true
-                });
+            return Ok(ApplyOutcome::Nothing);
+        }
+
+        let is_replace = matches!(action, EditAction::Replace { .. });
+        let is_delete = matches!(action, EditAction::Delete { .. });
+        let mut result = Err(String::from("not applied"));
+        self.session.commit(|doc| {
+            result = boss_mcp::apply(action, doc);
+            result.as_ref().is_ok_and(ApplyOutcome::changed_document)
+        });
+        if result.as_ref().is_ok_and(ApplyOutcome::changed_document) {
+            if is_delete || is_replace {
                 self.selection.clear();
+            }
+            if is_replace {
                 self.zoom_to_fit();
-                Ok(ApplyOutcome::Changed)
-            }
-            action @ (EditAction::Undo | EditAction::Redo) => {
-                let stepped = match action {
-                    EditAction::Undo => self.session.undo(),
-                    _ => self.session.redo(),
-                };
-                if stepped {
-                    self.selection.clear();
-                    Ok(ApplyOutcome::Changed)
-                } else {
-                    Ok(ApplyOutcome::Nothing)
-                }
             }
         }
+        result
     }
 
     /// Handles the clipboard message family (BPMN XML as the payload).

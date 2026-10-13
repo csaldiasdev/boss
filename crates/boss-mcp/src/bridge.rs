@@ -94,10 +94,37 @@ pub enum EditAction {
 pub enum ApplyOutcome {
     /// A new element with this id.
     Created(BpmnId),
+    /// A bulk action touched `affected` and skipped `unknown` ids.
+    Affected {
+        /// The ids that existed and were acted on.
+        affected: Vec<BpmnId>,
+        /// The ids the document does not know.
+        unknown: Vec<BpmnId>,
+    },
     /// The document changed.
     Changed,
     /// Nothing to do (empty undo stack, empty selection, ...).
     Nothing,
+}
+
+impl ApplyOutcome {
+    /// Whether the document actually changed — the predicate an undoable
+    /// commit reports, so no-ops leave no undo step behind.
+    pub fn changed_document(&self) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Affected { affected, .. } => !affected.is_empty(),
+            Self::Created(_) | Self::Changed => true,
+        }
+    }
+}
+
+impl EditAction {
+    /// Whether this action steps the editor's history instead of mutating
+    /// the document; the app routes these to its edit session.
+    pub fn is_history(&self) -> bool {
+        matches!(self, Self::Undo | Self::Redo)
+    }
 }
 
 /// A request traveling from a tool handler to the editor.
