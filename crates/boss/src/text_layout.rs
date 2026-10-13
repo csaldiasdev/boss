@@ -10,8 +10,23 @@
 use iced::advanced::graphics::text::Paragraph;
 use iced::advanced::text::{self, LineHeight, Paragraph as _, Shaping, Wrapping};
 use iced::{Pixels, Size};
+use std::borrow::Cow;
+use std::sync::Once;
 
 use crate::theme;
+
+/// Loads the UI font into the global font system, so measurement uses the
+/// same metrics everywhere — the renderer only loads it when the application
+/// boots, which never happens in tests or other headless callers, and the
+/// per-platform fallback font would wrap differently per platform.
+fn ensure_fonts() {
+    static LOADED: Once = Once::new();
+    LOADED.call_once(|| {
+        if let Ok(mut font_system) = iced::advanced::graphics::text::font_system().write() {
+            font_system.load_font(Cow::Borrowed(theme::FONT_SANS_REGULAR));
+        }
+    });
+}
 
 /// The line-height factor of `iced::widget::canvas::Text`; measurement must
 /// match what the renderer will lay out.
@@ -20,6 +35,7 @@ const LINE_HEIGHT: f32 = 1.2;
 /// Measures `content` as the canvas draws it — honoring its explicit
 /// newlines, never adding more — in world units.
 pub fn measure(content: &str, size: f32) -> Size {
+    ensure_fonts();
     Paragraph::with_text(text::Text {
         content,
         bounds: Size::INFINITE,

@@ -611,9 +611,11 @@ mod tests {
         assert!(svg.contains("<circle"));
         assert!(svg.contains("<polyline"));
         assert!(svg.contains("stroke-dasharray=\"6 4\""));
-        // Text is escaped.
+        // Text is escaped, and the annotation wraps into tspan lines.
         let doc =
             bpmn_xml::parse(include_str!("../../../tests-fixtures/data-artifacts.bpmn")).unwrap();
-        assert!(super::export(&doc).contains("applies &amp; audit"));
+        let svg = super::export(&doc);
+        assert!(svg.contains("applies &amp;"));
+        assert!(svg.contains("<tspan"));
     }
 }
