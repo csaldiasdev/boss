@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="Definitions_library" targetNamespace="https://example.com/bpmn" exporter="example-modeler" exporterVersion="2.0.0">
+  <bpmn:process id="Process_Loan" name="Handle library loan" isExecutable="false">
+    <bpmn:startEvent id="StartEvent_Requested" name="Loan requested">
+      <bpmn:outgoing>Flow_ToAssess</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:subProcess id="Activity_Assess" name="Assess borrower">
+      <bpmn:incoming>Flow_ToAssess</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToDone</bpmn:outgoing>
+      <bpmn:startEvent id="StartEvent_Assess" name="Assessment starts">
+        <bpmn:outgoing>Flow_Inner_1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:task id="Task_CheckRecord" name="Check borrowing record">
+        <bpmn:incoming>Flow_Inner_1</bpmn:incoming>
+        <bpmn:outgoing>Flow_Inner_2</bpmn:outgoing>
+      </bpmn:task>
+      <bpmn:endEvent id="EndEvent_Assessed" name="Assessed">
+        <bpmn:incoming>Flow_Inner_2</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="Flow_Inner_1" sourceRef="StartEvent_Assess" targetRef="Task_CheckRecord" />
+      <bpmn:sequenceFlow id="Flow_Inner_2" sourceRef="Task_CheckRecord" targetRef="EndEvent_Assessed" />
+    </bpmn:subProcess>
+    <bpmn:endEvent id="EndEvent_Handled" name="Loan handled">
+      <bpmn:incoming>Flow_ToDone</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_ToAssess" sourceRef="StartEvent_Requested" targetRef="Activity_Assess" />
+    <bpmn:sequenceFlow id="Flow_ToDone" sourceRef="Activity_Assess" targetRef="EndEvent_Handled" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Process_Loan">
+      <bpmndi:BPMNShape id="StartEvent_Requested_di" bpmnElement="StartEvent_Requested">
+        <dc:Bounds x="179" y="99" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_Assess_di" bpmnElement="Activity_Assess" isExpanded="false">
+        <dc:Bounds x="270" y="77" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_Handled_di" bpmnElement="EndEvent_Handled">
+        <dc:Bounds x="432" y="99" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_ToAssess_di" bpmnElement="Flow_ToAssess">
+        <di:waypoint x="215" y="117" />
+        <di:waypoint x="270" y="117" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToDone_di" bpmnElement="Flow_ToDone">
+        <di:waypoint x="370" y="117" />
+        <di:waypoint x="432" y="117" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Assess">
+    <bpmndi:BPMNPlane id="BPMNPlane_Assess" bpmnElement="Activity_Assess">
+      <bpmndi:BPMNShape id="StartEvent_Assess_di" bpmnElement="StartEvent_Assess">
+        <dc:Bounds x="180" y="160" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_CheckRecord_di" bpmnElement="Task_CheckRecord">
+        <dc:Bounds x="280" y="138" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_Assessed_di" bpmnElement="EndEvent_Assessed">
+        <dc:Bounds x="442" y="160" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_Inner_1_di" bpmnElement="Flow_Inner_1">
+        <di:waypoint x="216" y="178" />
+        <di:waypoint x="280" y="178" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Inner_2_di" bpmnElement="Flow_Inner_2">
+        <di:waypoint x="380" y="178" />
+        <di:waypoint x="442" y="178" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

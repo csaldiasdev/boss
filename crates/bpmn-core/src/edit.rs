@@ -332,6 +332,36 @@ impl Document {
         self.definitions.diagrams.first_mut()?.plane.as_mut()
     }
 
+    /// Mutable access to the DI shape of `id`, on whichever plane holds it.
+    fn shape_mut(&mut self, id: &BpmnId) -> Option<&mut BpmnShape> {
+        self.definitions.diagrams.iter_mut().find_map(|diagram| {
+            diagram
+                .plane
+                .as_mut()?
+                .elements
+                .iter_mut()
+                .find_map(|element| match element {
+                    DiElement::Shape(shape) if shape.bpmn_element == *id => Some(shape),
+                    _ => None,
+                })
+        })
+    }
+
+    /// Mutable access to the DI edge of `id`, on whichever plane holds it.
+    fn edge_mut(&mut self, id: &BpmnId) -> Option<&mut BpmnEdge> {
+        self.definitions.diagrams.iter_mut().find_map(|diagram| {
+            diagram
+                .plane
+                .as_mut()?
+                .elements
+                .iter_mut()
+                .find_map(|element| match element {
+                    DiElement::Edge(edge) if edge.bpmn_element == *id => Some(edge),
+                    _ => None,
+                })
+        })
+    }
+
     /// Mutable access to the flow elements of `container`: a process id or an
     /// expanded subprocess id.
     fn elements_of_mut(&mut self, container: &BpmnId) -> Option<&mut Vec<FlowElement>> {
@@ -833,10 +863,18 @@ impl Document {
             // Pools anchor message flows on their rectangle.
             None => self.participant(id).map(|_| Outline::Rect)?,
         };
-        let plane = self.diagram()?.plane.as_ref()?;
-        let bounds = plane.elements.iter().find_map(|element| match element {
-            DiElement::Shape(shape) if shape.bpmn_element == *id => Some(shape.bounds),
-            _ => None,
+        // The shape may live on any plane: the root one, or the own plane of
+        // a collapsed subprocess holding this element.
+        let bounds = self.definitions.diagrams.iter().find_map(|diagram| {
+            diagram
+                .plane
+                .as_ref()?
+                .elements
+                .iter()
+                .find_map(|element| match element {
+                    DiElement::Shape(shape) if shape.bpmn_element == *id => Some(shape.bounds),
+                    _ => None,
+                })
         })?;
         Some((outline, bounds))
     }
@@ -887,9 +925,11 @@ impl Document {
             }
         }
 
-        {
-            let Some(plane) = self.plane_mut() else {
-                return;
+        // Shapes can sit on any plane (collapsed subprocesses keep their
+        // children's DI on their own plane); translate wherever they live.
+        for diagram in &mut self.definitions.diagrams {
+            let Some(plane) = diagram.plane.as_mut() else {
+                continue;
             };
             for element in &mut plane.elements {
                 match element {
@@ -1086,20 +1126,10 @@ impl Document {
             clamps.push((id.clone(), outline.anchor(host_bounds, own_bounds.center())));
         }
 
-        if clamps.is_empty() {
-            return;
-        }
-        let Some(plane) = self.plane_mut() else {
-            return;
-        };
         for (id, center) in clamps {
-            for element in &mut plane.elements {
-                if let DiElement::Shape(shape) = element
-                    && shape.bpmn_element == id
-                {
-                    shape.bounds.x = center.x - shape.bounds.width / 2.0;
-                    shape.bounds.y = center.y - shape.bounds.height / 2.0;
-                }
+            if let Some(shape) = self.shape_mut(&id) {
+                shape.bounds.x = center.x - shape.bounds.width / 2.0;
+                shape.bounds.y = center.y - shape.bounds.height / 2.0;
             }
         }
     }
@@ -1534,31 +1564,27 @@ impl Document {
         let Some((target_outline, target_bounds)) = self.node_outline(target) else {
             return;
         };
-        let Some(plane) = self.plane_mut() else {
+        let Some(edge) = self.edge_mut(flow_id) else {
             return;
         };
-        for element in &mut plane.elements {
-            if let DiElement::Edge(edge) = element
-                && edge.bpmn_element == *flow_id
-                && edge.waypoints.len() >= 2
-            {
-                // An edge that still looks auto-routed (short, axis-aligned)
-                // is re-routed from scratch; hand-shaped polylines keep their
-                // interior and only re-anchor the endpoints.
-                if looks_auto_routed(&edge.waypoints) {
-                    edge.waypoints = Self::orthogonal_route(
-                        (source_outline, source_bounds),
-                        (target_outline, target_bounds),
-                    );
-                    continue;
-                }
-                let n = edge.waypoints.len();
-                let toward_first = edge.waypoints[1];
-                let toward_last = edge.waypoints[n - 2];
-                edge.waypoints[0] = source_outline.anchor(source_bounds, toward_first);
-                edge.waypoints[n - 1] = target_outline.anchor(target_bounds, toward_last);
-            }
+        if edge.waypoints.len() < 2 {
+            return;
         }
+        // An edge that still looks auto-routed (short, axis-aligned) is
+        // re-routed from scratch; hand-shaped polylines keep their interior
+        // and only re-anchor the endpoints.
+        if looks_auto_routed(&edge.waypoints) {
+            edge.waypoints = Self::orthogonal_route(
+                (source_outline, source_bounds),
+                (target_outline, target_bounds),
+            );
+            return;
+        }
+        let n = edge.waypoints.len();
+        let toward_first = edge.waypoints[1];
+        let toward_last = edge.waypoints[n - 2];
+        edge.waypoints[0] = source_outline.anchor(source_bounds, toward_first);
+        edge.waypoints[n - 1] = target_outline.anchor(target_bounds, toward_last);
     }
 
     /// Deletes elements (plus the contents of deleted subprocesses and pools,
@@ -1629,12 +1655,25 @@ impl Document {
             }
         }
 
-        if let Some(plane) = self.plane_mut() {
-            plane.elements.retain(|element| match element {
-                DiElement::Shape(shape) => !doomed.contains(&shape.bpmn_element),
-                DiElement::Edge(edge) => !doomed.contains(&edge.bpmn_element),
-                DiElement::Unknown(_) => true,
-            });
+        // Prune DI everywhere: a deleted element's shape may live on a
+        // collapsed subprocess's own plane. A secondary diagram owned by a
+        // doomed subprocess goes away whole; the root diagram always stays.
+        let mut diagrams = std::mem::take(&mut self.definitions.diagrams).into_iter();
+        let mut kept: Vec<_> = diagrams.next().into_iter().collect();
+        kept.extend(diagrams.filter(|diagram| {
+            diagram
+                .plane
+                .as_ref()
+                .and_then(|plane| plane.bpmn_element.as_ref())
+                .is_none_or(|owner| !doomed.contains(owner))
+        }));
+        self.definitions.diagrams = kept;
+        for diagram in &mut self.definitions.diagrams {
+            if let Some(plane) = diagram.plane.as_mut() {
+                plane
+                    .elements
+                    .retain(|element| element.bpmn_element().is_none_or(|id| !doomed.contains(id)));
+            }
         }
 
         // A collaboration without pools dissolves; the canvas shows a plain
@@ -1801,22 +1840,12 @@ impl Document {
             },
         };
 
-        let Some(plane) = self.plane_mut() else {
+        let Some(edge) = self.edge_mut(flow_id) else {
             return false;
         };
-        let mut found = false;
-        for element in &mut plane.elements {
-            if let DiElement::Edge(edge) = element
-                && edge.bpmn_element == *flow_id
-            {
-                edge.waypoints = waypoints.to_vec();
-                found = true;
-            }
-        }
-        if found {
-            self.reanchor_flow(flow_id, &source, &target);
-        }
-        found
+        edge.waypoints = waypoints.to_vec();
+        self.reanchor_flow(flow_id, &source, &target);
+        true
     }
 
     /// Copies `selection` (plus flows fully inside it, plus the contents of
@@ -1889,10 +1918,15 @@ impl Document {
             process.flow_elements = elements;
         }
 
+        // DI comes from every plane (a kept subprocess's children may live on
+        // its own plane) and lands flattened on the clipboard's single plane.
         let mut di_keep = keep;
         di_keep.extend(nested);
         let mut di = Vec::new();
-        if let Some(plane) = self.diagram().and_then(|d| d.plane.as_ref()) {
+        for diagram in &self.definitions.diagrams {
+            let Some(plane) = diagram.plane.as_ref() else {
+                continue;
+            };
             for element in &plane.elements {
                 match element {
                     DiElement::Shape(shape) if di_keep.contains(&shape.bpmn_element) => {

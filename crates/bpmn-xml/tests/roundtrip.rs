@@ -11,13 +11,15 @@ const ORDER: &str = include_str!("../../../tests-fixtures/order-fulfillment.bpmn
 const EXTENSIONS: &str = include_str!("../../../tests-fixtures/with-extensions.bpmn");
 const PIZZA: &str = include_str!("../../../tests-fixtures/pizza-collaboration.bpmn");
 const DATA: &str = include_str!("../../../tests-fixtures/data-artifacts.bpmn");
+const PLANES: &str = include_str!("../../../tests-fixtures/collapsed-subprocess-plane.bpmn");
 
-const FIXTURES: [(&str, &str); 5] = [
+const FIXTURES: [(&str, &str); 6] = [
     ("minimal", MINIMAL),
     ("order-fulfillment", ORDER),
     ("with-extensions", EXTENSIONS),
     ("pizza-collaboration", PIZZA),
     ("data-artifacts", DATA),
+    ("collapsed-subprocess-plane", PLANES),
 ];
 
 #[test]
@@ -382,6 +384,66 @@ fn vendor_extensions_survive_the_round_trip() {
     ] {
         assert!(out.contains(needle), "output keeps {needle:?}\n---\n{out}");
     }
+}
+
+#[test]
+fn parses_the_secondary_plane_fixture() {
+    let doc = parse(PLANES).expect("planes fixture parses");
+
+    let diagrams = &doc.definitions.diagrams;
+    assert_eq!(diagrams.len(), 2);
+    assert_eq!(
+        diagrams[1]
+            .plane
+            .as_ref()
+            .and_then(|p| p.bpmn_element.as_ref()),
+        Some(&BpmnId::from("Activity_Assess"))
+    );
+    // The subprocess children's DI lives only on the secondary plane.
+    let on_root = |id: &str| {
+        diagrams[0].plane.as_ref().is_some_and(|p| {
+            p.elements
+                .iter()
+                .any(|e| e.bpmn_element() == Some(&BpmnId::from(id)))
+        })
+    };
+    assert!(on_root("Activity_Assess"));
+    assert!(!on_root("Task_CheckRecord"));
+
+    // And it round-trips: both diagrams survive a write/parse cycle.
+    let reparsed = parse(&write(&doc)).expect("written XML parses");
+    assert_eq!(reparsed.definitions.diagrams.len(), 2);
+}
+
+#[test]
+fn edits_reach_secondary_planes() {
+    use std::collections::HashSet;
+
+    let task = BpmnId::from("Task_CheckRecord");
+    let sub = BpmnId::from("Activity_Assess");
+
+    // Geometry readers see shapes on secondary planes.
+    let doc = parse(PLANES).expect("planes fixture parses");
+    let (_, bounds) = doc.node_outline(&task).expect("task shape found");
+    assert_eq!((bounds.x, bounds.y), (280.0, 138.0));
+
+    // Moving the collapsed subprocess carries its children's DI along,
+    // wherever that DI lives.
+    let mut doc = parse(PLANES).unwrap();
+    let selection: HashSet<BpmnId> = [sub.clone()].into_iter().collect();
+    doc.move_shapes(&selection, 50.0, 10.0);
+    let (_, moved) = doc.node_outline(&task).unwrap();
+    assert_eq!((moved.x, moved.y), (330.0, 148.0));
+
+    // Extract copies nested DI from the secondary plane.
+    let clipboard = doc.extract(&selection);
+    assert!(clipboard.node_outline(&task).is_some());
+
+    // Deleting the subprocess prunes its whole diagram and every shape.
+    doc.delete_elements(&selection);
+    assert_eq!(doc.definitions.diagrams.len(), 1);
+    assert!(doc.node_outline(&task).is_none());
+    assert!(doc.node_outline(&sub).is_none());
 }
 
 #[test]

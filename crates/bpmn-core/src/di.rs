@@ -46,6 +46,17 @@ pub enum DiElement {
     Unknown(RawXml),
 }
 
+impl DiElement {
+    /// The semantic element this DI element draws, when known.
+    pub fn bpmn_element(&self) -> Option<&BpmnId> {
+        match self {
+            Self::Shape(shape) => Some(&shape.bpmn_element),
+            Self::Edge(edge) => Some(&edge.bpmn_element),
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
 /// A `bpmndi:BPMNShape`: where one flow node is drawn.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BpmnShape {
