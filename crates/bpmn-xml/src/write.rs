@@ -103,7 +103,14 @@ struct Attrs(Vec<(String, String)>);
 
 impl Attrs {
     fn push(&mut self, key: &str, value: &str) {
-        self.0.push((key.to_string(), escape(value).into_owned()));
+        // Literal whitespace in an attribute value is folded to spaces by XML
+        // attribute-value normalization on read; character references survive
+        // it, so newlines and tabs in names round-trip only this way.
+        let escaped = escape(value)
+            .replace('\n', "&#10;")
+            .replace('\r', "&#13;")
+            .replace('\t', "&#9;");
+        self.0.push((key.to_string(), escaped));
     }
 
     fn push_opt(&mut self, key: &str, value: Option<&str>) {

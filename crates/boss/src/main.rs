@@ -12,6 +12,7 @@ mod platform;
 mod render;
 mod session;
 mod svg;
+mod text_layout;
 mod theme;
 
 use app::App;

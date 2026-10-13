@@ -385,6 +385,37 @@ fn vendor_extensions_survive_the_round_trip() {
 }
 
 #[test]
+fn multi_line_names_survive_the_round_trip() {
+    let mut doc = parse(MINIMAL).expect("minimal fixture parses");
+    let task = BpmnId::from("Activity_1");
+    assert!(doc.set_name(&task, Some("Review\norder".to_string())));
+
+    let xml = write(&doc);
+    assert!(
+        xml.contains("Review&#10;order"),
+        "the attribute newline must be a character reference:\n{xml}"
+    );
+    assert!(
+        !xml.contains("name=\"Review\norder"),
+        "a literal newline would be normalized away on read:\n{xml}"
+    );
+
+    let reparsed = parse(&xml).expect("written XML parses");
+    let index = reparsed.flow_element_index();
+    assert_eq!(index[&task].name(), Some("Review\norder"));
+
+    // Annotation text is element content; its newlines round-trip as-is.
+    let mut doc = parse(DATA).expect("data fixture parses");
+    let note = BpmnId::from("TextAnnotation_1");
+    assert!(doc.set_name(&note, Some("first\nsecond".to_string())));
+    let reparsed = parse(&write(&doc)).expect("written XML parses");
+    assert_eq!(
+        reparsed.flow_element_index()[&note].name(),
+        Some("first\nsecond")
+    );
+}
+
+#[test]
 fn rejects_non_bpmn_xml() {
     assert!(matches!(
         parse("<foo><bar/></foo>"),

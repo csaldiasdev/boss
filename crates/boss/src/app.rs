@@ -14,7 +14,7 @@ use bpmn_core::model::{
 use bpmn_core::{BpmnId, Document, NodeKind};
 use bpmn_validate::{Issue, Severity, Validator};
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, space, text, text_input,
+    button, column, container, pick_list, row, scrollable, space, text, text_editor, text_input,
 };
 use iced::{Center, Element, Fill, Size, Subscription, Task, Theme, Vector};
 use std::collections::HashSet;
@@ -77,8 +77,9 @@ enum CanvasOverlay {
         world: iced::Point,
         id: BpmnId,
     },
-    /// The inline name editor (double-click).
-    LabelEdit { at: iced::Point, id: BpmnId },
+    /// The inline name editor (double-click). The element is the single
+    /// selection, as everywhere else in the properties path.
+    LabelEdit { at: iced::Point },
 }
 
 /// A transient message for the status bar.
@@ -223,6 +224,8 @@ pub struct App {
     window_id: Option<iced::window::Id>,
     /// The floating canvas overlay (menus or the inline name editor).
     overlay: Option<CanvasOverlay>,
+    /// The inline name editor's buffer, (re)loaded when the editor opens.
+    inline_name: text_editor::Content,
     session: EditSession,
     file_name: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -250,6 +253,7 @@ impl Default for App {
             cursor_world: None,
             window_id: None,
             overlay: None,
+            inline_name: text_editor::Content::default(),
             session: EditSession::new(Document::new()),
             file_name: String::from("untitled.bpmn"),
             #[cfg(not(target_arch = "wasm32"))]
@@ -325,6 +329,8 @@ pub enum Message {
     ClipboardPasted(Option<String>),
     /// The name field of the selected element changed.
     NameEdited(String),
+    /// The inline (floating, multi-line) name editor did something.
+    InlineNameAction(text_editor::Action),
     /// The task type of the selected activity changed.
     TaskTypeChanged(TaskTypeChoice),
     /// The default flow of the selected gateway changed.
@@ -606,11 +612,36 @@ impl App {
         iced::advanced::widget::Id::new("inline-name")
     }
 
+    /// The display name of any nameable element (flow element, participant,
+    /// lane, or message flow).
+    fn element_name(&self, id: &BpmnId) -> String {
+        let document = self.session.document();
+        document
+            .flow_element_index()
+            .get(id)
+            .and_then(|element| element.name())
+            .map(str::to_string)
+            .or_else(|| {
+                document
+                    .participant(id)
+                    .and_then(|p| p.name.clone())
+                    .or_else(|| document.lane(id).and_then(|l| l.name.clone()))
+                    .or_else(|| {
+                        document
+                            .message_flows()
+                            .find(|m| m.base.id == *id)
+                            .and_then(|m| m.name.clone())
+                    })
+            })
+            .unwrap_or_default()
+    }
+
     /// Opens the floating name editor over the element at `at`.
-    fn edit_label(&mut self, id: BpmnId, at: iced::Point) -> Task<Message> {
+    fn edit_label(&mut self, id: &BpmnId, at: iced::Point) -> Task<Message> {
         self.selection.clear();
         self.selection.insert(id.clone());
-        self.overlay = Some(CanvasOverlay::LabelEdit { at, id });
+        self.inline_name = text_editor::Content::with_text(&self.element_name(id));
+        self.overlay = Some(CanvasOverlay::LabelEdit { at });
         iced::widget::operation::focus(Self::inline_input_id())
     }
 
@@ -623,7 +654,7 @@ impl App {
 
     fn handle_canvas(&mut self, message: CanvasMessage) -> Task<Message> {
         match message {
-            CanvasMessage::EditLabel { id, screen } => return self.edit_label(id, screen),
+            CanvasMessage::EditLabel { id, screen } => return self.edit_label(&id, screen),
             CanvasMessage::CursorAt(x, y) => self.cursor_world = Some((x, y)),
             CanvasMessage::ContextMenu { screen, world } => {
                 self.overlay = Some(CanvasOverlay::PlaceMenu { at: screen, world });
@@ -949,7 +980,7 @@ impl App {
             }
             Message::RenameHere => {
                 if let Some(CanvasOverlay::ElementMenu { at, id, .. }) = self.overlay.take() {
-                    return self.edit_label(id, at);
+                    return self.edit_label(&id, at);
                 }
             }
             Message::Escape => {
@@ -985,6 +1016,15 @@ impl App {
             | Message::ToggleExpanded
             | Message::AddLane
             | Message::CalledElementEdited(_)) => self.handle_property(message),
+            Message::InlineNameAction(action) => {
+                let edited = action.is_edit();
+                self.inline_name.perform(action);
+                // Only edits commit; cursor motion must not touch the session.
+                if edited {
+                    let name = self.inline_name.text().replace("\r\n", "\n");
+                    self.handle_property(Message::NameEdited(name));
+                }
+            }
             Message::IssueClicked(Some(id)) => {
                 if let Some((_, bounds)) = self.session.document().node_outline(&id) {
                     let center = bounds.center();
@@ -1369,8 +1409,8 @@ impl App {
             Some(CanvasOverlay::ElementMenu { at, id, .. }) => {
                 self.overlay_at(base, *at, self.element_menu(t, id))
             }
-            Some(CanvasOverlay::LabelEdit { at, id }) => {
-                self.overlay_at(base, *at, self.inline_editor(t, id))
+            Some(CanvasOverlay::LabelEdit { at }) => {
+                self.overlay_at(base, *at, self.inline_editor(t))
             }
             None => base,
         }
@@ -1628,35 +1668,25 @@ impl App {
             .into()
     }
 
-    /// The floating name editor opened by a double-click.
-    fn inline_editor(&self, t: Tokens, id: &BpmnId) -> Element<'_, Message> {
-        let name = self
-            .session
-            .document()
-            .flow_element_index()
-            .get(id)
-            .and_then(|element| element.name())
-            .map(str::to_string)
-            .or_else(|| {
-                let document = self.session.document();
-                document
-                    .participant(id)
-                    .and_then(|p| p.name.clone())
-                    .or_else(|| document.lane(id).and_then(|l| l.name.clone()))
-                    .or_else(|| {
-                        document
-                            .message_flows()
-                            .find(|m| m.base.id == *id)
-                            .and_then(|m| m.name.clone())
-                    })
-            })
-            .unwrap_or_default();
+    /// The floating name editor opened by a double-click. Multi-line:
+    /// Shift+Enter breaks the line, Enter and Escape close the editor.
+    fn inline_editor(&self, t: Tokens) -> Element<'_, Message> {
+        use iced::keyboard::key::{Key, Named};
 
         container(
-            text_input("Name", &name)
+            text_editor(&self.inline_name)
                 .id(Self::inline_input_id())
-                .on_input(Message::NameEdited)
-                .on_submit(Message::CloseOverlay)
+                .placeholder("Name")
+                .on_action(Message::InlineNameAction)
+                .key_binding(|press| match press.key.as_ref() {
+                    Key::Named(Named::Enter) if !press.modifiers.shift() => {
+                        Some(text_editor::Binding::Custom(Message::CloseOverlay))
+                    }
+                    Key::Named(Named::Escape) => {
+                        Some(text_editor::Binding::Custom(Message::CloseOverlay))
+                    }
+                    _ => text_editor::Binding::from_key_press(press),
+                })
                 .size(13)
                 .width(170),
         )

@@ -5,6 +5,7 @@
 //! event triggers) are left out; outlines, markers, bands, and labels carry
 //! the diagram's structure.
 
+use crate::text_layout;
 use crate::theme::{self, CanvasTokens, Mode};
 use bpmn_core::di::{BpmnShape, DiElement};
 use bpmn_core::model::{
@@ -32,6 +33,26 @@ fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The text content as one `<tspan>` per line, the block vertically centered
+/// on the parent `<text>` position (1.2 matches the canvas line height).
+fn tspans(x: f64, size: f64, content: &str) -> String {
+    use std::fmt::Write as _;
+
+    let lines: Vec<&str> = content.split('\n').collect();
+    let line_height = size * 1.2;
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let dy = if i == 0 {
+            -line_height * (lines.len() - 1) as f64 / 2.0
+        } else {
+            line_height
+        };
+        let _ = write!(out, "<tspan x=\"{x}\" dy=\"{dy}\">{}</tspan>", escape(line));
+    }
+    out
 }
 
 /// Renders the document's first diagram as an SVG string.
@@ -163,25 +184,28 @@ fn band(svg: &mut String, b: Bounds, name: Option<&str>, tokens: CanvasTokens, i
 }
 
 fn label_below(svg: &mut String, b: Bounds, name: &str, tokens: CanvasTokens) {
+    let x = b.x + b.width / 2.0;
     let _ = writeln!(
         svg,
         "  <text x=\"{}\" y=\"{}\" font-size=\"11\" fill=\"{}\" text-anchor=\"middle\">{}</text>",
-        b.x + b.width / 2.0,
+        x,
         b.y + b.height + 14.0,
         hex(tokens.edge_label),
-        escape(name),
+        tspans(x, 11.0, name),
     );
 }
 
 fn label_centered(svg: &mut String, b: Bounds, name: &str, tokens: CanvasTokens) {
+    let x = b.x + b.width / 2.0;
+    let wrapped = text_layout::wrap(name, 12.0, b.width as f32 - 14.0);
     let _ = writeln!(
         svg,
         "  <text x=\"{}\" y=\"{}\" font-size=\"12\" fill=\"{}\" text-anchor=\"middle\" \
          dominant-baseline=\"central\">{}</text>",
-        b.x + b.width / 2.0,
+        x,
         b.y + b.height / 2.0,
         hex(tokens.label),
-        escape(name),
+        tspans(x, 12.0, &wrapped),
     );
 }
 
@@ -359,13 +383,14 @@ fn node_shape(
                         b.y + b.height,
                     );
                     if let Some(text) = text {
+                        let wrapped = text_layout::wrap(text, 11.0, b.width as f32 - 10.0);
                         let _ = writeln!(
                             svg,
                             "  <text x=\"{}\" y=\"{}\" font-size=\"11\" fill=\"{}\" dominant-baseline=\"central\">{}</text>",
                             b.x + 7.0,
                             b.y + b.height / 2.0,
                             hex(tokens.label),
-                            escape(text),
+                            tspans(b.x + 7.0, 11.0, &wrapped),
                         );
                     }
                 }
@@ -454,13 +479,14 @@ fn activity_shape(svg: &mut String, activity: &Activity, shape: &BpmnShape, toke
 
     if let Some(name) = &activity.node.name {
         if expanded {
+            let x = b.x + b.width / 2.0;
             let _ = writeln!(
                 svg,
                 "  <text x=\"{}\" y=\"{}\" font-size=\"12\" fill=\"{}\" text-anchor=\"middle\">{}</text>",
-                b.x + b.width / 2.0,
+                x,
                 b.y + 18.0,
                 hex(tokens.label),
-                escape(name),
+                tspans(x, 12.0, name),
             );
         } else {
             label_centered(svg, b, name, tokens);
@@ -528,13 +554,19 @@ fn edges(svg: &mut String, document: &Document, tokens: CanvasTokens) {
         if let Some(name) = name {
             let n = edge.waypoints.len();
             let (a, z) = (edge.waypoints[n / 2 - 1], edge.waypoints[n / 2]);
+            let x = f64::midpoint(a.x, z.x);
+            // The background-colored stroke halo keeps the label readable
+            // where it crosses the flow line, matching the canvas plate.
             let _ = writeln!(
                 svg,
-                "  <text x=\"{}\" y=\"{}\" font-size=\"11\" fill=\"{}\" text-anchor=\"middle\">{}</text>",
-                f64::midpoint(a.x, z.x),
+                "  <text x=\"{}\" y=\"{}\" font-size=\"11\" fill=\"{}\" text-anchor=\"middle\" \
+                 paint-order=\"stroke\" stroke=\"{}\" stroke-width=\"3\" \
+                 stroke-linejoin=\"round\">{}</text>",
+                x,
                 f64::midpoint(a.y, z.y) - 8.0,
                 hex(tokens.edge_label),
-                escape(name),
+                hex(tokens.bg),
+                tspans(x, 11.0, name),
             );
         }
     }

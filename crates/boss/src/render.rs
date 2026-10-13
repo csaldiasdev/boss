@@ -5,6 +5,7 @@
 //! colors come from [`CanvasTokens`]. DI references outside the modeled subset
 //! (subprocesses, pools, ...) render as dashed placeholders.
 
+use crate::text_layout;
 use crate::theme::{CanvasTokens, ElementColors};
 use bpmn_core::Document;
 use bpmn_core::di::{BpmnLabel, BpmnShape, DiElement};
@@ -244,7 +245,7 @@ fn draw_edges(
                     .as_ref()
                     .and_then(|l| l.bounds)
                     .map_or_else(|| midpoint(&points), |b| rect(b).center());
-                label(frame, name, position, 11.0, tokens.edge_label);
+                edge_label(frame, name, position, tokens);
             }
         }
     }
@@ -473,9 +474,8 @@ fn draw_artifact(
             frame.stroke(&bracket, stroke);
             if let Some(text) = text {
                 frame.fill_text(Text {
-                    content: text.clone(),
+                    content: text_layout::wrap(text, 11.0, bounds.width - 10.0),
                     position: Point::new(bounds.x + 7.0, bounds.y + bounds.height / 2.0),
-                    max_width: bounds.width - 10.0,
                     color: tokens.label,
                     size: 11.0.into(),
                     font: theme::SANS,
@@ -665,6 +665,26 @@ fn arrowhead(frame: &mut Frame, points: &[Point], tokens: CanvasTokens) {
     frame.fill(&path, tokens.stroke);
 }
 
+/// An edge name over a plate of canvas background, so the flow line reads as
+/// interrupted under the text instead of striking through it.
+fn edge_label(frame: &mut Frame, content: &str, center: Point, tokens: CanvasTokens) {
+    let size = 11.0;
+    let text = text_layout::measure(content, size);
+    let plate = iced::Size::new(text.width + 8.0, text.height + 4.0);
+    frame.fill(
+        &Path::rounded_rectangle(
+            Point::new(center.x - plate.width / 2.0, center.y - plate.height / 2.0),
+            plate,
+            3.0.into(),
+        ),
+        iced::Color {
+            a: 0.85,
+            ..tokens.bg
+        },
+    );
+    label(frame, content, center, size, tokens.edge_label);
+}
+
 fn label(frame: &mut Frame, content: &str, center: Point, size: f32, color: iced::Color) {
     frame.fill_text(Text {
         content: content.to_string(),
@@ -685,10 +705,11 @@ fn wrapped_label(
     size: f32,
     color: iced::Color,
 ) {
+    // Wrapped in world units up front — a finite canvas `max_width` would
+    // make the renderer re-wrap the text as the camera zooms.
     frame.fill_text(Text {
-        content: content.to_string(),
+        content: text_layout::wrap(content, size, bounds.width - 14.0),
         position: bounds.center(),
-        max_width: bounds.width - 14.0,
         color,
         size: size.into(),
         font: theme::SANS,
